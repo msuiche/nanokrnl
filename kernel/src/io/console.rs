@@ -195,9 +195,32 @@ fn ingest_serial_byte(b: u8) {
 /// typed input flows through here; canned test input uses [`push_input`]
 /// directly and bypasses editing/echo (so the deterministic suite is
 /// unaffected, and an automated run with no serial input is a no-op).
+///
+/// We read the UART's 16-byte receive FIFO into a local batch *first* (each
+/// read is a cheap port `in`), then run the line discipline — which echoes,
+/// and echoing is a slow busy-wait on the transmitter. Echoing inline between
+/// reads would leave the FIFO full during each slow echo, so a fast burst
+/// (paste, or a quick run of keystrokes) would overflow it and drop the
+/// leading bytes. Emptying the FIFO promptly, then echoing, avoids that.
 fn feed_from_serial() {
-    while let Some(b) = crate::hal::serial::try_read_byte() {
-        ingest_serial_byte(b);
+    loop {
+        let mut batch = [0u8; 64];
+        let mut n = 0;
+        while n < batch.len() {
+            match crate::hal::serial::try_read_byte() {
+                Some(b) => {
+                    batch[n] = b;
+                    n += 1;
+                }
+                None => break,
+            }
+        }
+        if n == 0 {
+            break;
+        }
+        for &b in &batch[..n] {
+            ingest_serial_byte(b);
+        }
     }
 }
 
