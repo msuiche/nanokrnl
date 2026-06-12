@@ -2439,14 +2439,31 @@ pub unsafe extern "C" fn GetFullPathNameW(
         return 0;
     }
     let n = wstrlen(name);
-    if !file_part.is_null() {
-        *file_part = core::ptr::null_mut();
-    }
     if buffer.is_null() || (len as usize) < n + 1 {
+        if !file_part.is_null() {
+            *file_part = core::ptr::null_mut();
+        }
         return (n + 1) as u32;
     }
     for i in 0..=n {
         *buffer.add(i) = *name.add(i);
+    }
+    // lpFilePart points at the last path component within the buffer (the
+    // filename), or NULL when the path names a directory (ends in a separator).
+    // cmd uses this to split a resolved path into directory + file when
+    // searching for an executable; leaving it NULL breaks that split.
+    if !file_part.is_null() {
+        let mut fp = buffer;
+        let mut have = false;
+        for i in 0..n {
+            let c = *buffer.add(i);
+            if c == b'\\' as u16 || c == b'/' as u16 {
+                fp = buffer.add(i + 1);
+                have = true;
+            }
+        }
+        // If the path ends in a separator, there is no file component.
+        *file_part = if have && *fp != 0 { fp } else if have { core::ptr::null_mut() } else { buffer };
     }
     n as u32
 }
