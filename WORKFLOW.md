@@ -13,97 +13,124 @@ bounded increments, into a system that runs **unmodified Microsoft console
 binaries** in ring 3. The arc below is the order things were built and why each
 step unlocked the next. (Dates are early; the project is young and moved fast.)
 
+Each phase below is framed **What / Why / How**. (The git history begins at the
+baseline commit, after Phases A–G were already built, so this narrative is the
+record of those — see §0.1.)
+
 ### Phase A — the kernel core
-NT-shaped subsystems from the start: `ke` (scheduler, dispatcher, traps, IRQL via
-CR8), `mm` (paging), `ob` (object manager with typed headers + handle table),
-`ps` (threads), `ex` (pool), `io` (device/IRP), `ldr` (loader), `rtl`, `hal`
-(serial, APIC timer at vector 0xD1). NT-exact constants throughout (NTSTATUS,
-KGDT64 selectors, clock vector). The kernel builds on **stable** for
-`x86_64-unknown-none`; the bootloader needs **nightly**. This established the
-shapes (KTHREAD, ETHREAD, dispatcher objects, IO_STACK_LOCATION) that later let
-real Windows code feel at home.
+- **What:** NT-shaped subsystems from the start — `ke` (scheduler, dispatcher,
+  traps, IRQL via CR8), `mm` (paging), `ob` (object manager, typed headers +
+  handle table), `ps` (threads), `ex` (pool), `io` (device/IRP), `ldr`, `rtl`,
+  `hal` (serial, APIC timer at vector 0xD1), with NT-exact constants (NTSTATUS,
+  KGDT64 selectors, clock vector).
+- **Why:** matching NT's *shapes* (KTHREAD/ETHREAD, dispatcher objects,
+  IO_STACK_LOCATION) up front means real Windows drivers and binaries later slot
+  in instead of fighting a foreign model — and it's the honest way to learn NT.
+- **How:** kernel builds on **stable** Rust for `x86_64-unknown-none`; the
+  `bootloader` crate needs **nightly** (it `-Zbuild-std`s the boot stages).
 
 ### Phase B — loading real kernel drivers
-Before any user mode, the kernel could load real PE/COFF **kernel drivers** built
-for `x86_64-pc-windows-msvc`: a PE loader (sections/relocs/import binding), an
-export table of `extern "win64"` `ntoskrnl.exe` shims (~47: Ke events/sema/mutex/
-timer/DPC, Ex pool, Rtl, the Io IRP stack-location path, device namespace, Mm
-map), a shared `ntabi` repr(C) kernel<->driver ABI, and an `ntoskrnl.lib` import
-library generated with `llvm-dlltool`. Key hazard solved here: making the loaded
-image **executable** without tripping NXE reserved-bit faults (clear NX along the
-PTE path, do not disable NXE). A test driver exercised timer->DPC->event,
-spinlock IOCTLs, symlinks, and unload. This proved the PE-loading + win64-ABI
-machinery that user-mode loading later reused.
+- **What:** load and run an unmodified PE/COFF **kernel driver** compiled for
+  `x86_64-pc-windows-msvc`, binding its imports to a ~47-export `ntoskrnl.exe`
+  surface (Ke events/sema/mutex/timer/DPC, Ex pool, Rtl, the Io IRP
+  stack-location path, device namespace, Mm map).
+- **Why:** a controlled, kernel-side target to prove the PE-loading + win64-ABI
+  machinery *before* user mode (which is harder to debug) had to depend on it.
+- **How:** a PE loader (sections/relocs/import binding) + a shared `ntabi`
+  repr(C) kernel↔driver ABI + an `ntoskrnl.lib` import lib from `llvm-dlltool`.
+  Key hazard: make the image **executable** without an NXE reserved-bit fault —
+  clear NX along the PTE path, do **not** disable EFER.NXE. A test driver
+  exercised timer→DPC→event, spinlock IOCTLs, symlinks, and unload.
 
 ### Phase C — crossing into user mode
-- **Syscalls:** programmed STAR/LSTAR/FMASK/EFER.SCE; `KiSystemCall64` (naked:
-  swapgs, per-CPU stack switch via KPCR, Windows->SysV arg marshalling, SSDT
-  dispatch, sysretq). `ki_enter_user_mode` builds an `iretq` frame to ring 3.
-  Two subtle ABI bugs fixed at the boundary: the dispatcher must preserve
-  RDI/RSI (Windows-nonvolatile, SysV-volatile), and the user syscall stub must
-  mark the full clobber set incl. r9.
-- **Handles + console + Nt services:** a system-wide handle table, a
-  `\Device\Console` routing writes to serial, and the first SSDT services
-  (NtWriteFile/NtCreateFile/NtClose/NtReadFile/terminate).
-- **First real ring-3 PE:** `userapp` (no CRT) opened the console, wrote, read,
-  and exited — a Win32-ish console app running in ring 3.
-- **User virtual memory:** NtAllocateVirtualMemory/Free/Protect.
+- **What:** ring-3 execution — syscalls, a system-wide handle table, a
+  `\Device\Console` (writes → serial), the first SSDT services
+  (NtWriteFile/Create/Close/Read/terminate), a first no-CRT ring-3 PE
+  (`userapp`), and user virtual memory (NtAllocate/Free/ProtectVirtualMemory).
+- **Why:** the foundation for running any user program at all.
+- **How:** program STAR/LSTAR/FMASK/EFER.SCE; a naked `KiSystemCall64` (swapgs,
+  per-CPU stack switch via KPCR, Windows→SysV arg marshalling, SSDT dispatch,
+  sysretq); `ki_enter_user_mode` builds an `iretq` frame to ring 3. Two ABI bugs
+  fixed at the boundary: preserve RDI/RSI (Windows-nonvolatile but SysV-volatile)
+  and mark the full syscall clobber set incl. r9.
 
 ### Phase D — the dynamic-linking stack
-The path that makes unmodified `.exe`s viable:
-1. **ntdll trampoline** (`ldr/ntdll.rs`): a ring-3 page of `Nt*` syscall stubs +
-   a name->service table, so imports can bind to it.
-2. **kernel32 shim** (`kernel32/`): a real cdylib exporting Win32 names, each
-   calling our syscalls; `pe::resolve_export` parses its export table.
-3. **loaded-module registry** (`ldr/loaded.rs`): resolve a symbol across
-   ntdll/kernel32/msvcrt **by name** — cross-module dynamic linking.
-4. **CRT-style startup, argc/argv, a pooled heap, a test-result channel**, and a
-   second app — proving the loader runs arbitrary programs through one path.
+- **What:** the pipeline that makes unmodified `.exe`s viable — an **ntdll
+  trampoline** (`ldr/ntdll.rs`, a ring-3 page of `Nt*` syscall stubs), a
+  **kernel32 shim** (`kernel32/`, a cdylib exporting Win32 names that call our
+  syscalls), a **by-name loaded-module resolver** (`ldr/loaded.rs`), and a
+  CRT-style startup with argc/argv + a pooled heap + a test-result channel.
+- **Why:** real binaries import functions *by name* across DLLs; we need
+  cross-module binding to our own shims, and a CRT entry to run normal `main`s.
+- **How:** `pe::resolve_export` parses export tables; `loaded::resolve` looks a
+  symbol up across ntdll/kernel32/msvcrt **ignoring the DLL name** — the trick
+  that later makes apiset binaries bind for free (§1).
 
 ### Phase E — hardening + isolation
-- **SMEP**, then **SMAP** (with `user_access_begin/end` brackets at every kernel
-  touch of user memory). Enabling SMEP surfaced a real large-page-coarsening bug,
-  fixed properly with 1G->2M->4K **page splitting** along the protect path.
-- **Kernel relocated to the high half**, freeing the entire low half for
-  per-process mappings.
-- **Per-process address spaces + isolation**, then **multiple concurrent
-  processes** (per-thread CR3, AS switch on context switch). Real multiprocessing
-  with isolation.
-- A broad **kernel32 surface** expansion across many increments (versioning,
-  system info, Interlocked atomics, timing/QPC, per-thread last-error,
-  Multi/WideChar, LoadLibrary/GetProcAddress, WriteConsole, lstr\*, ...), plus
-  ProbeForRead/Write user-pointer validation.
+- **What:** SMEP then SMAP; relocate the kernel to the high half; per-process
+  address spaces + true multiprocessing; a broad kernel32 surface expansion
+  (versioning, system info, Interlocked, timing/QPC, per-thread last-error,
+  Multi/WideChar, LoadLibrary/GetProcAddress, WriteConsole, lstr\*, …) +
+  ProbeForRead/Write.
+- **Why:** catch bad kernel↔user accesses early (SMEP/SMAP), give each process
+  real isolation, and satisfy the API surface real binaries reach for.
+- **How:** `user_access_begin/end` brackets at every kernel touch of user memory
+  (enabling SMEP surfaced a large-page-coarsening bug, fixed with 1G→2M→4K
+  **page splitting** along the protect path); moving the kernel high frees the
+  low half for per-process mappings; per-thread CR3 + AS switch on context
+  switch.
 
 ### Phase F — running real Microsoft binaries
-- **Feasibility study:** extracted binaries from the Win11 26H1 ISO and measured
-  imports. Finding that set the whole strategy: real `msvcrt`/`cmd` link
-  `api-ms-win-*` -> KERNELBASE + ucrt, not classic kernel32 — so we **substitute
-  our own shims by export name** rather than load Microsoft's DLLs (see §1).
-  `sort.exe` was uniquely minimal and chosen as the first target.
-- **msvcrt shim** (`msvcrt/`): the C-runtime surface (mem/str/qsort/printf/CRT
-  startup), calling our kernel32.
-- **sort.exe runs** end-to-end (sorts real input). Required: TEB/PEB (real
-  binaries read `gs:[0x30]/[0x60]`), the Win64 entry frame (return addr + shadow
-  space + RSP alignment), trap-entry `swapgs` gating, and per-stream std handles.
-- **choice.exe + the MUI finding:** modern tools externalize UI strings to an
-  `<exe>.mui` resource-only PE -> built the MUI loader.
-- **where.exe + three new subsystems:** a RAM filesystem, MUI, and per-process
-  command-line args.
+- **What:** run unmodified **sort.exe**, then **choice.exe** and **where.exe**.
+- **Why:** the project's whole point — prove real MS binaries run on our shims.
+- **How:** an ISO feasibility study showed `msvcrt`/`cmd` link `api-ms-win-*` →
+  KERNELBASE + ucrt (not classic kernel32), which set the **own-ABI-shim
+  strategy**: substitute our shims by export name, skip apiset/kernelbase
+  entirely (§1). Built the **msvcrt shim**; sort needed a TEB/PEB (binaries read
+  `gs:[0x30]/[0x60]`), the Win64 entry frame (return addr + shadow space + RSP
+  alignment), trap-entry `swapgs` gating, and per-stream std handles. choice/where
+  needed the **MUI** loader (UI strings live in an external `<exe>.mui`), a
+  **RAM filesystem**, and **per-process command-line args**.
 
 ### Phase G — the debugger, and finishing where.exe + choice.exe
-- Built the **in-kernel user-mode debugger / API tracer** (§3) to troubleshoot
-  why where/choice diverged into error paths.
-- Used it to find and fix where.exe's chain: `SetThreadUILanguage(0)` returning
-  0, missing **version-info** APIs, and a `_vsnwprintf` `%04x` zero-pad bug.
-  where.exe now runs correctly.
-- Made the tracer **fast** (the DR0 hybrid, §3) so it is usable as a standing
-  tool, not a 90-second crawl.
-- Fixed the **stale std-handle** bug (a closed cached console handle across
-  processes); **choice.exe now runs interactively**.
-- Measured the **cmd.exe** gap (§5) — reachable but multi-session.
+- **What:** an in-kernel user-mode **API tracer/debugger** (§3); where.exe and
+  choice.exe made to run correctly.
+- **Why:** the binaries diverged into opaque error paths; we needed to *see* what
+  they asked the OS and what they got back to find the divergence.
+- **How:** single-step via the Trap Flag, made fast with a **DR0-hybrid** (trap
+  only at API call/return, run library bodies native-speed). It found+fixed
+  where.exe's chain (`SetThreadUILanguage(0)`→0, missing version-info APIs, a
+  `_vsnwprintf %04x` zero-pad bug) and the **stale std-handle** bug (a closed
+  cached console handle across processes) that blocked choice's interactive read.
 
-The result today: three real Windows binaries (sort, where, choice) run on the
-kernel, with the loader, shims, debugger, and methodology to bring up more.
+### Phase H — the cmd.exe era (registry, CreateProcess, shell bring-up)
+- **What:** a kernel **registry** (Configuration Manager); a **CreateProcess**
+  primitive + `CreateProcessW`; **per-thread GS** save/restore; ring-3 faults
+  that terminate only the faulting thread; **line-input** console mode; and
+  **message-table** `FormatMessage` so cmd.exe prints its real banner. cmd.exe
+  loads, runs its CRT + command loop, and exits cleanly.
+- **Why:** cmd.exe is the marquee target, and `CreateProcess` + the registry are
+  core Windows architecture a modern CLI depends on.
+- **How:** `cm/` in-memory hive + `Reg*` syscalls; `create_user_process` +
+  process wait/exit-code wired to `CreateProcessW`; the scheduler restores
+  `IA32_KERNEL_GS_BASE` per thread (so a parent and child TEB coexist); `#PF`/`#GP`
+  from CPL 3 → `ki_terminate_current_thread`; the console read honors
+  `ENABLE_LINE_INPUT`; `cmd.exe.mui`'s `RT_MESSAGETABLE` is parsed for messages.
+  **Limit:** cmd doesn't execute arbitrary commands yet — command dispatch faults
+  on an unresolved API (folded into the generic stub; naming it needs per-name
+  stub instrumentation). Chasing it also taught: kernel32 changes must be
+  verified against *all four* binaries (an env block / a GetFileAttributesW
+  last-error each regressed where.exe).
+
+The result today: four real Windows binaries run on the kernel — **sort, choice,
+where** fully, and **cmd** loads/runs/banners/exits — with the loader, shims,
+debugger, registry, CreateProcess, and methodology to push further.
+
+### 0.1 A note on history
+The git repository was initialized partway through (during Phase H), so the
+commit log starts at a baseline that already contains Phases A–G. The
+commit-by-commit code history of those phases was not captured; this section and
+the dated entries in the project memory are the authoritative record of them.
 
 ---
 
