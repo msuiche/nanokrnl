@@ -126,6 +126,24 @@ pub unsafe extern "C" fn __intrinsic_setjmp() {
     );
 }
 
+/// `_local_unwind(TargetFrame, TargetIp)` — the SEH local-unwind helper. The
+/// real one (via RtlUnwindEx) runs intervening `__finally` blocks then transfers
+/// control to `TargetIp` with RSP at the establisher frame; crucially it does
+/// NOT return, so the compiler treats the code after the call as unreachable.
+/// We do a longjmp-style transfer (skip the `__finally` cleanup): set RSP to the
+/// target frame and jump. Correct for intra-function local unwinds where the
+/// establisher frame is the target RSP; nonvolatiles are unchanged within one
+/// function. (A full implementation would walk the scope table and run the
+/// `__finally` handlers — deferred.)
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "C" fn _local_unwind() {
+    core::arch::naked_asm!(
+        "mov rsp, rcx", // TargetFrame (establisher frame == target RSP)
+        "jmp rdx",      // TargetIp (resume point); never returns
+    );
+}
+
 /// `longjmp(jmpbuf, val)` — restore context saved by `__intrinsic_setjmp` and
 /// resume there, with the setjmp call appearing to return `val` (or 1 if 0).
 #[unsafe(naked)]
