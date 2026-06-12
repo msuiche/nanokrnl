@@ -12,6 +12,14 @@ description = "NT-compatible kernel (ntoskrnl) written in Rust"
 bootloader_api = "0.11"
 ntabi = { path = "../ntabi" }
 
+[features]
+# `interactive`: drive cmd.exe as a live shell attached to the serial console
+# instead of running the deterministic canned-input smoke tests. Build with
+# `cargo build -p kernel --features interactive` and run under a QEMU with an
+# interactive serial (see scripts/run-interactive.sh). Off by default so the
+# automated suite stays deterministic.
+interactive = []
+
 # Host-only: property-based testing of the allocator primitives. Never
 # compiled into the freestanding kernel (dev-dependencies don't ship).
 [target.'cfg(not(target_os = "none"))'.dev-dependencies]

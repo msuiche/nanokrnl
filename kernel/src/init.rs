@@ -1205,6 +1205,7 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
     // blocks reading input after startup — reaching that point means the real
     // MSVC CRT startup plus our shims executed. We wait with a timeout and
     // only report (never gate the suite).
+    #[cfg(not(feature = "interactive"))]
     if !SORT_IMAGE.is_empty() {
         kd_println!("SORT: loading real sort.exe ({} bytes)", SORT_IMAGE.len());
         match crate::ldr::pe::load_user_process(SORT_IMAGE) {
@@ -1255,6 +1256,7 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
     // once the stale-std-handle bug was fixed: GetStdHandle now re-opens the
     // console when a prior process — sort, which closes stdin — left a closed
     // handle cached in shared kernel32 .data.)
+    #[cfg(not(feature = "interactive"))]
     if !CHOICE_IMAGE.is_empty() {
         kd_println!("CHOICE: loading real choice.exe ({} bytes)", CHOICE_IMAGE.len());
         match crate::ldr::pe::load_user_process(CHOICE_IMAGE) {
@@ -1294,6 +1296,7 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
     // Runs `where cmd`. With no directory-enumeration model, FindFirstFile
     // reports no matches, so `where` searches and prints its "Could not find
     // files for the given pattern(s)" message — loaded from where.exe.mui.
+    #[cfg(not(feature = "interactive"))]
     if !WHERE_IMAGE.is_empty() {
         kd_println!("WHERE: loading real where.exe ({} bytes)", WHERE_IMAGE.len());
         match crate::ldr::pe::load_user_process(WHERE_IMAGE) {
@@ -1348,7 +1351,7 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
         kd_println!("CMD: loading real cmd.exe ({} bytes)", CMD_IMAGE.len());
         match crate::ldr::pe::load_user_process(CMD_IMAGE) {
             Ok(proc) => {
-                kd_println!("CMD: mapped, entry {:#X}; feeding 'exit':", proc.entry_va);
+                kd_println!("CMD: mapped, entry {:#X}", proc.entry_va);
                 // Register cmd.exe.mui so its messages (banner, errors, prompts)
                 // resolve through FormatMessage/the message table.
                 if !CMD_MUI.is_empty() {
@@ -1361,17 +1364,34 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
                 let (mcb, mcs) = crate::ldr::loaded::msvcrt_range();
                 ke::debug::add_module("msvcrt", mcb, mcs as u64, true);
                 ke::debug::add_module("ntdll", crate::ldr::ntdll::trampoline_base(), 0x1000, true);
-                // Drive cmd as a real interactive shell: run a builtin, then
-                // exit. (Tracer left disarmed so cmd's own console output is
-                // clean; re-enable with `ke::debug::arm(N)` to trace API calls.)
-                io::console::push_input_str(b"echo hi\r\nexit\r\n");
-                io::console::set_input_eof(true);
+                // Tracer left disarmed so cmd's own console output is clean;
+                // re-enable with `ke::debug::arm(N)` to trace API calls.
+                #[cfg(not(feature = "interactive"))]
+                {
+                    // Deterministic smoke test: feed a builtin + exit, then EOF.
+                    io::console::push_input_str(b"echo hi\r\nexit\r\n");
+                    io::console::set_input_eof(true);
+                }
+                #[cfg(feature = "interactive")]
+                {
+                    // Interactive: no canned input and no EOF — cmd reads live
+                    // keystrokes from the serial console until the user types
+                    // `exit`. Echo + line editing happen in the console driver.
+                    kd_println!("\n--- interactive cmd.exe: type commands, `exit` to quit ---\n");
+                }
                 let wr_before = io::console::bytes_written();
                 match spawn_process_thread(proc.entry_va, proc.user_rsp, proc.cr3.0, proc.teb) {
                     Ok(t) => {
                         set_cmdline(t, "cmd.exe");
+                        #[cfg(not(feature = "interactive"))]
                         let st = unsafe {
                             scheduler::ki_wait_for_object(&raw mut (*t).tcb.header, Some(8000))
+                        };
+                        #[cfg(feature = "interactive")]
+                        let st = unsafe {
+                            // Wait until cmd exits — the session ends when the
+                            // user types `exit`.
+                            scheduler::ki_wait_for_object(&raw mut (*t).tcb.header, None)
                         };
                         unsafe {
                             mm::virt::mm_switch_address_space(mm::virt::mm_kernel_address_space());

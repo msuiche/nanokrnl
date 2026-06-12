@@ -116,10 +116,88 @@ pub fn peek_input_byte() -> i32 {
     }
 }
 
-/// Drain any bytes the UART has received into the input buffer.
+/// Pending cooked-mode line being edited. Typed bytes accumulate here (with
+/// echo + backspace handling) and are committed to [`INPUT`] only on Enter, so
+/// a blocking read returns whole lines and the user can edit before pressing
+/// Return — the classic canonical-TTY line discipline. Unused in raw mode.
+struct LineEdit {
+    buf: [u8; INPUT_CAP],
+    len: usize,
+}
+static EDIT: SpinLock<LineEdit> = SpinLock::new(LineEdit { buf: [0; INPUT_CAP], len: 0 });
+
+/// Echo a typed byte back to the console output when `ENABLE_ECHO_INPUT` is set
+/// (so the user sees what they type). Only printable ASCII is echoed directly;
+/// control bytes are handled by the caller.
+fn echo_byte(b: u8) {
+    if echo_mode() && (0x20..0x7f).contains(&b) {
+        crate::kd_print!("{}", b as char);
+    }
+}
+
+/// Apply the terminal line discipline to one freshly-received byte.
+///
+/// * Raw mode (`ENABLE_LINE_INPUT` clear): deliver and echo immediately — each
+///   keystroke is its own read (what choice.exe wants).
+/// * Cooked mode: accumulate into [`EDIT`], echoing printable chars; handle
+///   Backspace/DEL (erase last char, emit `\b \b`) and Ctrl-C (discard line);
+///   on Enter, echo CR/LF and commit the whole line plus `\r\n` to [`INPUT`].
+fn ingest_serial_byte(b: u8) {
+    if !line_mode() {
+        INPUT.lock().push(b);
+        echo_byte(b);
+        return;
+    }
+    match b {
+        b'\r' | b'\n' => {
+            if echo_mode() {
+                crate::kd_print!("\r\n");
+            }
+            let mut edit = EDIT.lock();
+            let mut input = INPUT.lock();
+            for i in 0..edit.len {
+                input.push(edit.buf[i]);
+            }
+            input.push(b'\r');
+            input.push(b'\n');
+            edit.len = 0;
+        }
+        0x08 | 0x7f => {
+            let mut edit = EDIT.lock();
+            if edit.len > 0 {
+                edit.len -= 1;
+                if echo_mode() {
+                    // Move back, overwrite with a space, move back again.
+                    crate::kd_print!("\u{8} \u{8}");
+                }
+            }
+        }
+        0x03 => {
+            EDIT.lock().len = 0;
+            if echo_mode() {
+                crate::kd_print!("^C\r\n");
+            }
+        }
+        _ => {
+            let mut edit = EDIT.lock();
+            let n = edit.len;
+            if n < edit.buf.len() {
+                edit.buf[n] = b;
+                edit.len = n + 1;
+                drop(edit);
+                echo_byte(b);
+            }
+        }
+    }
+}
+
+/// Drain any bytes the UART has received, applying the line discipline. Live
+/// typed input flows through here; canned test input uses [`push_input`]
+/// directly and bypasses editing/echo (so the deterministic suite is
+/// unaffected, and an automated run with no serial input is a no-op).
 fn feed_from_serial() {
     while let Some(b) = crate::hal::serial::try_read_byte() {
-        INPUT.lock().push(b);
+        ingest_serial_byte(b);
     }
 }
 
@@ -128,6 +206,9 @@ fn feed_from_serial() {
 /// a time (cooked input — what cmd.exe and line-based tools expect). Clearing
 /// it gives raw single-keystroke reads (what choice.exe uses).
 const ENABLE_LINE_INPUT: u32 = 0x0002;
+/// `ENABLE_ECHO_INPUT` (0x4): the console echoes typed characters back to the
+/// output as they are received (terminal echo). Set by default with line input.
+const ENABLE_ECHO_INPUT: u32 = 0x0004;
 static INPUT_MODE: AtomicU64 = AtomicU64::new(0x0007); // PROCESSED|LINE|ECHO
 
 /// Set the console input mode (from `SetConsoleMode`).
@@ -137,6 +218,10 @@ pub fn set_input_mode(mode: u32) {
 
 fn line_mode() -> bool {
     INPUT_MODE.load(Ordering::Acquire) as u32 & ENABLE_LINE_INPUT != 0
+}
+
+fn echo_mode() -> bool {
+    INPUT_MODE.load(Ordering::Acquire) as u32 & ENABLE_ECHO_INPUT != 0
 }
 
 /// Copy buffered input bytes into `dst` (up to `max`). In line-input mode the
