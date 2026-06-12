@@ -101,6 +101,53 @@ pub fn ordinal_stub() -> Option<usize> {
     .map(|va| va as usize)
 }
 
+// --- Per-name unresolved-import stubs (instrumentation) --------------------
+// Unimplemented by-name imports each get their OWN return-0 stub at a distinct
+// address (instead of all sharing __ordinal_stub), and we log name->address.
+// Behaviour is identical (return 0), but the API tracer's call target now
+// uniquely identifies WHICH missing import a binary actually calls — essential
+// for finding the next function to implement (e.g. cmd.exe's command dispatch).
+const UNRESOLVED_MAX: usize = 384;
+const UNRESOLVED_STRIDE: usize = 8;
+static UNRESOLVED_PAGE: AtomicU64 = AtomicU64::new(0);
+static UNRESOLVED_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Assign a distinct return-0 stub to an unresolved import `name`, logging the
+/// mapping. Returns the stub's VA (or `None` if the page is full / unallocated).
+pub fn unresolved_stub(name: &str) -> Option<usize> {
+    // Lazily build a user-executable page of `xor eax,eax; ret` stubs.
+    let mut base = UNRESOLVED_PAGE.load(Ordering::Acquire);
+    if base == 0 {
+        let pa = crate::mm::phys::mm_allocate_page()?;
+        let va = crate::mm::phys_to_virt(pa) as u64;
+        unsafe {
+            for i in 0..UNRESOLVED_MAX {
+                let s = (va as *mut u8).add(i * UNRESOLVED_STRIDE);
+                *s = 0x31; // xor eax, eax
+                *s.add(1) = 0xC0;
+                *s.add(2) = 0xC3; // ret
+            }
+            crate::mm::virt::mm_set_user_executable(va, crate::mm::PAGE_SIZE);
+        }
+        UNRESOLVED_PAGE.store(va, Ordering::Release);
+        base = va;
+    }
+    let i = UNRESOLVED_COUNT.fetch_add(1, Ordering::AcqRel);
+    if i >= UNRESOLVED_MAX {
+        // Out of slots: fall back to the shared stub.
+        return ordinal_stub();
+    }
+    let addr = base + (i * UNRESOLVED_STRIDE) as u64;
+    crate::kd_println!("LDR: unresolved import {} -> stub {:#x}", name, addr);
+    Some(addr as usize)
+}
+
+/// Base VA + size of the unresolved-stub page (for the debug tracer's module
+/// map, so calls into a missing import are labelled). 0 if not built yet.
+pub fn unresolved_range() -> (u64, usize) {
+    (UNRESOLVED_PAGE.load(Ordering::Acquire), crate::mm::PAGE_SIZE)
+}
+
 /// Read an export `name` from an already-loaded user-accessible image at
 /// `(base, size)`, bracketing the read for SMAP (the image is U/S).
 fn resolve_export_in(base: u64, size: usize, name: &str) -> Option<u64> {

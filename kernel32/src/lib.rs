@@ -2536,6 +2536,16 @@ pub unsafe extern "C" fn FindFirstFileExW(
     INVALID_HANDLE_VALUE
 }
 
+/// `FindFirstFileW(lpFileName, lpFindFileData)` — like the Ex variant: no
+/// directory model, so report no match with INVALID_HANDLE_VALUE (not 0 — a
+/// caller checks against INVALID_HANDLE_VALUE and would use a 0 handle as if
+/// valid, e.g. cmd.exe path globbing).
+#[no_mangle]
+pub unsafe extern "C" fn FindFirstFileW(_name: *const u16, _find_data: *mut c_void) -> u64 {
+    SetLastError(ERROR_FILE_NOT_FOUND);
+    INVALID_HANDLE_VALUE
+}
+
 /// `FindNextFileW(hFindFile, lpFindFileData)` — no more files.
 #[no_mangle]
 pub unsafe extern "C" fn FindNextFileW(_handle: u64, _find_data: *mut c_void) -> i32 {

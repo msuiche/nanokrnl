@@ -469,14 +469,13 @@ fn resolve_imports(
                 match resolver(name) {
                     Some(a) => a,
                     None => {
-                        // Unimplemented import: bind to a generic return-0 stub
-                        // and log the name, so the image still loads and we can
-                        // see (and prioritize) the surface a binary actually
-                        // needs. A stub that returns 0 is "fail" for most APIs;
-                        // the binary may still fault later, which the user-fault
-                        // handler turns into a clean thread exit.
-                        crate::kd_println!("LDR: unresolved import {} -> stub", name);
-                        super::loaded::ordinal_stub().ok_or(NtStatus(0xC000_007A))?
+                        // Unimplemented import: bind to a distinct per-name
+                        // return-0 stub (logs name->address), so the image
+                        // loads and the API tracer can identify exactly which
+                        // missing import a binary calls. Returns 0 like the
+                        // shared stub; a binary that needs it may fault later,
+                        // which the user-fault handler turns into a clean exit.
+                        super::loaded::unresolved_stub(name).ok_or(NtStatus(0xC000_007A))?
                     }
                 }
             };

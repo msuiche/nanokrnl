@@ -1273,6 +1273,87 @@ pub extern "C" fn towupper(c: u16) -> u16 {
     }
 }
 
+// --- Wide character classification / case (ASCII-range; what a CLI needs) ---
+#[no_mangle]
+pub extern "C" fn towlower(c: u16) -> u16 {
+    if (b'A' as u16..=b'Z' as u16).contains(&c) {
+        c + 32
+    } else {
+        c
+    }
+}
+#[no_mangle]
+pub extern "C" fn iswalpha(c: u16) -> i32 {
+    (((b'A' as u16..=b'Z' as u16).contains(&c)) || ((b'a' as u16..=b'z' as u16).contains(&c))) as i32
+}
+#[no_mangle]
+pub extern "C" fn iswdigit(c: u16) -> i32 {
+    (b'0' as u16..=b'9' as u16).contains(&c) as i32
+}
+#[no_mangle]
+pub extern "C" fn iswspace(c: u16) -> i32 {
+    matches!(c, 0x20 | 0x09 | 0x0A | 0x0B | 0x0C | 0x0D) as i32
+}
+#[no_mangle]
+pub extern "C" fn iswxdigit(c: u16) -> i32 {
+    ((b'0' as u16..=b'9' as u16).contains(&c)
+        || (b'a' as u16..=b'f' as u16).contains(&c)
+        || (b'A' as u16..=b'F' as u16).contains(&c)) as i32
+}
+
+/// `_wcsicmp(a, b)` — case-insensitive wide compare.
+#[no_mangle]
+pub unsafe extern "C" fn _wcsicmp(a: *const u16, b: *const u16) -> i32 {
+    let mut i = 0;
+    loop {
+        let (x, y) = (towlower(*a.add(i)), towlower(*b.add(i)));
+        if x != y {
+            return x as i32 - y as i32;
+        }
+        if x == 0 {
+            return 0;
+        }
+        i += 1;
+    }
+}
+
+/// `_wcsnicmp(a, b, n)` — case-insensitive wide compare, first `n` units.
+#[no_mangle]
+pub unsafe extern "C" fn _wcsnicmp(a: *const u16, b: *const u16, n: usize) -> i32 {
+    let mut i = 0;
+    while i < n {
+        let (x, y) = (towlower(*a.add(i)), towlower(*b.add(i)));
+        if x != y {
+            return x as i32 - y as i32;
+        }
+        if x == 0 {
+            return 0;
+        }
+        i += 1;
+    }
+    0
+}
+
+/// `_wcslwr(s)` / `_wcsupr(s)` — in-place ASCII case conversion; returns `s`.
+#[no_mangle]
+pub unsafe extern "C" fn _wcslwr(s: *mut u16) -> *mut u16 {
+    let mut i = 0;
+    while *s.add(i) != 0 {
+        *s.add(i) = towlower(*s.add(i));
+        i += 1;
+    }
+    s
+}
+#[no_mangle]
+pub unsafe extern "C" fn _wcsupr(s: *mut u16) -> *mut u16 {
+    let mut i = 0;
+    while *s.add(i) != 0 {
+        *s.add(i) = towupper(*s.add(i));
+        i += 1;
+    }
+    s
+}
+
 /// `wcsrchr(s, c)` — last occurrence of `c` (incl. NUL), or null.
 #[no_mangle]
 pub unsafe extern "C" fn wcsrchr(s: *const u16, c: u16) -> *const u16 {
