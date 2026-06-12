@@ -2108,27 +2108,41 @@ unsafe fn wcopy(dst: *mut u16, cap: u32, src: &[u16]) -> u32 {
     (need - 1) as u32 // exclude NUL
 }
 
-/// `GetEnvironmentVariableW(lpName, lpBuffer, nSize)` — we expose a minimal
-/// `PATH` (`C:\`) so a path-search tool has somewhere to look; other names
-/// are reported not-found.
+// `GetEnvironmentVariableW(lpName, lpBuffer, nSize)` — minimal environment.
+// We expose `PATH` (`C:\\`) and `OS` (`nanokrnl`); other names are reported
+// not-found. (A full mutable wide environment block tripped cmd.exe into an
+// unbounded path-search and regressed where.exe, so we keep this minimal.)
 #[no_mangle]
 pub unsafe extern "C" fn GetEnvironmentVariableW(name: *const u16, buffer: *mut u16, size: u32) -> u32 {
     if name.is_null() {
         return 0;
     }
-    // Match "PATH" case-insensitively.
-    let want = [b'P' as u16, b'A' as u16, b'T' as u16, b'H' as u16];
-    let mut is_path = true;
-    for i in 0..4 {
-        let c = *name.add(i);
-        let u = if (0x61..=0x7A).contains(&c) { c - 32 } else { c };
-        if u != want[i] {
-            is_path = false;
-            break;
+    let eqi = |w: &[u16]| -> bool {
+        for (i, &c) in w.iter().enumerate() {
+            let n = *name.add(i);
+            let nu = if (0x61..=0x7A).contains(&n) { n - 32 } else { n };
+            if nu != c {
+                return false;
+            }
         }
-    }
-    if is_path && *name.add(4) == 0 {
+        *name.add(w.len()) == 0
+    };
+    // PATH
+    if eqi(&[b'P' as u16, b'A' as u16, b'T' as u16, b'H' as u16]) {
         return wcopy(buffer, size, &[b'C' as u16, b':' as u16, b'\\' as u16, 0]);
+    }
+    // OS = nanokrnl
+    if eqi(&[b'O' as u16, b'S' as u16]) {
+        let v = [b'n' as u16, b'a' as u16, b'n' as u16, b'o' as u16, b'k' as u16,
+                 b'r' as u16, b'n' as u16, b'l' as u16, 0];
+        return wcopy(buffer, size, &v);
+    }
+    // SystemRoot = C:\fxcknmc
+    if eqi(&[b'S' as u16, b'Y' as u16, b'S' as u16, b'T' as u16, b'E' as u16,
+             b'M' as u16, b'R' as u16, b'O' as u16, b'O' as u16, b'T' as u16]) {
+        let v = [b'C' as u16, b':' as u16, b'\\' as u16, b'f' as u16, b'x' as u16,
+                 b'c' as u16, b'k' as u16, b'n' as u16, b'm' as u16, b'c' as u16, 0];
+        return wcopy(buffer, size, &v);
     }
     SetLastError(ERROR_ENVVAR_NOT_FOUND);
     0
@@ -2506,6 +2520,45 @@ pub unsafe extern "C" fn GetModuleHandleExW(
 #[no_mangle]
 pub extern "C" fn GetConsoleWindow() -> u64 {
     0
+}
+
+/// `CompareStringOrdinal(s1, c1, s2, c2, ignoreCase)` — ordinal (code-unit) wide
+/// comparison. Returns CSTR_LESS_THAN(1)/EQUAL(2)/GREATER_THAN(3). `c < 0` means
+/// NUL-terminated. cmd.exe sorts/searches with this; a wrong result spins it.
+#[no_mangle]
+pub unsafe extern "C" fn CompareStringOrdinal(
+    s1: *const u16,
+    c1: i32,
+    s2: *const u16,
+    c2: i32,
+    ignore_case: i32,
+) -> i32 {
+    let n1 = if c1 < 0 { wlen(s1) } else { c1 as usize };
+    let n2 = if c2 < 0 { wlen(s2) } else { c2 as usize };
+    let lc = |c: u16| {
+        if ignore_case != 0 && (b'A' as u16..=b'Z' as u16).contains(&c) {
+            c + 32
+        } else {
+            c
+        }
+    };
+    let mut i = 0;
+    loop {
+        if i == n1 || i == n2 {
+            return if n1 == n2 {
+                2 // CSTR_EQUAL
+            } else if n1 < n2 {
+                1 // CSTR_LESS_THAN
+            } else {
+                3 // CSTR_GREATER_THAN
+            };
+        }
+        let (a, b) = (lc(*s1.add(i)), lc(*s2.add(i)));
+        if a != b {
+            return if a < b { 1 } else { 3 };
+        }
+        i += 1;
+    }
 }
 
 /// `lstrcmpW`/`lstrcmpiW` — wide string compare (case-sensitive / insensitive).
