@@ -1,7 +1,0 @@
-{
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"cd /Users/msuiche/Documents/Projects/ntoskrnl-rs\\npython3 - <<'PY'\\nimport struct\\nf=open('/tmp/cmdmui/cmd.exe.mui','rb').read()\\npe=struct.unpack('<I',f[0x3c:0x40])[0]; nsec=struct.unpack...",
-  "error": "Exit code 1\nTraceback (most recent call last):\n  File \"<stdin>\", line 15, in <module>\n  File \"<stdin>\", line 12, in rd16\nTypeError: unsupported operand type(s) for +: 'NoneType' and 'int'",
-  "timestamp": "2026-06-12T12:07:37.771Z",
-  "retry_count": 1
-}

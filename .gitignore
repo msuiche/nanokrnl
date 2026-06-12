@@ -38,3 +38,6 @@ sortexe/*.mui
 *.exp
 
 .DS_Store
+
+# OMC tooling state
+.omc/
