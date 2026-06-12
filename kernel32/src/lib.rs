@@ -49,6 +49,7 @@ const NT_GET_EXIT_CODE_PROCESS: u32 = 29;
 const NT_SET_CONSOLE_MODE: u32 = 30;
 const NT_LOAD_MESSAGE: u32 = 31;
 const NT_QUERY_ATTRIBUTES: u32 = 32;
+const NT_QUERY_DIRECTORY: u32 = 33;
 
 // A couple of Win32 error codes used by the shim.
 const ERROR_SUCCESS: u32 = 0;
@@ -2506,6 +2507,136 @@ pub unsafe extern "C" fn GetFileAttributesW(name: *const u16) -> u32 {
     attrs
 }
 
+/// `GetFileAttributesExW(lpFileName, fInfoLevelId, lpFileInformation)` — the
+/// existence/attribute check cmd uses for external-command resolution. Fills a
+/// `WIN32_FILE_ATTRIBUTE_DATA` (attrs@0, three FILETIMEs@4, sizeHigh@28,
+/// sizeLow@32; 36 bytes) and returns TRUE, or FALSE + ERROR_FILE_NOT_FOUND.
+/// Times and size are left zero (the RAM-fs query reports only attributes).
+#[no_mangle]
+pub unsafe extern "C" fn GetFileAttributesExW(
+    name: *const u16,
+    _info_level: u32,
+    out: *mut u8,
+) -> i32 {
+    if name.is_null() || out.is_null() {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return 0;
+    }
+    let len = wstrlen(name);
+    let attrs = syscall3(NT_QUERY_ATTRIBUTES, name as u64, len as u64, 0) as u32;
+    if attrs == INVALID_FILE_ATTRIBUTES {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return 0;
+    }
+    core::ptr::write_bytes(out, 0, 36);
+    *(out as *mut u32) = attrs;
+    1
+}
+
+/// `NeedCurrentDirectoryForExePathW(ExeName)` — whether the current directory
+/// should be part of the executable search path. Return TRUE (the default when
+/// `NoDefaultCurrentDirectoryInExePath` isn't set).
+#[no_mangle]
+pub extern "C" fn NeedCurrentDirectoryForExePathW(_exe_name: *const u16) -> i32 {
+    1
+}
+
+/// If `cand` (NUL-terminated, `cand_len` chars) names an existing non-directory
+/// file, copy it to `buffer` and return its length (chars, excl. NUL); 0 if it
+/// doesn't exist; the required size if `buffer` is too small. Helper for
+/// [`SearchPathW`].
+unsafe fn search_emit(
+    cand: *const u16,
+    cand_len: usize,
+    buffer: *mut u16,
+    buf_len: u32,
+    file_part: *mut *mut u16,
+) -> u32 {
+    let attrs = syscall3(NT_QUERY_ATTRIBUTES, cand as u64, cand_len as u64, 0) as u32;
+    if attrs == INVALID_FILE_ATTRIBUTES || attrs & 0x10 != 0 {
+        return 0; // missing, or a directory
+    }
+    if buffer.is_null() || (buf_len as usize) <= cand_len {
+        return (cand_len + 1) as u32; // required size
+    }
+    for i in 0..cand_len {
+        *buffer.add(i) = *cand.add(i);
+    }
+    *buffer.add(cand_len) = 0;
+    if !file_part.is_null() {
+        let mut fp = buffer;
+        for i in 0..cand_len {
+            let c = *buffer.add(i);
+            if c == b'\\' as u16 || c == b'/' as u16 {
+                fp = buffer.add(i + 1);
+            }
+        }
+        *file_part = fp;
+    }
+    cand_len as u32
+}
+
+/// `SearchPathW(lpPath, lpFileName, lpExtension, …)` — locate an executable/file
+/// by name. Minimal model for our single-directory RAM filesystem: compose the
+/// leaf name (appending `lpExtension` when `lpFileName` has no `.`), and look it
+/// up either directly (if it already contains a path separator) or under `C:\`
+/// (our only directory, which is also what `%PATH%` points at). This is how cmd
+/// resolves external commands, so without it every bare command name is
+/// "not recognized".
+#[no_mangle]
+pub unsafe extern "C" fn SearchPathW(
+    _path: *const u16,
+    file: *const u16,
+    ext: *const u16,
+    buf_len: u32,
+    buffer: *mut u16,
+    file_part: *mut *mut u16,
+) -> u32 {
+    if file.is_null() {
+        return 0;
+    }
+    // leaf = file, plus ext only when file has no extension of its own.
+    let mut leaf = [0u16; 320];
+    let mut ll = 0usize;
+    let flen = wstrlen(file).min(300);
+    let mut has_dot = false;
+    for i in 0..flen {
+        let c = *file.add(i);
+        if c == b'.' as u16 {
+            has_dot = true;
+        }
+        leaf[ll] = c;
+        ll += 1;
+    }
+    if !has_dot && !ext.is_null() {
+        let el = wstrlen(ext).min(16);
+        for i in 0..el {
+            leaf[ll] = *ext.add(i);
+            ll += 1;
+        }
+    }
+
+    // Already path-qualified? Look it up as-is.
+    let qualified = leaf[..ll]
+        .iter()
+        .any(|&c| c == b'\\' as u16 || c == b'/' as u16 || c == b':' as u16);
+    if qualified {
+        return search_emit(leaf.as_ptr(), ll, buffer, buf_len, file_part);
+    }
+    // Otherwise try it under C:\ (the current directory / the PATH directory).
+    let mut cand = [0u16; 320];
+    let mut cl = 0usize;
+    for &c in &[b'C' as u16, b':' as u16, b'\\' as u16] {
+        cand[cl] = c;
+        cl += 1;
+    }
+    for i in 0..ll {
+        cand[cl] = leaf[i];
+        cl += 1;
+    }
+    search_emit(cand.as_ptr(), cl, buffer, buf_len, file_part)
+}
+
 /// `GetFileInformationByHandle(hFile, lpFileInformation)` — unsupported; fail.
 #[no_mangle]
 pub extern "C" fn GetFileInformationByHandle(_file: u64, _info: *mut c_void) -> i32 {
@@ -2576,26 +2707,76 @@ pub unsafe extern "C" fn FindFirstFileExW(
     INVALID_HANDLE_VALUE
 }
 
-/// `FindFirstFileW(lpFileName, lpFindFileData)` — like the Ex variant: no
-/// directory model, so report no match with INVALID_HANDLE_VALUE (not 0 — a
-/// caller checks against INVALID_HANDLE_VALUE and would use a 0 handle as if
-/// valid, e.g. cmd.exe path globbing).
-#[no_mangle]
-pub unsafe extern "C" fn FindFirstFileW(_name: *const u16, _find_data: *mut c_void) -> u64 {
-    SetLastError(ERROR_FILE_NOT_FOUND);
-    INVALID_HANDLE_VALUE
+/// Enumeration state behind a find handle: the wildcard pattern (so
+/// FindNextFileW can keep querying) and the index of the next match.
+#[repr(C)]
+struct FindState {
+    index: u32,
+    pattern_len: u32,
+    pattern: [u16; 260],
 }
 
-/// `FindNextFileW(hFindFile, lpFindFileData)` — no more files.
+/// `FindFirstFileW(lpFileName, lpFindFileData)` — begin a directory
+/// enumeration against the RAM filesystem. `lpFileName` is a wildcard pattern
+/// (`C:\*`, `C:\*.exe`, `C:\cmd.exe`). On a match, fills `lpFindFileData` with
+/// the first entry and returns a find handle for FindNextFileW; otherwise sets
+/// ERROR_FILE_NOT_FOUND and returns INVALID_HANDLE_VALUE.
 #[no_mangle]
-pub unsafe extern "C" fn FindNextFileW(_handle: u64, _find_data: *mut c_void) -> i32 {
-    SetLastError(ERROR_NO_MORE_FILES);
-    0
+pub unsafe extern "C" fn FindFirstFileW(name: *const u16, find_data: *mut c_void) -> u64 {
+    if name.is_null() || find_data.is_null() {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+    let len = wstrlen(name).min(259);
+    // Deliver the first match (index 0) straight into the caller's buffer.
+    if syscall4(NT_QUERY_DIRECTORY, name as u64, len as u64, 0, find_data as u64) == 0 {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+    // Stash the pattern + next index so FindNextFileW can continue.
+    let st = HeapAlloc(1, 0, core::mem::size_of::<FindState>() as u64) as *mut FindState;
+    if st.is_null() {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+    (*st).index = 1;
+    (*st).pattern_len = len as u32;
+    for i in 0..len {
+        (*st).pattern[i] = *name.add(i);
+    }
+    st as u64
 }
 
-/// `FindClose(hFindFile)` — accept.
+/// `FindNextFileW(hFindFile, lpFindFileData)` — deliver the next matching
+/// entry, or set ERROR_NO_MORE_FILES and return FALSE at the end.
 #[no_mangle]
-pub extern "C" fn FindClose(_handle: u64) -> i32 {
+pub unsafe extern "C" fn FindNextFileW(handle: u64, find_data: *mut c_void) -> i32 {
+    if handle == 0 || handle == INVALID_HANDLE_VALUE || find_data.is_null() {
+        SetLastError(ERROR_NO_MORE_FILES);
+        return 0;
+    }
+    let st = handle as *mut FindState;
+    let ok = syscall4(
+        NT_QUERY_DIRECTORY,
+        (*st).pattern.as_ptr() as u64,
+        (*st).pattern_len as u64,
+        (*st).index as u64,
+        find_data as u64,
+    );
+    if ok == 0 {
+        SetLastError(ERROR_NO_MORE_FILES);
+        return 0;
+    }
+    (*st).index += 1;
+    1
+}
+
+/// `FindClose(hFindFile)` — release the enumeration handle.
+#[no_mangle]
+pub unsafe extern "C" fn FindClose(handle: u64) -> i32 {
+    if handle != 0 && handle != INVALID_HANDLE_VALUE {
+        HeapFree(1, 0, handle as *mut u8);
+    }
     1
 }
 

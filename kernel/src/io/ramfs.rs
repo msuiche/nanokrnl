@@ -22,8 +22,12 @@ pub struct RamFile {
     pub data: &'static [u8],
 }
 
-/// The filesystem contents. A couple of demonstration files for now; the set
-/// grows as real programs need specific paths (e.g. `.mui` resources).
+/// The filesystem contents, all in the `C:\` root. Demonstration text files
+/// plus the embedded console programs — exposing the `.exe`s here lets them be
+/// enumerated (`dir`, `where`) and launched by path (`CreateProcessW`). The
+/// executable bytes are shared with the loader's `const` images (no second
+/// copy). Entries with empty data (an image that wasn't built) are skipped by
+/// lookups since their path still matches but length is zero.
 pub static FILES: &[RamFile] = &[
     RamFile {
         path: "C:\\hello.txt",
@@ -33,12 +37,13 @@ pub static FILES: &[RamFile] = &[
         path: "C:\\readme.txt",
         data: b"This file lives in kernel memory, opened via NtCreateFile.\n",
     },
-    // A real executable on the filesystem, so CreateProcessW("C:\\child.exe")
-    // can load and launch it (the compute app — reports 5050 then exits).
-    RamFile {
-        path: "C:\\child.exe",
-        data: include_bytes!(env!("NTOS_USERAPP2_IMAGE")),
-    },
+    // A compute app, so CreateProcessW("C:\\child.exe") can load + launch it.
+    RamFile { path: "C:\\child.exe", data: crate::init::USERAPP2_IMAGE },
+    // The real Windows console programs we run against our shims.
+    RamFile { path: "C:\\sort.exe", data: crate::init::SORT_IMAGE },
+    RamFile { path: "C:\\choice.exe", data: crate::init::CHOICE_IMAGE },
+    RamFile { path: "C:\\where.exe", data: crate::init::WHERE_IMAGE },
+    RamFile { path: "C:\\cmd.exe", data: crate::init::CMD_IMAGE },
 ];
 
 /// Object-manager type for RAM files, distinct from `DEVICE_TYPE` so the read
@@ -109,6 +114,92 @@ pub fn attributes(path: &str) -> u32 {
         FILE_ATTRIBUTE_NORMAL
     } else {
         INVALID
+    }
+}
+
+/// One result of a directory enumeration: the bare file name (no directory),
+/// its Win32 attributes, and its size in bytes.
+pub struct DirEntry {
+    pub name: &'static str,
+    pub attributes: u32,
+    pub size: u64,
+}
+
+/// `FindFirstFile`/`FindNextFile` backend: the `index`-th [`FILES`] entry whose
+/// path matches the wildcard `pattern` (`C:\*`, `C:\*.exe`, `C:\cmd.exe`, …).
+/// The pattern's directory part (everything up to the last separator) must
+/// equal the file's directory; the trailing name part is glob-matched (`*` and
+/// `?`, case-insensitive). Returns `None` once `index` is past the last match,
+/// which is how the caller detects `ERROR_NO_MORE_FILES`.
+pub fn find(pattern: &str, index: usize) -> Option<DirEntry> {
+    let (pat_dir, pat_name) = split_path(pattern);
+    // A bare directory pattern ("C:\", which has an empty name part) means
+    // "everything in that directory" — cmd's `dir` enumerates a directory path
+    // directly rather than appending `*`.
+    let pat_name = if pat_name.is_empty() { "*" } else { pat_name };
+    let mut n = 0;
+    for f in FILES {
+        let (dir, name) = split_path(f.path);
+        if dir_eq(dir, pat_dir) && glob_match(pat_name.as_bytes(), name.as_bytes()) {
+            if n == index {
+                return Some(DirEntry {
+                    name,
+                    attributes: 0x80, // FILE_ATTRIBUTE_NORMAL
+                    size: f.data.len() as u64,
+                });
+            }
+            n += 1;
+        }
+    }
+    None
+}
+
+/// Split a path into `(directory-with-trailing-separator, file-name)`. A path
+/// with no separator has an empty directory.
+fn split_path(p: &str) -> (&str, &str) {
+    match p.bytes().rposition(|b| b == b'\\' || b == b'/') {
+        Some(i) => (&p[..=i], &p[i + 1..]),
+        None => ("", p),
+    }
+}
+
+/// Case-insensitive directory comparison (`/`≡`\`) tolerating a missing
+/// trailing separator on either side, so `C:\` and `C:` compare equal.
+fn dir_eq(a: &str, b: &str) -> bool {
+    fn trim(s: &str) -> &str {
+        s.trim_end_matches(|c| c == '\\' || c == '/')
+    }
+    path_eq(trim(a), trim(b))
+}
+
+/// Case-insensitive ASCII byte equality.
+fn eq_ci(a: u8, b: u8) -> bool {
+    a.to_ascii_lowercase() == b.to_ascii_lowercase()
+}
+
+/// Minimal case-insensitive glob: `*` matches any run (including empty), `?`
+/// matches one character, everything else is literal. Iterative on `*` so a
+/// pattern full of stars can't blow the stack.
+fn glob_match(pat: &[u8], name: &[u8]) -> bool {
+    match pat.split_first() {
+        None => name.is_empty(),
+        Some((&b'*', rest)) => {
+            let mut tail = name;
+            loop {
+                if glob_match(rest, tail) {
+                    return true;
+                }
+                match tail.split_first() {
+                    Some((_, t)) => tail = t,
+                    None => return false,
+                }
+            }
+        }
+        Some((&b'?', rest)) => !name.is_empty() && glob_match(rest, &name[1..]),
+        Some((&p, rest)) => match name.split_first() {
+            Some((&c, t)) if eq_ci(p, c) => glob_match(rest, t),
+            _ => false,
+        },
     }
 }
 

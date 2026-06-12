@@ -56,6 +56,7 @@ pub const SVC_GET_EXIT_CODE_PROCESS: usize = 29;
 pub const SVC_SET_CONSOLE_MODE: usize = 30;
 pub const SVC_LOAD_MESSAGE: usize = 31;
 pub const SVC_QUERY_ATTRIBUTES: usize = 32;
+pub const SVC_QUERY_DIRECTORY: usize = 33;
 
 /// A shared kernel counter incremented atomically by [`SVC_INCREMENT_COUNTER`].
 /// Used to prove concurrent ring-3 threads both make progress through the
@@ -118,6 +119,55 @@ pub fn register_all() {
     register_service(SVC_SET_CONSOLE_MODE, nt_set_console_mode);
     register_service(SVC_LOAD_MESSAGE, nt_load_message);
     register_service(SVC_QUERY_ATTRIBUTES, nt_query_attributes);
+    register_service(SVC_QUERY_DIRECTORY, nt_query_directory);
+}
+
+/// `FindFirstFile`/`FindNextFile` backend (a1 = UTF-16 wildcard pattern ptr,
+/// a2 = char count, a3 = zero-based match index, a4 = user `WIN32_FIND_DATAW`
+/// buffer). Fills the buffer with the `index`-th matching RAM-fs entry and
+/// returns 1; returns 0 when there is no such match (end of enumeration).
+extern "C" fn nt_query_directory(pat_ptr: u64, pat_len: u64, index: u64, out_ptr: u64) -> u64 {
+    let mut wbuf = [0u16; 260];
+    let Some(w) = read_user_u16(pat_ptr, pat_len as usize, &mut wbuf) else {
+        return 0;
+    };
+    let mut abuf = [0u8; 260];
+    let mut n = 0;
+    for &c in w {
+        if n < abuf.len() {
+            abuf[n] = c as u8;
+            n += 1;
+        }
+    }
+    let Ok(pattern) = core::str::from_utf8(&abuf[..n]) else {
+        return 0;
+    };
+    let Some(entry) = io::ramfs::find(pattern, index as usize) else {
+        return 0;
+    };
+
+    // WIN32_FIND_DATAW (x64): dwFileAttributes@0, three FILETIMEs@4, sizes@28/32,
+    // two reserved DWORDs@36/40, cFileName[260]@44, cAlternateFileName[14]@564.
+    const FIND_DATA_SIZE: usize = 592;
+    if out_ptr == 0 || crate::mm::virt::probe_for_write(out_ptr, FIND_DATA_SIZE, 2).is_err() {
+        return 0;
+    }
+    crate::mm::virt::user_access_begin();
+    unsafe {
+        core::ptr::write_bytes(out_ptr as *mut u8, 0, FIND_DATA_SIZE);
+        *(out_ptr as *mut u32) = entry.attributes;
+        *((out_ptr + 28) as *mut u32) = (entry.size >> 32) as u32;
+        *((out_ptr + 32) as *mut u32) = entry.size as u32;
+        let name = out_ptr + 44; // cFileName
+        let bytes = entry.name.as_bytes();
+        let cch = bytes.len().min(259);
+        for i in 0..cch {
+            *((name + (i as u64) * 2) as *mut u16) = bytes[i] as u16;
+        }
+        *((name + (cch as u64) * 2) as *mut u16) = 0;
+    }
+    crate::mm::virt::user_access_end();
+    1
 }
 
 /// `GetFileAttributesW` backend (a1 = UTF-16 path ptr, a2 = char count).

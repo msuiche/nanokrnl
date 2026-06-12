@@ -1430,17 +1430,20 @@ static MSVCRT_IMAGE: &[u8] = include_bytes!(env!("NTOS_MSVCRT_IMAGE"));
 /// A real Windows console binary (`sort.exe`), embedded for the experiment of
 /// running an unmodified `.exe` against our kernel32 + msvcrt shims. Empty
 /// when not present (see `sortexe/`).
-static SORT_IMAGE: &[u8] = include_bytes!(env!("NTOS_SORT_IMAGE"));
-static CHOICE_IMAGE: &[u8] = include_bytes!(env!("NTOS_CHOICE_IMAGE"));
+// `pub(crate) const` so the RAM filesystem ([`crate::io::ramfs`]) can expose
+// these same embedded images as files (e.g. `C:\cmd.exe`) without a second
+// `include_bytes!` copy — a `const &[u8]` references the one emitted blob.
+pub(crate) const SORT_IMAGE: &[u8] = include_bytes!(env!("NTOS_SORT_IMAGE"));
+pub(crate) const CHOICE_IMAGE: &[u8] = include_bytes!(env!("NTOS_CHOICE_IMAGE"));
 static CHOICE_MUI: &[u8] = include_bytes!(env!("NTOS_CHOICE_MUI_IMAGE"));
-static WHERE_IMAGE: &[u8] = include_bytes!(env!("NTOS_WHERE_IMAGE"));
+pub(crate) const WHERE_IMAGE: &[u8] = include_bytes!(env!("NTOS_WHERE_IMAGE"));
 static WHERE_MUI: &[u8] = include_bytes!(env!("NTOS_WHERE_MUI_IMAGE"));
-static CMD_IMAGE: &[u8] = include_bytes!(env!("NTOS_CMD_IMAGE"));
+pub(crate) const CMD_IMAGE: &[u8] = include_bytes!(env!("NTOS_CMD_IMAGE"));
 static CMD_MUI: &[u8] = include_bytes!(env!("NTOS_CMD_MUI_IMAGE"));
 
 /// A second, independent console app — proves the loader runs arbitrary
 /// programs. Empty when not built (see `scripts/build-userapp2.sh`).
-static USERAPP2_IMAGE: &[u8] = include_bytes!(env!("NTOS_USERAPP2_IMAGE"));
+pub(crate) const USERAPP2_IMAGE: &[u8] = include_bytes!(env!("NTOS_USERAPP2_IMAGE"));
 
 /// The worker app — run by two concurrent threads to demonstrate preemptive
 /// user-mode multitasking. Empty when not built (`scripts/build-worker.sh`).
