@@ -1,0 +1,20 @@
+# userapp2 — a second, independent ring-3 console program for ntoskrnl-rs.
+#
+# A distinct PE from userapp, importing the same kernel32 shim. Its existence
+# proves the loader/kernel32/CRT path runs arbitrary console programs, not a
+# single bespoke one. Built by scripts/build-userapp2.sh.
+[package]
+name = "userapp2"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "userapp2"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"

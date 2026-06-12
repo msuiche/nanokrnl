@@ -1,0 +1,24 @@
+# kernel32 — a minimal Win32 console-API shim for ntoskrnl-rs.
+#
+# A freestanding PE DLL (x86_64-pc-windows-msvc) exporting the handful of
+# kernel32 functions a no-CRT console program uses (GetStdHandle, WriteFile,
+# ReadFile, ExitProcess). Each forwards to this kernel's syscalls. The loader
+# loads it as a DLL and resolves a console app's kernel32 imports against its
+# export table — the real cross-module dynamic-linking path.
+#
+# Not a workspace member (different target + linker flags); built by
+# scripts/build-kernel32.sh.
+[package]
+name = "kernel32"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"

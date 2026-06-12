@@ -1,0 +1,10 @@
+# Build configuration for the worker app (same shape as userapp).
+[build]
+target = "x86_64-pc-windows-msvc"
+
+[unstable]
+build-std = ["core", "compiler_builtins"]
+build-std-features = ["compiler-builtins-mem"]
+
+[target.x86_64-pc-windows-msvc]
+linker = "lld-link"

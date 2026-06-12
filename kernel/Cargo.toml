@@ -1,0 +1,24 @@
+[package]
+name = "kernel"
+version = "0.1.0"
+edition = "2021"
+description = "NT-compatible kernel (ntoskrnl) written in Rust"
+
+# `bootloader_api` defines the kernel<->bootloader ABI (entry point signature,
+# memory map, framebuffer, physical-memory offset). It is the only external
+# dependency of the kernel proper; everything else (GDT, IDT, APIC, paging,
+# pool, scheduler) is implemented in-tree, NT-style.
+[dependencies]
+bootloader_api = "0.11"
+ntabi = { path = "../ntabi" }
+
+# Host-only: property-based testing of the allocator primitives. Never
+# compiled into the freestanding kernel (dev-dependencies don't ship).
+[target.'cfg(not(target_os = "none"))'.dev-dependencies]
+proptest = "1"
+
+[lints.rust]
+# The kernel is full of FFI-shaped, NT-named items (LIST_ENTRY, KPCR, ...).
+# Keep Rust's naming lints from fighting the Windows naming convention where
+# we deliberately mirror it.
+unsafe_op_in_unsafe_fn = "warn"

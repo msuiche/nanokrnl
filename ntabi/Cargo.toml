@@ -1,0 +1,16 @@
+[package]
+name = "ntabi"
+version = "0.1.0"
+edition = "2021"
+description = "Shared, repr(C) NT ABI surface at the kernel<->driver boundary"
+
+# This crate is the contract between ntoskrnl-rs and any driver it loads.
+# It is `no_std`, dependency-free, and compiles for BOTH the kernel target
+# (x86_64-unknown-none) and the driver target (x86_64-pc-windows-msvc), so
+# a single definition guarantees both sides agree on layout and calling
+# convention. It contains types only — no code that could pull in an ABI
+# mismatch or a CRT dependency.
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]

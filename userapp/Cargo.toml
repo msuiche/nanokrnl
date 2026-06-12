@@ -1,0 +1,24 @@
+# userapp — a real ring-3 console program for ntoskrnl-rs.
+#
+# A freestanding PE executable (x86_64-pc-windows-msvc) whose entry issues
+# this kernel's system calls directly via the `syscall` instruction — no CRT,
+# no kernel32/ntdll. The kernel's user-mode PE loader maps it into ring-3
+# pages and runs it. See scripts/build-userapp.sh.
+#
+# Not a workspace member (different target + linker flags); built by the
+# script.
+[package]
+name = "userapp"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "userapp"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"

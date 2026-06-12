@@ -1,0 +1,5 @@
+# Stable Rust is sufficient: x86_64-unknown-none is a Tier-2 target with
+# prebuilt core/alloc, and naked functions (`naked_asm!`) are stable since 1.88.
+[toolchain]
+channel = "stable"
+targets = ["x86_64-unknown-none"]

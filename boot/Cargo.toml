@@ -1,0 +1,10 @@
+[package]
+name = "boot"
+version = "0.1.0"
+edition = "2021"
+description = "Host-side image builder + QEMU runner for ntoskrnl-rs (winload stand-in)"
+
+# `bootloader` (the builder half of bootloader_api) runs on the HOST and
+# packages the kernel ELF into bootable BIOS and UEFI disk images.
+[dependencies]
+bootloader = "0.11"

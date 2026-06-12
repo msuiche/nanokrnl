@@ -1,0 +1,448 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1781160120575,
+  "projectRoot": "/Users/msuiche/Documents/Projects/ntoskrnl-rs",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Rust",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "Cargo.toml"
+        ]
+      }
+    ],
+    "frameworks": [],
+    "packageManager": "cargo",
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": "cd /Users/msuiche/Documents/Projects/ntoskrnl-rs\npkill -9 qemu-system-x86_64 2>/dev/null\ncargo build -p kernel --target x86_64-unknown-none 2>&1 | grep -E \"error\\[|error:|Finished\" | head -1\ncargo +nightly run -q -p boot -- target/x86_64-unknown-none/debug/kernel < /dev/null 2>&1 >/dev/null\nrm -f /tmp/boot.log\ntimeout 60 qemu-system-x86_64 -drive format=raw,file=target/x86_64-unknown-none/debug/disk-bios.img -cpu qemu64,+smep,+smap -serial file:/tmp/boot.log -device isa-debug-exit,iobase=0xf4,iosize=0x04 -display none -no-reboot < /dev/null; echo \"exit $?\"\ngrep -E \"CMD: wait|ALL SELF\" /tmp/boot.log",
+    "testCommand": "cd /Users/msuiche/Documents/Projects/ntoskrnl-rs\ncargo test -p kernel 2>&1 | grep -E \"test result:\" | head -4",
+    "lintCommand": "cargo clippy",
+    "devCommand": "cargo run",
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "scripts"
+    ],
+    "gitBranches": null
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "boot": {
+      "path": "boot",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1781160120568,
+      "keyFiles": [
+        "Cargo.toml"
+      ]
+    },
+    "driver": {
+      "path": "driver",
+      "purpose": null,
+      "fileCount": 5,
+      "lastAccessed": 1781160120568,
+      "keyFiles": [
+        "Cargo.lock",
+        "Cargo.toml",
+        "ntoskrnl.def",
+        "ntoskrnl.lib",
+        "testdriver.sys"
+      ]
+    },
+    "kernel": {
+      "path": "kernel",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1781160120568,
+      "keyFiles": [
+        "Cargo.toml",
+        "build.rs"
+      ]
+    },
+    "kernel32": {
+      "path": "kernel32",
+      "purpose": null,
+      "fileCount": 3,
+      "lastAccessed": 1781160120569,
+      "keyFiles": [
+        "Cargo.lock",
+        "Cargo.toml",
+        "kernel32.dll"
+      ]
+    },
+    "ntabi": {
+      "path": "ntabi",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1781160120569,
+      "keyFiles": [
+        "Cargo.toml"
+      ]
+    },
+    "scripts": {
+      "path": "scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 8,
+      "lastAccessed": 1781160120570,
+      "keyFiles": [
+        "build-app.sh",
+        "build-driver.sh",
+        "build-kernel32.sh",
+        "build-userapp.sh",
+        "build-userapp2.sh"
+      ]
+    },
+    "target": {
+      "path": "target",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1781160120570,
+      "keyFiles": [
+        "CACHEDIR.TAG"
+      ]
+    },
+    "userapp": {
+      "path": "userapp",
+      "purpose": null,
+      "fileCount": 7,
+      "lastAccessed": 1781160120570,
+      "keyFiles": [
+        "Cargo.lock",
+        "Cargo.toml",
+        "kernel32.def",
+        "kernel32.lib",
+        "ntdll.def"
+      ]
+    },
+    "userapp2": {
+      "path": "userapp2",
+      "purpose": null,
+      "fileCount": 5,
+      "lastAccessed": 1781160120570,
+      "keyFiles": [
+        "Cargo.lock",
+        "Cargo.toml",
+        "kernel32.def",
+        "kernel32.lib",
+        "userapp2.exe"
+      ]
+    },
+    "worker": {
+      "path": "worker",
+      "purpose": null,
+      "fileCount": 5,
+      "lastAccessed": 1781160120570,
+      "keyFiles": [
+        "Cargo.lock",
+        "Cargo.toml",
+        "kernel32.def",
+        "kernel32.lib",
+        "worker.exe"
+      ]
+    },
+    "boot/src": {
+      "path": "boot/src",
+      "purpose": "Source code",
+      "fileCount": 1,
+      "lastAccessed": 1781160120570,
+      "keyFiles": [
+        "main.rs"
+      ]
+    },
+    "driver/src": {
+      "path": "driver/src",
+      "purpose": "Source code",
+      "fileCount": 1,
+      "lastAccessed": 1781160120570,
+      "keyFiles": [
+        "main.rs"
+      ]
+    },
+    "kernel/src": {
+      "path": "kernel/src",
+      "purpose": "Source code",
+      "fileCount": 4,
+      "lastAccessed": 1781160120571,
+      "keyFiles": [
+        "init.rs",
+        "lib.rs",
+        "main.rs"
+      ]
+    },
+    "kernel/tests": {
+      "path": "kernel/tests",
+      "purpose": "Test files",
+      "fileCount": 2,
+      "lastAccessed": 1781160120571,
+      "keyFiles": [
+        "bitmap_proptest.rs",
+        "conformance.rs"
+      ]
+    },
+    "kernel32/src": {
+      "path": "kernel32/src",
+      "purpose": "Source code",
+      "fileCount": 1,
+      "lastAccessed": 1781160120571,
+      "keyFiles": [
+        "lib.rs"
+      ]
+    },
+    "ntabi/src": {
+      "path": "ntabi/src",
+      "purpose": "Source code",
+      "fileCount": 1,
+      "lastAccessed": 1781160120571,
+      "keyFiles": [
+        "lib.rs"
+      ]
+    },
+    "userapp/src": {
+      "path": "userapp/src",
+      "purpose": "Source code",
+      "fileCount": 1,
+      "lastAccessed": 1781160120571,
+      "keyFiles": [
+        "main.rs"
+      ]
+    },
+    "userapp2/src": {
+      "path": "userapp2/src",
+      "purpose": "Source code",
+      "fileCount": 1,
+      "lastAccessed": 1781160120572,
+      "keyFiles": [
+        "main.rs"
+      ]
+    },
+    "worker/src": {
+      "path": "worker/src",
+      "purpose": "Source code",
+      "fileCount": 1,
+      "lastAccessed": 1781160120572,
+      "keyFiles": [
+        "main.rs"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "kernel/src/init.rs",
+      "accessCount": 92,
+      "lastAccessed": 1781265593828,
+      "type": "file"
+    },
+    {
+      "path": "kernel32/src/lib.rs",
+      "accessCount": 77,
+      "lastAccessed": 1781263296918,
+      "type": "file"
+    },
+    {
+      "path": "kernel/src/syscalls.rs",
+      "accessCount": 59,
+      "lastAccessed": 1781263167541,
+      "type": "file"
+    },
+    {
+      "path": "userapp/src/main.rs",
+      "accessCount": 49,
+      "lastAccessed": 1781263594620,
+      "type": "file"
+    },
+    {
+      "path": "msvcrt/src/lib.rs",
+      "accessCount": 34,
+      "lastAccessed": 1781262105703,
+      "type": "file"
+    },
+    {
+      "path": "README.md",
+      "accessCount": 26,
+      "lastAccessed": 1781211813033,
+      "type": "file"
+    },
+    {
+      "path": "kernel/src/ke/debug.rs",
+      "accessCount": 19,
+      "lastAccessed": 1781224166229,
+      "type": "file"
+    },
+    {
+      "path": "kernel/src/ldr/pe.rs",
+      "accessCount": 18,
+      "lastAccessed": 1781261308160,
+      "type": "file"
+    },
+    {
+      "path": "kernel/src/io/console.rs",
+      "accessCount": 13,
+      "lastAccessed": 1781225101879,
+      "type": "file"
+    },
+    {
+      "path": "kernel/src/ldr/loaded.rs",
+      "accessCount": 13,
+      "lastAccessed": 1781261315504,
+      "type": "file"
+    },
+    {
+      "path": "kernel/src/ke/traps.rs",
+      "accessCount": 11,
+      "lastAccessed": 1781261444526,
+      "type": "file"
+    },
+    {
+      "path": "kernel/src/ke/thread.rs",
+      "accessCount": 11,
+      "lastAccessed": 1781263464058,
+      "type": "file"
+    },
+    {
+      "path": "kernel/src/mm/virt.rs",
+      "accessCount": 10,
+      "lastAccessed": 1781172337611,
+      "type": "file"
+    },
+    {
+      "path": "kernel/src/ke/usermode.rs",
+      "accessCount": 8,
+      "lastAccessed": 1781263473422,
+      "type": "file"
+    },
+    {
+      "path": "kernel/src/ke/syscall.rs",
+      "accessCount": 4,
+      "lastAccessed": 1781262546731,
+      "type": "file"
+    },
+    {
+      "path": "WORKFLOW.md",
+      "accessCount": 4,
+      "lastAccessed": 1781263672902,
+      "type": "file"
+    },
+    {
+      "path": "kernel/src/ke/mod.rs",
+      "accessCount": 3,
+      "lastAccessed": 1781211190484,
+      "type": "file"
+    },
+    {
+      "path": "kernel/src/io/ramfs.rs",
+      "accessCount": 3,
+      "lastAccessed": 1781263249888,
+      "type": "file"
+    },
+    {
+      "path": "kernel/src/ke/scheduler.rs",
+      "accessCount": 3,
+      "lastAccessed": 1781263483736,
+      "type": "file"
+    },
+    {
+      "path": "kernel/src/rtl/status.rs",
+      "accessCount": 2,
+      "lastAccessed": 1781161793606,
+      "type": "file"
+    },
+    {
+      "path": "kernel/src/ldr/ntdll.rs",
+      "accessCount": 2,
+      "lastAccessed": 1781164842878,
+      "type": "file"
+    },
+    {
+      "path": "worker/src/main.rs",
+      "accessCount": 2,
+      "lastAccessed": 1781176724305,
+      "type": "file"
+    },
+    {
+      "path": "Cargo.toml",
+      "accessCount": 2,
+      "lastAccessed": 1781184606182,
+      "type": "file"
+    },
+    {
+      "path": "kernel/src/io/mod.rs",
+      "accessCount": 2,
+      "lastAccessed": 1781193253449,
+      "type": "file"
+    },
+    {
+      "path": "kernel/src/ldr/mod.rs",
+      "accessCount": 2,
+      "lastAccessed": 1781193630936,
+      "type": "file"
+    },
+    {
+      "path": "kernel/src/ob/handle.rs",
+      "accessCount": 2,
+      "lastAccessed": 1781225047052,
+      "type": "file"
+    },
+    {
+      "path": "kernel/src/cm/mod.rs",
+      "accessCount": 2,
+      "lastAccessed": 1781262491973,
+      "type": "file"
+    },
+    {
+      "path": "kernel/src/lib.rs",
+      "accessCount": 2,
+      "lastAccessed": 1781262515093,
+      "type": "file"
+    },
+    {
+      "path": "kernel/src/ldr/exports.rs",
+      "accessCount": 1,
+      "lastAccessed": 1781160357034,
+      "type": "file"
+    },
+    {
+      "path": "kernel/src/ps/mod.rs",
+      "accessCount": 1,
+      "lastAccessed": 1781182600801,
+      "type": "file"
+    },
+    {
+      "path": "msvcrt/Cargo.toml",
+      "accessCount": 1,
+      "lastAccessed": 1781184465893,
+      "type": "file"
+    },
+    {
+      "path": "kernel/src/ob/mod.rs",
+      "accessCount": 1,
+      "lastAccessed": 1781193131796,
+      "type": "file"
+    },
+    {
+      "path": "kernel/src/ldr/mui.rs",
+      "accessCount": 1,
+      "lastAccessed": 1781193607801,
+      "type": "file"
+    },
+    {
+      "path": "kernel/src/rtl/string.rs",
+      "accessCount": 1,
+      "lastAccessed": 1781262475187,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}

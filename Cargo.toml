@@ -1,0 +1,24 @@
+# ntoskrnl-rs workspace
+#
+# Members:
+#   kernel — the NT-compatible kernel itself (no_std, x86_64-unknown-none).
+#   boot   — host-side builder that wraps the kernel ELF into bootable
+#            BIOS/UEFI disk images and can launch QEMU (the "winload" stand-in).
+[workspace]
+resolver = "2"
+members = ["kernel", "boot", "ntabi"]
+# The test driver is its own workspace (different target + linker flags);
+# excluded here so `cargo build` of the kernel workspace doesn't try to
+# cross-compile it. See driver/ and its build instructions.
+exclude = ["driver", "userapp", "userapp2", "worker", "kernel32", "msvcrt"]
+
+# The kernel is interrupt- and lock-sensitive: panics must abort (no unwinding
+# machinery exists in a freestanding environment), and we keep enough debug
+# info to symbolicate bugchecks.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+debug = true
+lto = true

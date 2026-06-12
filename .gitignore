@@ -1,0 +1,40 @@
+/target
+driver/target
+**/*.img
+# Generated driver-load artifacts (produced by scripts/build-driver.sh).
+driver/ntoskrnl.def
+driver/ntoskrnl.lib
+driver/testdriver.sys
+userapp/target
+userapp/userapp.exe
+userapp/ntdll.def
+userapp/ntdll.lib
+userapp/kernel32.def
+userapp/kernel32.lib
+kernel32/target
+kernel32/kernel32.dll
+userapp2/target
+userapp2/userapp2.exe
+userapp2/kernel32.def
+userapp2/kernel32.lib
+worker/target
+worker/worker.exe
+worker/kernel32.def
+worker/kernel32.lib
+msvcrt/target
+msvcrt/msvcrt.dll
+msvcrt/msvcrt.def
+msvcrt/msvcrt.lib
+
+# Large third-party Microsoft binaries used for the real-binary experiments
+# (kept locally; the build falls back to empty placeholders when absent).
+sortexe/*.exe
+sortexe/*.mui
+
+# Generated import libs / DLLs anywhere (rebuilt from source by scripts/)
+*.dll
+*.lib
+*.def
+*.exp
+
+.DS_Store

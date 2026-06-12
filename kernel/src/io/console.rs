@@ -1,0 +1,234 @@
+//! `\Device\Console` — the console output device.
+//!
+//! A built-in driver (like [`super::null`]) whose write dispatch routes the
+//! IRP's buffer to the debug serial port. This is the device a console
+//! application's standard-output handle refers to: `WriteFile` →
+//! `NtWriteFile` → an `IRP_MJ_WRITE` to this device → bytes on the wire.
+//!
+//! NT's real console stack is far more elaborate (conhost/condrv, input
+//! records, screen buffers); this is the minimal output path that makes a
+//! "print a line and exit" console program work end to end.
+
+use super::{
+    io_complete_request, io_create_device, io_create_driver, io_get_current_stack_location,
+    namespace, AbiUnicodeString, DeviceObject, DriverObject, Irp, Ntstatus, IRP_MJ_CLOSE,
+    IRP_MJ_CREATE, IRP_MJ_READ, IRP_MJ_WRITE,
+};
+use crate::ke::spinlock::SpinLock;
+use crate::rtl::NtStatus;
+use crate::w;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Total bytes written through the console device — lets the self tests
+/// confirm an `IRP_MJ_WRITE` actually reached the device.
+static BYTES_WRITTEN: AtomicU64 = AtomicU64::new(0);
+
+/// `BYTES_WRITTEN` snapshot.
+pub fn bytes_written() -> u64 {
+    BYTES_WRITTEN.load(Ordering::Acquire)
+}
+
+/// Diagnostics: count of `IRP_MJ_READ` dispatches and total bytes drained.
+static READ_CALLS: AtomicU64 = AtomicU64::new(0);
+static READ_BYTES: AtomicU64 = AtomicU64::new(0);
+/// `(read calls, read bytes)` snapshot.
+pub fn read_stats() -> (u64, u64) {
+    (READ_CALLS.load(Ordering::Acquire), READ_BYTES.load(Ordering::Acquire))
+}
+
+// ---------------------------------------------------------------------------
+// Console input
+// ---------------------------------------------------------------------------
+
+/// A small ring buffer of pending input bytes, fed by the serial receiver
+/// (and by [`push_input`] for deterministic tests). `IRP_MJ_READ` drains it.
+const INPUT_CAP: usize = 256;
+struct ConsoleInput {
+    buf: [u8; INPUT_CAP],
+    head: usize,
+    tail: usize,
+}
+impl ConsoleInput {
+    const fn new() -> Self {
+        ConsoleInput { buf: [0; INPUT_CAP], head: 0, tail: 0 }
+    }
+    fn push(&mut self, b: u8) {
+        let next = (self.tail + 1) % INPUT_CAP;
+        if next != self.head {
+            self.buf[self.tail] = b;
+            self.tail = next;
+        } // else: buffer full, drop (a real TTY would flow-control)
+    }
+    fn pop(&mut self) -> Option<u8> {
+        if self.head == self.tail {
+            return None;
+        }
+        let b = self.buf[self.head];
+        self.head = (self.head + 1) % INPUT_CAP;
+        Some(b)
+    }
+}
+
+static INPUT: SpinLock<ConsoleInput> = SpinLock::new(ConsoleInput::new());
+
+/// End-of-input flag. When set, a blocking `IRP_MJ_READ` returns 0 bytes
+/// (EOF) once the input buffer drains, instead of waiting for more — the
+/// signal a console program needs to stop reading stdin and finish (e.g. a
+/// real `sort.exe` reads to EOF, then sorts and writes its output).
+static INPUT_EOF: AtomicU64 = AtomicU64::new(0);
+
+/// Mark the console input as ended (or not). With `eof` true, reads return
+/// EOF after the buffer empties.
+pub fn set_input_eof(eof: bool) {
+    INPUT_EOF.store(eof as u64, Ordering::Release);
+}
+
+fn input_at_eof() -> bool {
+    INPUT_EOF.load(Ordering::Acquire) != 0
+}
+
+/// Inject a byte into the console input buffer. Called by the (future)
+/// serial-RX interrupt path and by tests to simulate typed input.
+pub fn push_input(b: u8) {
+    INPUT.lock().push(b);
+}
+
+/// Inject a string into the console input buffer (test/bring-up helper).
+pub fn push_input_str(s: &[u8]) {
+    let mut input = INPUT.lock();
+    for &b in s {
+        input.push(b);
+    }
+}
+
+/// Peek the next pending input byte without consuming it. Drains the UART
+/// first so freshly-typed bytes are visible. Returns -1 when no input is
+/// buffered (so callers can distinguish "a key is ready" from "nothing yet").
+/// Used by `PeekConsoleInputW` to report a pending key event — interactive
+/// tools (e.g. choice.exe) poll for an input event before issuing the read.
+pub fn peek_input_byte() -> i32 {
+    feed_from_serial();
+    let input = INPUT.lock();
+    if input.head == input.tail {
+        -1
+    } else {
+        input.buf[input.head] as i32
+    }
+}
+
+/// Drain any bytes the UART has received into the input buffer.
+fn feed_from_serial() {
+    while let Some(b) = crate::hal::serial::try_read_byte() {
+        INPUT.lock().push(b);
+    }
+}
+
+/// Copy up to `max` buffered input bytes into `dst`; returns the count.
+fn drain_input(dst: *mut u8, max: usize) -> usize {
+    let mut input = INPUT.lock();
+    let mut n = 0;
+    while n < max {
+        match input.pop() {
+            Some(b) => {
+                // SAFETY: caller guarantees dst is valid for `max` bytes.
+                unsafe { *dst.add(n) = b };
+                n += 1;
+            }
+            None => break,
+        }
+    }
+    n
+}
+
+static DRIVER_NAME: AbiUnicodeString = AbiUnicodeString::from_units(w!("\\Driver\\Console"));
+static DEVICE_NAME: AbiUnicodeString = AbiUnicodeString::from_units(w!("\\Device\\Console"));
+static LINK_NAME: AbiUnicodeString = AbiUnicodeString::from_units(w!("\\DosDevices\\CON"));
+
+/// Dispatch: writes go to the serial port; create/close/read succeed
+/// trivially (reads return EOF — no console input yet).
+unsafe extern "win64" fn console_dispatch(_device: *mut DeviceObject, irp: *mut Irp) -> Ntstatus {
+    unsafe {
+        let sl = io_get_current_stack_location(irp);
+        let info = match (*sl).major_function {
+            IRP_MJ_WRITE => {
+                let len = (*sl).read_write().length as usize;
+                let buf = (*irp).system_buffer;
+                if !buf.is_null() && len > 0 {
+                    // SMAP: bracket the read of the user buffer.
+                    crate::mm::virt::user_access_begin();
+                    let bytes = core::slice::from_raw_parts(buf, len);
+                    // Console output is text; render UTF-8, falling back to
+                    // raw bytes so non-UTF-8 still reaches the port.
+                    match core::str::from_utf8(bytes) {
+                        Ok(s) => crate::kd_print!("{}", s),
+                        Err(_) => {
+                            for &b in bytes {
+                                crate::kd_print!("{}", b as char);
+                            }
+                        }
+                    }
+                    crate::mm::virt::user_access_end();
+                    BYTES_WRITTEN.fetch_add(len as u64, Ordering::AcqRel);
+                }
+                len as u64
+            }
+            IRP_MJ_READ => {
+                READ_CALLS.fetch_add(1, Ordering::AcqRel);
+                let len = (*sl).read_write().length as usize;
+                let buf = (*irp).system_buffer;
+                if buf.is_null() || len == 0 {
+                    0
+                } else {
+                    // Blocking read: poll the serial receiver into the input
+                    // buffer, yielding the CPU between polls, until at least
+                    // one byte is available, then drain what fits. Tests
+                    // pre-inject input so this returns immediately.
+                    loop {
+                        feed_from_serial();
+                        // SMAP: bracket the write into the user buffer only
+                        // (not the blocking delay below).
+                        crate::mm::virt::user_access_begin();
+                        let n = drain_input(buf, len);
+                        crate::mm::virt::user_access_end();
+                        if n > 0 {
+                            READ_BYTES.fetch_add(n as u64, Ordering::AcqRel);
+                            break n as u64;
+                        }
+                        // Empty buffer: report EOF if input has ended, else
+                        // block (yield) until more arrives.
+                        if input_at_eof() {
+                            break 0;
+                        }
+                        crate::ke::dispatcher::ke_delay_execution_thread(1);
+                    }
+                }
+            }
+            _ => 0,
+        };
+        (*irp).io_status.status = Ntstatus(NtStatus::SUCCESS.0);
+        (*irp).io_status.information = info;
+        io_complete_request(irp);
+    }
+    Ntstatus(NtStatus::SUCCESS.0)
+}
+
+unsafe extern "win64" fn driver_entry(
+    driver: *mut DriverObject,
+    _registry_path: *mut AbiUnicodeString,
+) -> Ntstatus {
+    unsafe {
+        for major in [IRP_MJ_CREATE, IRP_MJ_CLOSE, IRP_MJ_READ, IRP_MJ_WRITE] {
+            (*driver).major_function[major as usize] = Some(console_dispatch);
+        }
+    }
+    Ntstatus(NtStatus::SUCCESS.0)
+}
+
+/// Load the console driver, create `\Device\Console`, and alias it as
+/// `\DosDevices\CON`. Returns the device.
+pub fn initialize() -> Result<*mut DeviceObject, NtStatus> {
+    let driver = io_create_driver(DRIVER_NAME, driver_entry)?;
+    let device = io_create_device(driver, DEVICE_NAME, core::ptr::null_mut())?;
+    namespace::create_symbolic_link(&LINK_NAME, &DEVICE_NAME);
+    Ok(device)
+}

@@ -1,0 +1,16 @@
+# Build configuration for the kernel32 shim DLL.
+#
+# Same toolchain shape as the driver/userapp: the real Windows target, core +
+# compiler_builtins via build-std, LLVM's MSVC-flavored LLD as the linker.
+# Link arguments (DLL, entry, no default libs, and the /EXPORT: directives
+# that populate the export table) are injected by scripts/build-kernel32.sh.
+
+[build]
+target = "x86_64-pc-windows-msvc"
+
+[unstable]
+build-std = ["core", "compiler_builtins"]
+build-std-features = ["compiler-builtins-mem"]
+
+[target.x86_64-pc-windows-msvc]
+linker = "lld-link"

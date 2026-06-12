@@ -1,0 +1,18 @@
+# worker — a ring-3 program used to demonstrate concurrent user-mode threads.
+# Two threads run this same image at once; each loops incrementing a shared
+# kernel counter and sleeping (forcing the scheduler to interleave them).
+[package]
+name = "worker"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "worker"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"

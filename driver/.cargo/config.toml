@@ -1,0 +1,19 @@
+# Build configuration for the PE test driver.
+#
+# Targets the real Windows kernel triple and recompiles `core` +
+# `compiler_builtins` for it (build-std) so we get memcpy/memset/etc. without
+# a system CRT. The linker is LLVM's MSVC-flavored LLD (`lld-link`), which
+# runs on macOS/Linux and accepts link.exe-style arguments. The remaining
+# link arguments (subsystem, entry point, no default libs, and the generated
+# ntoskrnl.lib import library) are injected via RUSTFLAGS by
+# scripts/driver-test.sh, which knows the absolute path to the import lib.
+
+[build]
+target = "x86_64-pc-windows-msvc"
+
+[unstable]
+build-std = ["core", "compiler_builtins"]
+build-std-features = ["compiler-builtins-mem"]
+
+[target.x86_64-pc-windows-msvc]
+linker = "lld-link"

@@ -1,0 +1,31 @@
+# testdriver — a real PE/COFF kernel driver for ntoskrnl-rs.
+#
+# Built for x86_64-pc-windows-msvc (the genuine Windows kernel target), this
+# compiles to a PE with an import table referencing `ntoskrnl.exe` exports
+# and a base-relocation section — exactly what a WDK driver produces. The
+# ntoskrnl-rs PE loader maps it, binds those imports to the kernel export
+# table, and calls DriverEntry. See scripts/driver-test.sh for the build.
+#
+# Not a member of the main workspace (different target + linker flags);
+# built on its own via the script.
+[package]
+name = "testdriver"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# The shared ABI — same struct layouts and win64 signatures the kernel uses.
+ntabi = { path = "../ntabi" }
+
+[[bin]]
+name = "testdriver"
+path = "src/main.rs"
+
+# Freestanding: panics abort (no unwinder in a driver), and we keep symbols
+# light. build-std (see .cargo/config.toml) recompiles core for the target.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"

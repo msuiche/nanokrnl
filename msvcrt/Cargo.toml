@@ -1,0 +1,26 @@
+# msvcrt — a minimal C-runtime shim for ntoskrnl-rs.
+#
+# A freestanding PE DLL (x86_64-pc-windows-msvc) exporting the subset of the
+# classic Microsoft C runtime that a small console binary (our first target:
+# the real Windows `sort.exe`) imports: the pure string/memory/sort helpers,
+# the MSVC CRT startup helpers (`__getmainargs`, `_initterm`, ...), and SEH
+# glue stubs. Like our `kernel32` shim, it issues this kernel's syscalls
+# inline (no imports of its own); the loader binds an app's `msvcrt` imports
+# to its export table.
+#
+# Not a workspace member (different target + linker flags); built by
+# scripts/build-msvcrt.sh.
+[package]
+name = "msvcrt"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
