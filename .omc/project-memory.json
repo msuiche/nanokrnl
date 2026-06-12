@@ -18,8 +18,8 @@
     "runtime": null
   },
   "build": {
-    "buildCommand": "cd /Users/msuiche/Documents/Projects/ntoskrnl-rs\npkill -9 qemu-system-x86_64 2>/dev/null\ncargo build -p kernel --target x86_64-unknown-none 2>&1 | grep -E \"error\\[|error:|Finished\" | head -1\ncargo +nightly run -q -p boot -- target/x86_64-unknown-none/debug/kernel < /dev/null 2>&1 >/dev/null\nrm -f /tmp/boot.log\ntimeout 60 qemu-system-x86_64 -drive format=raw,file=target/x86_64-unknown-none/debug/disk-bios.img -cpu qemu64,+smep,+smap -serial file:/tmp/boot.log -device isa-debug-exit,iobase=0xf4,iosize=0x04 -display none -no-reboot < /dev/null; echo \"exit $?\"\ngrep -E \"CMD: wait|ALL SELF\" /tmp/boot.log",
-    "testCommand": "cd /Users/msuiche/Documents/Projects/ntoskrnl-rs\ncargo test -p kernel 2>&1 | grep -E \"test result:\" | head -4",
+    "buildCommand": "cd /Users/msuiche/Documents/Projects/ntoskrnl-rs\npkill -9 qemu-system-x86_64 2>/dev/null\ncargo build -p kernel --target x86_64-unknown-none 2>&1 | grep -E \"error\\[|error:|Finished\" | head -1\ncargo +nightly run -q -p boot -- target/x86_64-unknown-none/debug/kernel < /dev/null 2>&1 >/dev/null\nrm -f /tmp/boot.log\ntimeout 60 qemu-system-x86_64 -drive format=raw,file=target/x86_64-unknown-none/debug/disk-bios.img -cpu qemu64,+smep,+smap -serial file:/tmp/boot.log -device isa-debug-exit,iobase=0xf4,iosize=0x04 -display none -no-reboot < /dev/null; echo \"exit $?\"\ngrep -E \"SORT: wait|CHOICE: wait|WHERE: wait|CMD: wait|ALL SELF|FAIL\" /tmp/boot.log\ncargo test -p kernel 2>&1 | grep -E \"test result:\" | head -1",
+    "testCommand": "cd /Users/msuiche/Documents/Projects/ntoskrnl-rs\npkill -9 qemu-system-x86_64 2>/dev/null\ncargo build -p kernel --target x86_64-unknown-none 2>&1 | grep -E \"error\\[|error:|Finished\" | head -1\ncargo +nightly run -q -p boot -- target/x86_64-unknown-none/debug/kernel < /dev/null 2>&1 >/dev/null\nrm -f /tmp/boot.log\ntimeout 60 qemu-system-x86_64 -drive format=raw,file=target/x86_64-unknown-none/debug/disk-bios.img -cpu qemu64,+smep,+smap -serial file:/tmp/boot.log -device isa-debug-exit,iobase=0xf4,iosize=0x04 -display none -no-reboot < /dev/null; echo \"exit $?\"\ngrep -E \"SORT: wait|CHOICE: wait|WHERE: wait|CMD: wait|ALL SELF|FAIL\" /tmp/boot.log\ncargo test -p kernel 2>&1 | grep -E \"test result:\" | head -1",
     "lintCommand": "cargo clippy",
     "devCommand": "cargo run",
     "scripts": {}
@@ -241,20 +241,20 @@
   "hotPaths": [
     {
       "path": "kernel/src/init.rs",
-      "accessCount": 92,
-      "lastAccessed": 1781265593828,
+      "accessCount": 95,
+      "lastAccessed": 1781266133896,
       "type": "file"
     },
     {
       "path": "kernel32/src/lib.rs",
-      "accessCount": 77,
-      "lastAccessed": 1781263296918,
+      "accessCount": 80,
+      "lastAccessed": 1781265939336,
       "type": "file"
     },
     {
       "path": "kernel/src/syscalls.rs",
-      "accessCount": 59,
-      "lastAccessed": 1781263167541,
+      "accessCount": 61,
+      "lastAccessed": 1781265918119,
       "type": "file"
     },
     {
@@ -289,8 +289,8 @@
     },
     {
       "path": "kernel/src/io/console.rs",
-      "accessCount": 13,
-      "lastAccessed": 1781225101879,
+      "accessCount": 15,
+      "lastAccessed": 1781265880914,
       "type": "file"
     },
     {
@@ -336,15 +336,15 @@
       "type": "file"
     },
     {
-      "path": "kernel/src/ke/mod.rs",
-      "accessCount": 3,
-      "lastAccessed": 1781211190484,
+      "path": "kernel/src/io/ramfs.rs",
+      "accessCount": 4,
+      "lastAccessed": 1781265862572,
       "type": "file"
     },
     {
-      "path": "kernel/src/io/ramfs.rs",
+      "path": "kernel/src/ke/mod.rs",
       "accessCount": 3,
-      "lastAccessed": 1781263249888,
+      "lastAccessed": 1781211190484,
       "type": "file"
     },
     {

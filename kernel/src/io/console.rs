@@ -123,8 +123,27 @@ fn feed_from_serial() {
     }
 }
 
-/// Copy up to `max` buffered input bytes into `dst`; returns the count.
+/// Console input mode (the `GetConsoleMode`/`SetConsoleMode` bits that matter to
+/// reads). `ENABLE_LINE_INPUT` (0x2) is the default: a read returns one line at
+/// a time (cooked input — what cmd.exe and line-based tools expect). Clearing
+/// it gives raw single-keystroke reads (what choice.exe uses).
+const ENABLE_LINE_INPUT: u32 = 0x0002;
+static INPUT_MODE: AtomicU64 = AtomicU64::new(0x0007); // PROCESSED|LINE|ECHO
+
+/// Set the console input mode (from `SetConsoleMode`).
+pub fn set_input_mode(mode: u32) {
+    INPUT_MODE.store(mode as u64, Ordering::Release);
+}
+
+fn line_mode() -> bool {
+    INPUT_MODE.load(Ordering::Acquire) as u32 & ENABLE_LINE_INPUT != 0
+}
+
+/// Copy buffered input bytes into `dst` (up to `max`). In line-input mode the
+/// copy stops right after the first newline, so each read returns a single
+/// line; in raw mode it drains everything available. Returns the count.
 fn drain_input(dst: *mut u8, max: usize) -> usize {
+    let line = line_mode();
     let mut input = INPUT.lock();
     let mut n = 0;
     while n < max {
@@ -133,6 +152,9 @@ fn drain_input(dst: *mut u8, max: usize) -> usize {
                 // SAFETY: caller guarantees dst is valid for `max` bytes.
                 unsafe { *dst.add(n) = b };
                 n += 1;
+                if line && b == b'\n' {
+                    break; // one line per read in cooked mode
+                }
             }
             None => break,
         }

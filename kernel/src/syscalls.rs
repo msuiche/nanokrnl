@@ -53,6 +53,7 @@ pub const SVC_REG_ENUM_KEY: usize = 26;
 pub const SVC_CREATE_PROCESS: usize = 27;
 pub const SVC_WAIT_PROCESS: usize = 28;
 pub const SVC_GET_EXIT_CODE_PROCESS: usize = 29;
+pub const SVC_SET_CONSOLE_MODE: usize = 30;
 
 /// A shared kernel counter incremented atomically by [`SVC_INCREMENT_COUNTER`].
 /// Used to prove concurrent ring-3 threads both make progress through the
@@ -112,6 +113,14 @@ pub fn register_all() {
     register_service(SVC_CREATE_PROCESS, nt_create_process);
     register_service(SVC_WAIT_PROCESS, nt_wait_process);
     register_service(SVC_GET_EXIT_CODE_PROCESS, nt_get_exit_code_process);
+    register_service(SVC_SET_CONSOLE_MODE, nt_set_console_mode);
+}
+
+/// `SetConsoleMode` backend (a1 = mode bits). Sets the console input mode; the
+/// read path honors `ENABLE_LINE_INPUT` (one line per read vs raw).
+extern "C" fn nt_set_console_mode(mode: u64, _a2: u64, _a3: u64, _a4: u64) -> u64 {
+    crate::io::console::set_input_mode(mode as u32);
+    0
 }
 
 /// `NtCreateProcess` backend (a1 = UTF-16 path ptr, a2 = char count). Looks the

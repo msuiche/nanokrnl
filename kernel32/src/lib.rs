@@ -46,6 +46,7 @@ const NT_REG_ENUM_KEY: u32 = 26;
 const NT_CREATE_PROCESS: u32 = 27;
 const NT_WAIT_PROCESS: u32 = 28;
 const NT_GET_EXIT_CODE_PROCESS: u32 = 29;
+const NT_SET_CONSOLE_MODE: u32 = 30;
 
 // A couple of Win32 error codes used by the shim.
 const ERROR_SUCCESS: u32 = 0;
@@ -823,19 +824,35 @@ pub unsafe extern "C" fn GetModuleHandleExA(_flags: u32, name: *const u8, out: *
 
 /// `GetConsoleMode(hConsoleHandle, lpMode)` — report a plausible console mode.
 #[no_mangle]
-pub unsafe extern "C" fn GetConsoleMode(_handle: u64, mode: *mut u32) -> i32 {
+pub unsafe extern "C" fn GetConsoleMode(handle: u64, mode: *mut u32) -> i32 {
     if mode.is_null() {
         return 0;
     }
-    // ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT
-    *mode = 0x0007;
+    *mode = if is_input_handle(handle) { INPUT_MODE } else { OUTPUT_MODE };
     1
 }
 
 /// `SetConsoleMode(hConsoleHandle, dwMode)` — accepted (no-op). Returns TRUE.
 #[no_mangle]
-pub extern "C" fn SetConsoleMode(_handle: u64, _mode: u32) -> i32 {
+pub unsafe extern "C" fn SetConsoleMode(handle: u64, mode: u32) -> i32 {
+    if is_input_handle(handle) {
+        INPUT_MODE = mode;
+        // Tell the kernel so the console read honors ENABLE_LINE_INPUT.
+        syscall3(NT_SET_CONSOLE_MODE, mode as u64, 0, 0);
+    } else {
+        OUTPUT_MODE = mode;
+    }
     1
+}
+
+/// Console mode state mirrored shim-side for `GetConsoleMode`. Input defaults to
+/// PROCESSED|LINE|ECHO, output to PROCESSED|WRAP_AT_EOL.
+static mut INPUT_MODE: u32 = 0x0007;
+static mut OUTPUT_MODE: u32 = 0x0003;
+
+/// Is `handle` the standard input handle (so console-mode calls target input)?
+unsafe fn is_input_handle(handle: u64) -> bool {
+    handle != 0 && handle == STD_HANDLES[0]
 }
 
 /// Win32 `CPINFO`.
