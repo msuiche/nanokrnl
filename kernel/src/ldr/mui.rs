@@ -149,3 +149,76 @@ pub fn load_string(module_base: u64, id: u32, out: &mut [u16]) -> usize {
     })()
     .unwrap_or(0)
 }
+
+const RT_MESSAGETABLE: u32 = 11;
+
+/// Load message `id` from the registered `.mui`'s `RT_MESSAGETABLE` into `out`
+/// (UTF-16). Returns the number of code units, 0 if not found. Backs
+/// `FormatMessageW(FORMAT_MESSAGE_FROM_HMODULE)`. The message-table data is a
+/// `MESSAGE_RESOURCE_DATA`: a `u32` block count, then `{LowId, HighId, Offset}`
+/// blocks; entries at `Offset` are `{u16 Length, u16 Flags, text[Length-4]}`
+/// (Unicode when `Flags & 1`).
+pub fn load_message(module_base: u64, id: u32, out: &mut [u16]) -> usize {
+    let mui = match lookup(module_base) {
+        Some(m) => m,
+        None => return 0,
+    };
+    (|| -> Option<usize> {
+        let res_rva = rsrc_rva(mui)?;
+        let res_off = rva_to_off(mui, res_rva)?;
+        let type_dir = dir_find(mui, res_off, 0, RT_MESSAGETABLE)?;
+        // First name entry under the type dir, then its first language entry.
+        let named = u16le(mui, res_off + type_dir + 12)? as usize;
+        let name_dir = (u32le(mui, res_off + type_dir + 16 + named * 8 + 4)? & 0x7FFF_FFFF) as usize;
+        let data_rel = (u32le(mui, res_off + name_dir + 16 + 4)? & 0x7FFF_FFFF) as usize;
+        let blob_rva = u32le(mui, res_off + data_rel)?;
+        let mdo = rva_to_off(mui, blob_rva)?; // MESSAGE_RESOURCE_DATA start
+        let nblocks = u32le(mui, mdo)? as usize;
+        for b in 0..nblocks {
+            let bo = mdo + 4 + b * 12;
+            let low = u32le(mui, bo)?;
+            let high = u32le(mui, bo + 4)?;
+            let off = u32le(mui, bo + 8)? as usize;
+            if id >= low && id <= high {
+                let mut p = mdo + off;
+                for _ in low..id {
+                    p += u16le(mui, p)? as usize; // skip whole entries by Length
+                }
+                let len = u16le(mui, p)? as usize;
+                let flags = u16le(mui, p + 2)?;
+                let text_off = p + 4;
+                let text_bytes = len.saturating_sub(4);
+                // Entries are NUL-terminated within their padded Length; stop
+                // at the first NUL so the returned text is just the message.
+                return Some(if flags & 1 != 0 {
+                    let nchars = text_bytes / 2;
+                    let cap = nchars.min(out.len());
+                    let mut n = 0;
+                    while n < cap {
+                        let c = u16le(mui, text_off + n * 2)?;
+                        if c == 0 {
+                            break;
+                        }
+                        out[n] = c;
+                        n += 1;
+                    }
+                    n
+                } else {
+                    let cap = text_bytes.min(out.len());
+                    let mut n = 0;
+                    while n < cap {
+                        let c = *mui.get(text_off + n)?;
+                        if c == 0 {
+                            break;
+                        }
+                        out[n] = c as u16;
+                        n += 1;
+                    }
+                    n
+                });
+            }
+        }
+        None
+    })()
+    .unwrap_or(0)
+}

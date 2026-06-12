@@ -54,6 +54,7 @@ pub const SVC_CREATE_PROCESS: usize = 27;
 pub const SVC_WAIT_PROCESS: usize = 28;
 pub const SVC_GET_EXIT_CODE_PROCESS: usize = 29;
 pub const SVC_SET_CONSOLE_MODE: usize = 30;
+pub const SVC_LOAD_MESSAGE: usize = 31;
 
 /// A shared kernel counter incremented atomically by [`SVC_INCREMENT_COUNTER`].
 /// Used to prove concurrent ring-3 threads both make progress through the
@@ -114,6 +115,36 @@ pub fn register_all() {
     register_service(SVC_WAIT_PROCESS, nt_wait_process);
     register_service(SVC_GET_EXIT_CODE_PROCESS, nt_get_exit_code_process);
     register_service(SVC_SET_CONSOLE_MODE, nt_set_console_mode);
+    register_service(SVC_LOAD_MESSAGE, nt_load_message);
+}
+
+/// `FormatMessage(FROM_HMODULE)` backend: load message `id` from `base`'s
+/// registered `.mui` `RT_MESSAGETABLE` into the user buffer (`buf`/`cch`).
+/// Returns the char count (excluding NUL), 0 if not found.
+extern "C" fn nt_load_message(base: u64, id: u64, buf: u64, cch: u64) -> u64 {
+    let cch = cch as usize;
+    if buf == 0 || cch == 0 {
+        return 0;
+    }
+    let mut tmp = [0u16; 512];
+    let want = cch.saturating_sub(1).min(tmp.len());
+    let n = crate::ldr::mui::load_message(base, id as u32, &mut tmp[..want]);
+    if n == 0 {
+        return 0;
+    }
+    if crate::mm::virt::probe_for_write(buf, (n + 1) * 2, 2).is_err() {
+        return 0;
+    }
+    crate::mm::virt::user_access_begin();
+    let dst = buf as *mut u16;
+    unsafe {
+        for i in 0..n {
+            *dst.add(i) = tmp[i];
+        }
+        *dst.add(n) = 0;
+    }
+    crate::mm::virt::user_access_end();
+    n as u64
 }
 
 /// `SetConsoleMode` backend (a1 = mode bits). Sets the console input mode; the

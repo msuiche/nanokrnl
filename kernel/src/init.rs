@@ -1349,6 +1349,11 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
         match crate::ldr::pe::load_user_process(CMD_IMAGE) {
             Ok(proc) => {
                 kd_println!("CMD: mapped, entry {:#X}; feeding 'exit':", proc.entry_va);
+                // Register cmd.exe.mui so its messages (banner, errors, prompts)
+                // resolve through FormatMessage/the message table.
+                if !CMD_MUI.is_empty() {
+                    crate::ldr::mui::register(proc.image_base, CMD_MUI);
+                }
                 ke::debug::clear_modules();
                 ke::debug::add_module("cmd.exe", proc.image_base, proc.image_size, false);
                 let (k32b, k32s) = crate::ldr::loaded::kernel32_range();
@@ -1409,6 +1414,7 @@ static CHOICE_MUI: &[u8] = include_bytes!(env!("NTOS_CHOICE_MUI_IMAGE"));
 static WHERE_IMAGE: &[u8] = include_bytes!(env!("NTOS_WHERE_IMAGE"));
 static WHERE_MUI: &[u8] = include_bytes!(env!("NTOS_WHERE_MUI_IMAGE"));
 static CMD_IMAGE: &[u8] = include_bytes!(env!("NTOS_CMD_IMAGE"));
+static CMD_MUI: &[u8] = include_bytes!(env!("NTOS_CMD_MUI_IMAGE"));
 
 /// A second, independent console app — proves the loader runs arbitrary
 /// programs. Empty when not built (see `scripts/build-userapp2.sh`).

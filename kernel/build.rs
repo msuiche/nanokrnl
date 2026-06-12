@@ -94,6 +94,11 @@ fn main() {
         "no_cmd.bin",
         "NTOS_CMD_IMAGE",
     );
+    resolve(
+        workspace.join("sortexe").join("cmd.exe.mui"),
+        "no_cmd_mui.bin",
+        "NTOS_CMD_MUI_IMAGE",
+    );
 
     println!("cargo:rerun-if-changed=build.rs");
 }

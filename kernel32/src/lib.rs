@@ -47,6 +47,7 @@ const NT_CREATE_PROCESS: u32 = 27;
 const NT_WAIT_PROCESS: u32 = 28;
 const NT_GET_EXIT_CODE_PROCESS: u32 = 29;
 const NT_SET_CONSOLE_MODE: u32 = 30;
+const NT_LOAD_MESSAGE: u32 = 31;
 
 // A couple of Win32 error codes used by the shim.
 const ERROR_SUCCESS: u32 = 0;
@@ -1659,9 +1660,9 @@ pub unsafe extern "C" fn LocalFree(mem: *mut u8) -> u64 {
 /// character count.
 #[no_mangle]
 pub unsafe extern "C" fn FormatMessageW(
-    _flags: u32,
-    _source: *const c_void,
-    _message_id: u32,
+    flags: u32,
+    source: *const c_void,
+    message_id: u32,
     _language_id: u32,
     buffer: *mut u16,
     size: u32,
@@ -1670,6 +1671,19 @@ pub unsafe extern "C" fn FormatMessageW(
     if buffer.is_null() || size == 0 {
         return 0;
     }
+    // FORMAT_MESSAGE_FROM_HMODULE (0x800) / FROM_SYSTEM (0x1000): look the
+    // message up in the module's RT_MESSAGETABLE (our .mui). A NULL source
+    // means the process image itself. (We don't expand %1.. inserts yet.)
+    const FROM_HMODULE: u32 = 0x0800;
+    const FROM_SYSTEM: u32 = 0x1000;
+    if flags & (FROM_HMODULE | FROM_SYSTEM) != 0 {
+        let module = if !source.is_null() { source as u64 } else { peb_image_base() };
+        let n = syscall4(NT_LOAD_MESSAGE, module, message_id as u64, buffer as u64, size as u64);
+        if n > 0 {
+            return n as u32;
+        }
+    }
+    // Fallback when the message isn't found.
     let msg: &[u16] = &[
         b'U' as u16, b'n' as u16, b'k' as u16, b'n' as u16, b'o' as u16, b'w' as u16,
         b'n' as u16, b' ' as u16, b'e' as u16, b'r' as u16, b'r' as u16, b'o' as u16, b'r' as u16,
