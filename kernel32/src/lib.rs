@@ -382,10 +382,17 @@ pub extern "C" fn GetProcessHeap() -> u64 {
 /// `HeapAlloc(hHeap, dwFlags, dwBytes)` — acquires the heap lock and delegates
 /// to [`heap_alloc_locked`].
 #[no_mangle]
-pub unsafe extern "C" fn HeapAlloc(_heap: u64, _flags: u32, bytes: u64) -> *mut u8 {
+pub unsafe extern "C" fn HeapAlloc(_heap: u64, flags: u32, bytes: u64) -> *mut u8 {
+    const HEAP_ZERO_MEMORY: u32 = 0x8;
     heap_lock_acquire();
     let p = heap_alloc_locked(bytes);
     heap_lock_release();
+    // A reused free-list block still holds its previous contents; honor
+    // HEAP_ZERO_MEMORY so a caller that asked for zeroed memory (cmd.exe does,
+    // for its command/argument buffers) doesn't read stale heap data.
+    if flags & HEAP_ZERO_MEMORY != 0 && !p.is_null() {
+        core::ptr::write_bytes(p, 0, bytes as usize);
+    }
     p
 }
 
@@ -2735,6 +2742,41 @@ pub unsafe extern "C" fn GlobalFree(mem: *mut u8) -> *mut u8 {
         HeapFree(1, 0, mem);
     }
     core::ptr::null_mut()
+}
+
+/// `RtlCreateUnicodeStringFromAsciiz(DestinationString, SourceString)` — the
+/// ntdll helper that allocates a `UNICODE_STRING` and fills it by widening a
+/// NUL-terminated ASCII string. Resolves to here by name (our loader binds
+/// imports by name across DLLs), so cmd.exe's `ntdll` import is satisfied.
+///
+/// cmd builds its copyright banner line with this; when it was an unresolved
+/// return-0 stub the NULL result made cmd report a spurious out-of-memory
+/// error ("Unknown error") at startup and drop the copyright line. The buffer
+/// comes from the process heap (handle 1) so the caller's GlobalFree releases
+/// it. `UNICODE_STRING` on x64 is `{ u16 Length; u16 MaximumLength; <pad>;
+/// PWSTR Buffer @+8 }`. Returns TRUE (1) on success, FALSE (0) on failure.
+#[no_mangle]
+pub unsafe extern "C" fn RtlCreateUnicodeStringFromAsciiz(dest: *mut u8, src: *const u8) -> u8 {
+    if dest.is_null() || src.is_null() {
+        return 0;
+    }
+    let mut n = 0usize;
+    while *src.add(n) != 0 {
+        n += 1;
+    }
+    let bytes = (n + 1) * 2;
+    let buf = HeapAlloc(1, 0, bytes as u64) as *mut u16;
+    if buf.is_null() {
+        return 0;
+    }
+    for i in 0..n {
+        *buf.add(i) = *src.add(i) as u16;
+    }
+    *buf.add(n) = 0;
+    *(dest as *mut u16) = (n * 2) as u16; // Length (bytes, excluding NUL)
+    *(dest.add(2) as *mut u16) = bytes as u16; // MaximumLength (incl. NUL)
+    *(dest.add(8) as *mut *mut u16) = buf; // Buffer
+    1
 }
 
 // ETW tracing: no backend; report ERROR_SUCCESS so registration/writes are no-ops.
