@@ -2181,44 +2181,219 @@ unsafe fn wcopy(dst: *mut u16, cap: u32, src: &[u16]) -> u32 {
     (need - 1) as u32 // exclude NUL
 }
 
-// `GetEnvironmentVariableW(lpName, lpBuffer, nSize)` — minimal environment.
-// We expose `PATH` (`C:\\`) and `OS` (`nanokrnl`); other names are reported
-// not-found. (A full mutable wide environment block tripped cmd.exe into an
-// unbounded path-search and regressed where.exe, so we keep this minimal.)
+// --- Environment block (wide) ----------------------------------------------
+// cmd.exe copies the inherited environment via GetEnvironmentStringsW; a NULL
+// block makes it report "out of environment space" and run a degraded startup.
+// We keep a modifiable double-NUL-terminated UTF-16 block ("VAR=VAL\0...\0\0"),
+// sorted case-insensitively by name (Windows guarantees that, and cmd relies on
+// it). The placeholder values are deliberately fake (nanokrnl, not Windows).
+static mut ENV_W: [u16; 4096] = [0; 4096];
+static mut ENV_W_LEN: usize = 0; // units used, including the final block NUL
+static mut ENV_W_INIT: bool = false;
+
+const ENV_DEFAULTS: &[&str] = &[
+    "COMSPEC=C:\\cmd.exe",
+    "OS=nanokrnl",
+    "PATH=C:\\",
+    "PATHEXT=.EXE;.BAT;.CMD",
+    "PROMPT=$P$G",
+    "SystemRoot=C:\\fxcknmc",
+];
+
+unsafe fn ensure_env() {
+    if ENV_W_INIT {
+        return;
+    }
+    let mut p = 0usize;
+    for e in ENV_DEFAULTS {
+        for b in e.bytes() {
+            ENV_W[p] = b as u16;
+            p += 1;
+        }
+        ENV_W[p] = 0;
+        p += 1;
+    }
+    ENV_W[p] = 0; // block terminator
+    p += 1;
+    ENV_W_LEN = p;
+    ENV_W_INIT = true;
+}
+
+fn wlc(c: u16) -> u16 {
+    if (b'A' as u16..=b'Z' as u16).contains(&c) {
+        c + 32
+    } else {
+        c
+    }
+}
+
+/// Find the entry matching `name`; returns (entry_start, value_start, end_past_nul).
+unsafe fn env_find(name: *const u16) -> Option<(usize, usize, usize)> {
+    ensure_env();
+    let nlen = wlen(name);
+    let mut i = 0;
+    while i < ENV_W_LEN && ENV_W[i] != 0 {
+        let start = i;
+        let mut eq = i;
+        while eq < ENV_W_LEN && ENV_W[eq] != 0 && ENV_W[eq] != b'=' as u16 {
+            eq += 1;
+        }
+        let klen = eq - start;
+        let mut e = eq;
+        while e < ENV_W_LEN && ENV_W[e] != 0 {
+            e += 1;
+        }
+        let end = e + 1;
+        if klen == nlen && ENV_W[eq] == b'=' as u16 {
+            let mut m = true;
+            for k in 0..nlen {
+                if wlc(ENV_W[start + k]) != wlc(*name.add(k)) {
+                    m = false;
+                    break;
+                }
+            }
+            if m {
+                return Some((start, eq + 1, end));
+            }
+        }
+        i = end;
+    }
+    None
+}
+
+/// `GetEnvironmentStringsW()` — pointer to the environment block.
+#[no_mangle]
+pub unsafe extern "C" fn GetEnvironmentStringsW() -> *const u16 {
+    ensure_env();
+    (&raw const ENV_W) as *const u16
+}
+
+/// `FreeEnvironmentStringsW(block)` — the block is static; succeed.
+#[no_mangle]
+pub extern "C" fn FreeEnvironmentStringsW(_block: *const u16) -> i32 {
+    1
+}
+
+/// `GetEnvironmentVariableW(lpName, lpBuffer, nSize)` — value from the block, or
+/// 0 + ERROR_ENVVAR_NOT_FOUND. Returns the required size if the buffer is small.
 #[no_mangle]
 pub unsafe extern "C" fn GetEnvironmentVariableW(name: *const u16, buffer: *mut u16, size: u32) -> u32 {
     if name.is_null() {
         return 0;
     }
-    let eqi = |w: &[u16]| -> bool {
-        for (i, &c) in w.iter().enumerate() {
-            let n = *name.add(i);
-            let nu = if (0x61..=0x7A).contains(&n) { n - 32 } else { n };
-            if nu != c {
-                return false;
+    match env_find(name) {
+        Some((_, vstart, end)) => {
+            let vlen = (end - 1) - vstart;
+            if buffer.is_null() || (size as usize) < vlen + 1 {
+                return (vlen + 1) as u32;
+            }
+            for k in 0..vlen {
+                *buffer.add(k) = ENV_W[vstart + k];
+            }
+            *buffer.add(vlen) = 0;
+            vlen as u32
+        }
+        None => {
+            SetLastError(ERROR_ENVVAR_NOT_FOUND);
+            0
+        }
+    }
+}
+
+/// `SetEnvironmentVariableW(lpName, lpValue)` — replace/append/delete. NULL
+/// value deletes. Returns TRUE.
+#[no_mangle]
+pub unsafe extern "C" fn SetEnvironmentVariableW(name: *const u16, value: *const u16) -> i32 {
+    if name.is_null() {
+        return 0;
+    }
+    ensure_env();
+    if let Some((start, _, end)) = env_find(name) {
+        let shift = end - start;
+        for k in end..ENV_W_LEN {
+            ENV_W[k - shift] = ENV_W[k];
+        }
+        ENV_W_LEN -= shift;
+    }
+    if value.is_null() {
+        return 1;
+    }
+    let nlen = wlen(name);
+    let vlen = wlen(value);
+    let need = nlen + 1 + vlen + 1;
+    if ENV_W_LEN + need > ENV_W.len() {
+        return 0;
+    }
+    let mut p = ENV_W_LEN - 1; // before the final block NUL
+    for k in 0..nlen {
+        ENV_W[p] = *name.add(k);
+        p += 1;
+    }
+    ENV_W[p] = b'=' as u16;
+    p += 1;
+    for k in 0..vlen {
+        ENV_W[p] = *value.add(k);
+        p += 1;
+    }
+    ENV_W[p] = 0;
+    p += 1;
+    ENV_W[p] = 0;
+    p += 1;
+    ENV_W_LEN = p;
+    1
+}
+
+/// `ExpandEnvironmentStringsW(src, dst, count)` — copy `src` to `dst`, replacing
+/// `%VAR%` with its value. Returns chars written incl NUL. Unknown `%VAR%` is
+/// left verbatim.
+#[no_mangle]
+pub unsafe extern "C" fn ExpandEnvironmentStringsW(src: *const u16, dst: *mut u16, count: u32) -> u32 {
+    if src.is_null() {
+        return 0;
+    }
+    ensure_env();
+    let cap = count as usize;
+    let mut di = 0usize;
+    let mut si = 0usize;
+    loop {
+        let c = *src.add(si);
+        if c == 0 {
+            break;
+        }
+        if c == b'%' as u16 {
+            let mut j = si + 1;
+            while *src.add(j) != 0 && *src.add(j) != b'%' as u16 {
+                j += 1;
+            }
+            if *src.add(j) == b'%' as u16 && j > si + 1 {
+                let mut nm = [0u16; 64];
+                let nlen = (j - si - 1).min(nm.len() - 1);
+                for k in 0..nlen {
+                    nm[k] = *src.add(si + 1 + k);
+                }
+                nm[nlen] = 0;
+                if let Some((_, vstart, end)) = env_find(nm.as_ptr()) {
+                    for k in vstart..(end - 1) {
+                        if di < cap && !dst.is_null() {
+                            *dst.add(di) = ENV_W[k];
+                        }
+                        di += 1;
+                    }
+                    si = j + 1;
+                    continue;
+                }
             }
         }
-        *name.add(w.len()) == 0
-    };
-    // PATH
-    if eqi(&[b'P' as u16, b'A' as u16, b'T' as u16, b'H' as u16]) {
-        return wcopy(buffer, size, &[b'C' as u16, b':' as u16, b'\\' as u16, 0]);
+        if di < cap && !dst.is_null() {
+            *dst.add(di) = c;
+        }
+        di += 1;
+        si += 1;
     }
-    // OS = nanokrnl
-    if eqi(&[b'O' as u16, b'S' as u16]) {
-        let v = [b'n' as u16, b'a' as u16, b'n' as u16, b'o' as u16, b'k' as u16,
-                 b'r' as u16, b'n' as u16, b'l' as u16, 0];
-        return wcopy(buffer, size, &v);
+    if di < cap && !dst.is_null() {
+        *dst.add(di) = 0;
     }
-    // SystemRoot = C:\fxcknmc
-    if eqi(&[b'S' as u16, b'Y' as u16, b'S' as u16, b'T' as u16, b'E' as u16,
-             b'M' as u16, b'R' as u16, b'O' as u16, b'O' as u16, b'T' as u16]) {
-        let v = [b'C' as u16, b':' as u16, b'\\' as u16, b'f' as u16, b'x' as u16,
-                 b'c' as u16, b'k' as u16, b'n' as u16, b'm' as u16, b'c' as u16, 0];
-        return wcopy(buffer, size, &v);
-    }
-    SetLastError(ERROR_ENVVAR_NOT_FOUND);
-    0
+    (di + 1) as u32
 }
 
 /// `GetFullPathNameW(lpFileName, nBufferLength, lpBuffer, lpFilePart)` — our
@@ -2283,9 +2458,11 @@ pub unsafe extern "C" fn CreateFileW(
     CreateFileA(narrow.as_ptr(), access, share, sec, disp, flags, template)
 }
 
-/// `GetFileAttributesW(lpFileName)` — report "not found".
+/// `GetFileAttributesW(lpFileName)` — report "not found" with the proper
+/// last-error so a path-search caller (cmd probing PATH/PATHEXT) terminates.
 #[no_mangle]
-pub extern "C" fn GetFileAttributesW(_name: *const u16) -> u32 {
+pub unsafe extern "C" fn GetFileAttributesW(_name: *const u16) -> u32 {
+    SetLastError(ERROR_FILE_NOT_FOUND);
     INVALID_FILE_ATTRIBUTES
 }
 

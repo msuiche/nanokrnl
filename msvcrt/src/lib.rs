@@ -1306,14 +1306,14 @@ pub unsafe extern "C" fn wcspbrk(s: *const u16, set: *const u16) -> *const u16 {
     core::ptr::null()
 }
 
-/// `wcstok(str, delim, context)` — reentrant wide tokenizer (the MSVC 3-arg
-/// form; `context` carries the position between calls).
+/// Saved position for the classic (2-arg) `wcstok`. The msvcrt.dll `wcstok`
+/// keeps its state internally — callers pass `NULL` as `str` to continue — so
+/// we must NOT read a third "context" argument (it would be garbage from a
+/// 2-arg call and crash on the continuation). Not thread-safe, matching msvcrt.
+static mut WCSTOK_STATE: *mut u16 = core::ptr::null_mut();
+
 #[no_mangle]
-pub unsafe extern "C" fn wcstok(
-    str: *mut u16,
-    delim: *const u16,
-    context: *mut *mut u16,
-) -> *mut u16 {
+pub unsafe extern "C" fn wcstok(str: *mut u16, delim: *const u16) -> *mut u16 {
     let in_delim = |c: u16| {
         let mut q = delim;
         while *q != 0 {
@@ -1324,7 +1324,7 @@ pub unsafe extern "C" fn wcstok(
         }
         false
     };
-    let mut p = if str.is_null() { *context } else { str };
+    let mut p = if str.is_null() { WCSTOK_STATE } else { str };
     if p.is_null() {
         return core::ptr::null_mut();
     }
@@ -1332,7 +1332,7 @@ pub unsafe extern "C" fn wcstok(
         p = p.add(1);
     }
     if *p == 0 {
-        *context = p;
+        WCSTOK_STATE = p;
         return core::ptr::null_mut();
     }
     let token = p;
@@ -1343,7 +1343,7 @@ pub unsafe extern "C" fn wcstok(
         *p = 0;
         p = p.add(1);
     }
-    *context = p;
+    WCSTOK_STATE = p;
     token
 }
 
