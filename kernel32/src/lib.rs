@@ -707,9 +707,11 @@ pub unsafe extern "C" fn GetSystemInfo(info: *mut SystemInfo) {
 
 // Version the shim reports (Windows 10.0 build 19041), encoded the way each
 // API expects.
-const OS_MAJOR: u32 = 10;
+// A deliberately fake placeholder version (1.0.1) — nanokrnl reports its own
+// version, not a real Windows build number.
+const OS_MAJOR: u32 = 1;
 const OS_MINOR: u32 = 0;
-const OS_BUILD: u32 = 19041;
+const OS_BUILD: u32 = 1;
 const VER_PLATFORM_WIN32_NT: u32 = 2;
 
 /// `GetVersion()` — the legacy packed version: low byte of LOWORD = major,

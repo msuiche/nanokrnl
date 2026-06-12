@@ -270,6 +270,14 @@ pub fn load_user_process(data: &[u8]) -> Result<LoadedProcess, NtStatus> {
         w(0x60, PEB_BASE); // ProcessEnvironmentBlock
         // PEB (second page)
         w(0x1000 + 0x10, preferred_base); // PEB.ImageBaseAddress
+        // OS version fields — a placeholder version a binary can report (e.g.
+        // cmd.exe's banner reads major.minor.build from here). 1.0.1.
+        let w32 = |off: usize, v: u32| *(teb.add(off) as *mut u32) = v;
+        let w16 = |off: usize, v: u16| *(teb.add(off) as *mut u16) = v;
+        w32(0x1000 + 0x118, 1); // PEB.OSMajorVersion
+        w32(0x1000 + 0x11C, 0); // PEB.OSMinorVersion
+        w16(0x1000 + 0x120, 1); // PEB.OSBuildNumber
+        w32(0x1000 + 0x124, 2); // PEB.OSPlatformId = VER_PLATFORM_WIN32_NT
     }
 
     Ok(LoadedProcess {

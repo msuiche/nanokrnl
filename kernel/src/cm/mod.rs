@@ -215,6 +215,17 @@ pub fn init() {
         let one = [1u8, 0, 0, 0];
         h.set_value(cp, crate::w!("EnableExtensions"), REG_DWORD, &one);
     }
+    // HKLM\Software\Microsoft\Windows NT\CurrentVersion — the placeholder OS
+    // version (1.0.1.1). Tools (e.g. cmd's banner) read the build/UBR here.
+    if let Some(cv) = h.walk(hklm, crate::w!("Software\\Microsoft\\Windows NT\\CurrentVersion"), true) {
+        let one = [1u8, 0, 0, 0];
+        let zero = [0u8, 0, 0, 0];
+        h.set_value(cv, crate::w!("CurrentMajorVersionNumber"), REG_DWORD, &one);
+        h.set_value(cv, crate::w!("CurrentMinorVersionNumber"), REG_DWORD, &zero);
+        h.set_value(cv, crate::w!("UBR"), REG_DWORD, &one);
+        // CurrentBuildNumber = REG_SZ "1" (UTF-16: '1' 0x0031 then NUL).
+        h.set_value(cv, crate::w!("CurrentBuildNumber"), REG_SZ, &[0x31, 0x00, 0x00, 0x00]);
+    }
     h.initialized = true;
 }
 

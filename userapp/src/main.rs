@@ -360,9 +360,9 @@ unsafe fn main(argc: i32, argv: *const *const u8) -> i32 {
     let mut osvi: OsVersionInfoA = core::mem::zeroed();
     osvi.dw_os_version_info_size = core::mem::size_of::<OsVersionInfoA>() as u32;
     let vex = GetVersionExA(&mut osvi);
-    let version_ok = (ver & 0xFF) == 10 // major in low byte
+    let version_ok = (ver & 0xFF) == 1 // major in low byte (placeholder 1.0.1)
         && vex != 0
-        && osvi.dw_major_version == 10
+        && osvi.dw_major_version == 1
         && osvi.dw_minor_version == 0
         && osvi.dw_platform_id == 2 // VER_PLATFORM_WIN32_NT
         && IsDebuggerPresent() == 0;
