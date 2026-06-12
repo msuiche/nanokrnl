@@ -1630,16 +1630,63 @@ pub extern "C" fn GetConsoleOutputCP() -> u32 {
 /// path (we have no real module list). Returns the length in wide chars.
 #[no_mangle]
 pub unsafe extern "C" fn GetModuleFileNameW(_module: u64, filename: *mut u16, size: u32) -> u32 {
-    let name: &[u16] = &[
-        b'C' as u16, b':' as u16, b'\\' as u16, b'a' as u16, b'p' as u16, b'p' as u16,
-        b'.' as u16, b'e' as u16, b'x' as u16, b'e' as u16,
-    ];
     if filename.is_null() || size == 0 {
         return 0;
     }
-    let n = core::cmp::min(name.len(), (size - 1) as usize);
-    for i in 0..n {
-        *filename.add(i) = name[i];
+    // The running image's path is the first token of the command line. Bare
+    // names (e.g. "cmd.exe") are qualified to C:\ (our only directory); an
+    // already-qualified token (e.g. "C:\child.exe") is used as-is. Returning a
+    // real path matters: callers derive their own directory from it for PATH
+    // searches and resource loading (a hardcoded placeholder misled them).
+    ensure_command_line();
+    let cl = (&raw const COMMAND_LINE_W) as *const u16;
+    let mut tok = [0u16; 290];
+    let mut tl = 0usize;
+    let mut i = 0usize;
+    while *cl.add(i) == b' ' as u16 {
+        i += 1;
+    }
+    let quoted = *cl.add(i) == b'"' as u16;
+    if quoted {
+        i += 1;
+    }
+    let mut has_path = false;
+    while tl < tok.len() {
+        let c = *cl.add(i);
+        if c == 0 || (quoted && c == b'"' as u16) || (!quoted && c == b' ' as u16) {
+            break;
+        }
+        if c == b':' as u16 || c == b'\\' as u16 || c == b'/' as u16 {
+            has_path = true;
+        }
+        tok[tl] = c;
+        tl += 1;
+        i += 1;
+    }
+    let mut out = [0u16; 300];
+    let mut ol = 0usize;
+    if !has_path && tl > 0 {
+        for &c in &[b'C' as u16, b':' as u16, b'\\' as u16] {
+            out[ol] = c;
+            ol += 1;
+        }
+    }
+    for j in 0..tl {
+        if ol < out.len() {
+            out[ol] = tok[j];
+            ol += 1;
+        }
+    }
+    if ol == 0 {
+        // Empty command line: fall back to the drive root.
+        for &c in &[b'C' as u16, b':' as u16, b'\\' as u16] {
+            out[ol] = c;
+            ol += 1;
+        }
+    }
+    let n = core::cmp::min(ol, (size - 1) as usize);
+    for j in 0..n {
+        *filename.add(j) = out[j];
     }
     *filename.add(n) = 0;
     n as u32
@@ -2438,34 +2485,76 @@ pub unsafe extern "C" fn GetFullPathNameW(
     if name.is_null() {
         return 0;
     }
-    let n = wstrlen(name);
-    if buffer.is_null() || (len as usize) < n + 1 {
+    let nlen = wstrlen(name);
+    let c0 = if nlen > 0 { *name } else { 0 };
+    let c1 = if nlen > 1 { *name.add(1) } else { 0 };
+    let c2 = if nlen > 2 { *name.add(2) } else { 0 };
+    let sep = |c: u16| c == b'\\' as u16 || c == b'/' as u16;
+    let drive_abs = c1 == b':' as u16 && sep(c2); // "X:\..."
+    let unc = sep(c0) && sep(c1); // "\\server\..."
+
+    // Resolve to an absolute path: already-absolute names pass through;
+    // anything else is taken relative to the current directory (what
+    // GetFullPathName means — a passthrough left cmd unable to build the
+    // C:\<name> it searches for).
+    let mut full = [0u16; 320];
+    let mut fl = 0usize;
+    if drive_abs || unc {
+        for i in 0..nlen.min(319) {
+            full[fl] = *name.add(i);
+            fl += 1;
+        }
+    } else {
+        let mut cwd = [0u16; 290];
+        let cl = GetCurrentDirectoryW(cwd.len() as u32, cwd.as_mut_ptr()) as usize;
+        for i in 0..cl.min(289) {
+            full[fl] = cwd[i];
+            fl += 1;
+        }
+        if fl > 0 && !sep(full[fl - 1]) {
+            full[fl] = b'\\' as u16;
+            fl += 1;
+        }
+        // Drop a leading ".\" on the relative name.
+        let s = if nlen >= 2 && c0 == b'.' as u16 && sep(c1) { 2 } else { 0 };
+        for i in s..nlen {
+            if fl < 319 {
+                full[fl] = *name.add(i);
+                fl += 1;
+            }
+        }
+    }
+    full[fl] = 0;
+
+    if buffer.is_null() || (len as usize) < fl + 1 {
         if !file_part.is_null() {
             *file_part = core::ptr::null_mut();
         }
-        return (n + 1) as u32;
+        return (fl + 1) as u32;
     }
-    for i in 0..=n {
-        *buffer.add(i) = *name.add(i);
+    for i in 0..=fl {
+        *buffer.add(i) = full[i];
     }
-    // lpFilePart points at the last path component within the buffer (the
-    // filename), or NULL when the path names a directory (ends in a separator).
-    // cmd uses this to split a resolved path into directory + file when
-    // searching for an executable; leaving it NULL breaks that split.
+    // lpFilePart points at the last path component (the filename), or NULL when
+    // the path ends in a separator (names a directory).
     if !file_part.is_null() {
         let mut fp = buffer;
         let mut have = false;
-        for i in 0..n {
-            let c = *buffer.add(i);
-            if c == b'\\' as u16 || c == b'/' as u16 {
+        for i in 0..fl {
+            if sep(*buffer.add(i)) {
                 fp = buffer.add(i + 1);
                 have = true;
             }
         }
-        // If the path ends in a separator, there is no file component.
-        *file_part = if have && *fp != 0 { fp } else if have { core::ptr::null_mut() } else { buffer };
+        *file_part = if have && *fp != 0 {
+            fp
+        } else if have {
+            core::ptr::null_mut()
+        } else {
+            buffer
+        };
     }
-    n as u32
+    fl as u32
 }
 
 /// `GetLongPathNameW(lpszShortPath, lpszLongPath, cchBuffer)` — no 8.3
