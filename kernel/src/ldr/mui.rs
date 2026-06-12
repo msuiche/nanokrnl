@@ -199,6 +199,13 @@ pub fn load_message(module_base: u64, id: u32, out: &mut [u16]) -> usize {
                         if c == 0 {
                             break;
                         }
+                        // `%0` is the FormatMessage message terminator (it ends
+                        // the text and suppresses the trailing newline): stop.
+                        if c == b'%' as u16
+                            && u16le(mui, text_off + (n + 1) * 2).unwrap_or(0) == b'0' as u16
+                        {
+                            break;
+                        }
                         out[n] = c;
                         n += 1;
                     }
