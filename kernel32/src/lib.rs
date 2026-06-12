@@ -1668,34 +1668,105 @@ pub unsafe extern "C" fn FormatMessageW(
     _language_id: u32,
     buffer: *mut u16,
     size: u32,
-    _args: *mut c_void,
+    args: *mut c_void,
 ) -> u32 {
     if buffer.is_null() || size == 0 {
         return 0;
     }
-    // FORMAT_MESSAGE_FROM_HMODULE (0x800) / FROM_SYSTEM (0x1000): look the
-    // message up in the module's RT_MESSAGETABLE (our .mui). A NULL source
-    // means the process image itself. (We don't expand %1.. inserts yet.)
     const FROM_HMODULE: u32 = 0x0800;
     const FROM_SYSTEM: u32 = 0x1000;
+    const IGNORE_INSERTS: u32 = 0x0200;
+
+    // Load the raw message template from the module's RT_MESSAGETABLE (.mui).
+    let mut tmpl = [0u16; 512];
+    let mut tlen = 0usize;
     if flags & (FROM_HMODULE | FROM_SYSTEM) != 0 {
         let module = if !source.is_null() { source as u64 } else { peb_image_base() };
-        let n = syscall4(NT_LOAD_MESSAGE, module, message_id as u64, buffer as u64, size as u64);
-        if n > 0 {
-            return n as u32;
+        tlen = syscall4(
+            NT_LOAD_MESSAGE,
+            module,
+            message_id as u64,
+            tmpl.as_mut_ptr() as u64,
+            tmpl.len() as u64,
+        ) as usize;
+    }
+
+    // Fallback string when the message id isn't in the table.
+    if tlen == 0 {
+        let msg: &[u16] = &[
+            b'U' as u16, b'n' as u16, b'k' as u16, b'n' as u16, b'o' as u16, b'w' as u16,
+            b'n' as u16, b' ' as u16, b'e' as u16, b'r' as u16, b'r' as u16, b'o' as u16,
+            b'r' as u16,
+        ];
+        let n = core::cmp::min(msg.len(), (size - 1) as usize);
+        for i in 0..n {
+            *buffer.add(i) = msg[i];
         }
+        *buffer.add(n) = 0;
+        return n as u32;
     }
-    // Fallback when the message isn't found.
-    let msg: &[u16] = &[
-        b'U' as u16, b'n' as u16, b'k' as u16, b'n' as u16, b'o' as u16, b'w' as u16,
-        b'n' as u16, b' ' as u16, b'e' as u16, b'r' as u16, b'r' as u16, b'o' as u16, b'r' as u16,
-    ];
-    let n = core::cmp::min(msg.len(), (size - 1) as usize);
-    for i in 0..n {
-        *buffer.add(i) = msg[i];
+
+    // Emit into the caller's buffer, expanding inserts unless told to ignore
+    // them. On x64 `lpArguments` (with or without ARGUMENT_ARRAY) is an array of
+    // pointer-sized values; `%n` takes the n-th (default `!s!` = a wide string).
+    let cap = (size - 1) as usize;
+    let mut di = 0usize;
+    let expand = flags & IGNORE_INSERTS == 0 && !args.is_null();
+    let argv = args as *const u64;
+    let mut i = 0usize;
+    while i < tlen {
+        let c = tmpl[i];
+        if expand && c == b'%' as u16 && i + 1 < tlen {
+            let d = tmpl[i + 1];
+            if (b'1' as u16..=b'9' as u16).contains(&d) {
+                let idx = (d - b'1' as u16) as usize;
+                // Skip an optional `!printf-spec!` after the number.
+                let mut j = i + 2;
+                if j < tlen && tmpl[j] == b'!' as u16 {
+                    j += 1;
+                    while j < tlen && tmpl[j] != b'!' as u16 {
+                        j += 1;
+                    }
+                    if j < tlen {
+                        j += 1;
+                    }
+                }
+                // Insert argv[idx] as a NUL-terminated wide string (bounded).
+                let p = *argv.add(idx) as *const u16;
+                if p as usize >= 0x1_0000 {
+                    let mut k = 0usize;
+                    while k < 256 {
+                        let ch = *p.add(k);
+                        if ch == 0 {
+                            break;
+                        }
+                        if di < cap {
+                            *buffer.add(di) = ch;
+                        }
+                        di += 1;
+                        k += 1;
+                    }
+                }
+                i = j;
+                continue;
+            } else if d == b'%' as u16 {
+                if di < cap {
+                    *buffer.add(di) = b'%' as u16;
+                }
+                di += 1;
+                i += 2;
+                continue;
+            }
+        }
+        if di < cap {
+            *buffer.add(di) = c;
+        }
+        di += 1;
+        i += 1;
     }
-    *buffer.add(n) = 0;
-    n as u32
+    let term = di.min(cap);
+    *buffer.add(term) = 0;
+    term as u32
 }
 
 /// `HeapSize(hHeap, dwFlags, lpMem)` — usable bytes of a heap block (from our
