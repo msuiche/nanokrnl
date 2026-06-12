@@ -1677,6 +1677,7 @@ pub unsafe extern "C" fn FormatMessageW(
     const FROM_HMODULE: u32 = 0x0800;
     const FROM_SYSTEM: u32 = 0x1000;
     const IGNORE_INSERTS: u32 = 0x0200;
+    const ARGUMENT_ARRAY: u32 = 0x2000;
 
     // Load the raw message template from the module's RT_MESSAGETABLE (.mui).
     let mut tmpl = [0u16; 512];
@@ -1708,12 +1709,32 @@ pub unsafe extern "C" fn FormatMessageW(
     }
 
     // Emit into the caller's buffer, expanding inserts unless told to ignore
-    // them. On x64 `lpArguments` (with or without ARGUMENT_ARRAY) is an array of
-    // pointer-sized values; `%n` takes the n-th (default `!s!` = a wide string).
+    // them. `%n` takes the n-th argument (default `!s!` = a wide string).
+    //
+    // The meaning of `lpArguments` depends on FORMAT_MESSAGE_ARGUMENT_ARRAY:
+    //   * with it set, `lpArguments` is a flat array of insert values — `%n` is
+    //     `lpArguments[n-1]` directly;
+    //   * without it (the printf-style default), `lpArguments` is a `va_list*`,
+    //     so the insert array begins at `*lpArguments` (the va_list cursor) —
+    //     `%n` is `(*lpArguments)[n-1]`, one extra dereference.
+    // Treating the va_list case as a flat array (a single deref) inserts the
+    // *cursor pointer* itself for `%1` instead of the argument it points at —
+    // which is exactly how a real CRT console binary (cmd.exe) passes its
+    // version-banner insert, so getting this right is essential.
     let cap = (size - 1) as usize;
     let mut di = 0usize;
-    let expand = flags & IGNORE_INSERTS == 0 && !args.is_null();
-    let argv = args as *const u64;
+    let mut expand = flags & IGNORE_INSERTS == 0 && !args.is_null();
+    let argv: *const u64 = if !expand {
+        core::ptr::null()
+    } else if flags & ARGUMENT_ARRAY != 0 {
+        args as *const u64
+    } else if (args as usize) >= 0x1_0000 {
+        // va_list*: the insert values start at the cursor `*lpArguments`.
+        *(args as *const *const u64)
+    } else {
+        core::ptr::null()
+    };
+    expand = expand && !argv.is_null();
     let mut i = 0usize;
     while i < tlen {
         let c = tmpl[i];
