@@ -33,6 +33,11 @@ use crate::ke::traps::KtrapFrame;
 
 const RFLAGS_TF: u64 = 1 << 8;
 const MAX_MODULES: usize = 8;
+/// Export offset of `_local_unwind` within the msvcrt shim. It is a non-
+/// returning control transfer (`mov rsp,rcx; jmp rdx`), so the tracer must
+/// single-step through it rather than arm DR0 on a return that never fires.
+/// Tracks msvcrt's build; update if its layout changes.
+const LOCAL_UNWIND_OFF: u64 = 0x1040;
 
 #[derive(Clone, Copy)]
 struct Module {
@@ -129,6 +134,32 @@ unsafe fn read_user_u64(addr: u64) -> u64 {
     let v = core::ptr::read_unaligned(addr as *const u64);
     crate::mm::virt::user_access_end();
     v
+}
+
+/// Best-effort: read up to 31 UTF-16 code units at `addr` into `buf` as ASCII
+/// (non-ASCII shown as '.'), returning the byte length. Returns 0 if `addr`
+/// isn't a readable user pointer or the first unit isn't printable ASCII (so we
+/// only log things that look like strings). Used to annotate call args.
+unsafe fn read_user_wstr(addr: u64, buf: &mut [u8; 32]) -> usize {
+    if addr < 0x1000 || crate::mm::virt::probe_for_read(addr, 2, 2).is_err() {
+        return 0;
+    }
+    crate::mm::virt::user_access_begin();
+    let mut n = 0;
+    for i in 0..31 {
+        let c = core::ptr::read_unaligned((addr + i * 2) as *const u16);
+        if c == 0 {
+            break;
+        }
+        buf[n] = if (0x20..0x7f).contains(&c) { c as u8 } else { b'.' };
+        n += 1;
+    }
+    crate::mm::virt::user_access_end();
+    // Require a printable first char so we don't log binary noise.
+    if n == 0 || buf[0] == b'.' {
+        return 0;
+    }
+    n
 }
 
 /// Register an address range so the tracer can label RIPs. `is_lib` marks a
@@ -267,6 +298,17 @@ pub fn on_single_step(frame: &mut KtrapFrame) {
             frame.r8,
             frame.r9
         );
+        // If rcx or rdx points at a wide string, show it — pinpoints which path
+        // / value an API call is operating on (e.g. the command cmd searches).
+        let mut sb = [0u8; 32];
+        let n = unsafe { read_user_wstr(frame.rcx, &mut sb) };
+        if n != 0 {
+            kd_println!("TRACE     rcx=\"{}\"", core::str::from_utf8(&sb[..n]).unwrap_or("?"));
+        }
+        let n = unsafe { read_user_wstr(frame.rdx, &mut sb) };
+        if n != 0 {
+            kd_println!("TRACE     rdx=\"{}\"", core::str::from_utf8(&sb[..n]).unwrap_or("?"));
+        }
         // Trigger: dump the instruction backtrace the first time the target
         // value appears in RDX (e.g. the "ERROR:" string id).
         if d.trigger_rdx != 0 && frame.rdx == d.trigger_rdx && !d.triggered {
@@ -275,11 +317,19 @@ pub fn on_single_step(frame: &mut KtrapFrame) {
         }
         d.in_lib = true;
 
+        // Some library functions never return to the pushed return address —
+        // they transfer control elsewhere (`_local_unwind` does `mov rsp,rcx;
+        // jmp rdx`; likewise longjmp). Arming DR0 on the stack return would lose
+        // the thread, since that address is never reached. For those, keep TF
+        // set and single-step through the (tiny) transfer so we follow the jmp
+        // back into the image. Identified by module+offset.
+        let is_control_transfer = name == "msvcrt" && (off == LOCAL_UNWIND_OFF);
+
         // Fast path: read the return address (top of the user stack, just
         // pushed by the CALL) and, if it lands back in the image, arm it in DR0
         // and clear TF so the library runs at native speed until it returns.
         let rsp = frame.rsp;
-        if crate::mm::virt::probe_for_read(rsp, 8, 8).is_ok() {
+        if !is_control_transfer && crate::mm::virt::probe_for_read(rsp, 8, 8).is_ok() {
             let ret = unsafe { read_user_u64(rsp) };
             let (ri, _) = resolve(&d, ret);
             if ri != 0 && !d.modules[ri - 1].is_lib {

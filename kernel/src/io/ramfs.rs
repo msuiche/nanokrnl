@@ -83,6 +83,35 @@ pub fn lookup(path: &str) -> Option<&'static [u8]> {
     FILES.iter().find(|f| path_eq(f.path, path)).map(|f| f.data)
 }
 
+/// `GetFileAttributesW` backend: Win32 file attributes for `path`, or
+/// `INVALID_FILE_ATTRIBUTES` (0xFFFF_FFFF) if it doesn't exist.
+///
+/// A drive root (`C:`, `C:\`) or any path ending in a separator is reported as
+/// a directory so a shell's current-directory validation succeeds. A path that
+/// matches a [`FILES`] entry is a normal file. Everything else is "not found".
+pub fn attributes(path: &str) -> u32 {
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    const INVALID: u32 = 0xFFFF_FFFF;
+
+    let bytes = path.as_bytes();
+    // Drive root: "X:" or "X:\" / "X:/".
+    let is_drive_root = match bytes {
+        [_, b':'] => true,
+        [_, b':', b'\\'] | [_, b':', b'/'] => true,
+        _ => false,
+    };
+    let trailing_sep = matches!(bytes.last(), Some(b'\\') | Some(b'/'));
+    if is_drive_root || trailing_sep {
+        return FILE_ATTRIBUTE_DIRECTORY;
+    }
+    if lookup(path).is_some() {
+        FILE_ATTRIBUTE_NORMAL
+    } else {
+        INVALID
+    }
+}
+
 /// Open `path` as a referenced `FileObject` (the body pointer doubles as the
 /// object the handle stores). Returns `None` if no such file.
 pub fn open(path: &str) -> Option<*mut FileObject> {

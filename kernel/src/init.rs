@@ -1361,8 +1361,10 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
                 let (mcb, mcs) = crate::ldr::loaded::msvcrt_range();
                 ke::debug::add_module("msvcrt", mcb, mcs as u64, true);
                 ke::debug::add_module("ntdll", crate::ldr::ntdll::trampoline_base(), 0x1000, true);
-                // (Tracer left disarmed so cmd's own console output is clean.)
-                io::console::push_input_str(b"exit\r\n");
+                // Drive cmd as a real interactive shell: run a builtin, then
+                // exit. (Tracer left disarmed so cmd's own console output is
+                // clean; re-enable with `ke::debug::arm(N)` to trace API calls.)
+                io::console::push_input_str(b"echo hi\r\nexit\r\n");
                 io::console::set_input_eof(true);
                 let wr_before = io::console::bytes_written();
                 match spawn_process_thread(proc.entry_va, proc.user_rsp, proc.cr3.0, proc.teb) {

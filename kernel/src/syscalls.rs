@@ -55,6 +55,7 @@ pub const SVC_WAIT_PROCESS: usize = 28;
 pub const SVC_GET_EXIT_CODE_PROCESS: usize = 29;
 pub const SVC_SET_CONSOLE_MODE: usize = 30;
 pub const SVC_LOAD_MESSAGE: usize = 31;
+pub const SVC_QUERY_ATTRIBUTES: usize = 32;
 
 /// A shared kernel counter incremented atomically by [`SVC_INCREMENT_COUNTER`].
 /// Used to prove concurrent ring-3 threads both make progress through the
@@ -116,6 +117,29 @@ pub fn register_all() {
     register_service(SVC_GET_EXIT_CODE_PROCESS, nt_get_exit_code_process);
     register_service(SVC_SET_CONSOLE_MODE, nt_set_console_mode);
     register_service(SVC_LOAD_MESSAGE, nt_load_message);
+    register_service(SVC_QUERY_ATTRIBUTES, nt_query_attributes);
+}
+
+/// `GetFileAttributesW` backend (a1 = UTF-16 path ptr, a2 = char count).
+/// Returns the Win32 attributes from the RAM filesystem, or
+/// `INVALID_FILE_ATTRIBUTES` (0xFFFF_FFFF) if the path doesn't exist.
+extern "C" fn nt_query_attributes(path_ptr: u64, path_len: u64, _a3: u64, _a4: u64) -> u64 {
+    let mut wbuf = [0u16; 260];
+    let Some(w) = read_user_u16(path_ptr, path_len as usize, &mut wbuf) else {
+        return 0xFFFF_FFFF;
+    };
+    let mut abuf = [0u8; 260];
+    let mut n = 0;
+    for &c in w {
+        if n < abuf.len() {
+            abuf[n] = c as u8;
+            n += 1;
+        }
+    }
+    let Ok(path) = core::str::from_utf8(&abuf[..n]) else {
+        return 0xFFFF_FFFF;
+    };
+    io::ramfs::attributes(path) as u64
 }
 
 /// `FormatMessage(FROM_HMODULE)` backend: load message `id` from `base`'s

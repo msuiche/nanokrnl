@@ -48,6 +48,7 @@ const NT_WAIT_PROCESS: u32 = 28;
 const NT_GET_EXIT_CODE_PROCESS: u32 = 29;
 const NT_SET_CONSOLE_MODE: u32 = 30;
 const NT_LOAD_MESSAGE: u32 = 31;
+const NT_QUERY_ATTRIBUTES: u32 = 32;
 
 // A couple of Win32 error codes used by the shim.
 const ERROR_SUCCESS: u32 = 0;
@@ -2458,12 +2459,23 @@ pub unsafe extern "C" fn CreateFileW(
     CreateFileA(narrow.as_ptr(), access, share, sec, disp, flags, template)
 }
 
-/// `GetFileAttributesW(lpFileName)` — report "not found" with the proper
-/// last-error so a path-search caller (cmd probing PATH/PATHEXT) terminates.
+/// `GetFileAttributesW(lpFileName)` — query the RAM filesystem. Returns the
+/// Win32 attributes (a drive root like `C:\` is a directory; a known file is a
+/// normal file), or `INVALID_FILE_ATTRIBUTES` + `ERROR_FILE_NOT_FOUND` when the
+/// path doesn't exist (so a path-search caller, e.g. cmd probing PATH/PATHEXT,
+/// terminates). Making `C:\` resolve lets a shell's CWD validation succeed.
 #[no_mangle]
-pub unsafe extern "C" fn GetFileAttributesW(_name: *const u16) -> u32 {
-    SetLastError(ERROR_FILE_NOT_FOUND);
-    INVALID_FILE_ATTRIBUTES
+pub unsafe extern "C" fn GetFileAttributesW(name: *const u16) -> u32 {
+    if name.is_null() {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_FILE_ATTRIBUTES;
+    }
+    let len = wstrlen(name);
+    let attrs = syscall3(NT_QUERY_ATTRIBUTES, name as u64, len as u64, 0) as u32;
+    if attrs == INVALID_FILE_ATTRIBUTES {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+    }
+    attrs
 }
 
 /// `GetFileInformationByHandle(hFile, lpFileInformation)` — unsupported; fail.

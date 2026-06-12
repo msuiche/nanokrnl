@@ -1224,6 +1224,58 @@ pub unsafe extern "C" fn _vsnwprintf(
     }
 }
 
+/// `__stdio_common_vswprintf(options, buffer, count, format, locale, valist)` —
+/// the ucrt backend behind `vswprintf`/`_vsnwprintf`/`_snwprintf` (and their
+/// `_l` variants). On Win64 the public wide-printf inlines forward here with
+/// the buffer element count and a `va_list` (a pointer to the stacked args).
+/// We route to our [`_vsnwprintf`], which implements the format engine. This is
+/// what a real CRT console binary (e.g. cmd.exe) uses to format its version
+/// banner and `ECHO`/error output, so resolving it is essential.
+#[no_mangle]
+pub unsafe extern "C" fn __stdio_common_vswprintf(
+    _options: u64,
+    buffer: *mut u16,
+    count: usize,
+    format: *const u16,
+    _locale: *const c_void,
+    valist: *const u64,
+) -> i32 {
+    if buffer.is_null() || format.is_null() {
+        return -1;
+    }
+    _vsnwprintf(buffer, if count == 0 { 1 } else { count }, format, valist)
+}
+
+/// `__stdio_common_vswprintf_s(...)` — the secure (`_snwprintf_s`/`vswprintf_s`)
+/// variant. Same ABI; same engine. We always NUL-terminate (as the secure
+/// contract requires) via `_vsnwprintf`.
+#[no_mangle]
+pub unsafe extern "C" fn __stdio_common_vswprintf_s(
+    options: u64,
+    buffer: *mut u16,
+    count: usize,
+    format: *const u16,
+    locale: *const c_void,
+    valist: *const u64,
+) -> i32 {
+    __stdio_common_vswprintf(options, buffer, count, format, locale, valist)
+}
+
+/// `__stdio_common_vsnwprintf_s(...)` — the `_vsnwprintf_s` backend; identical
+/// surface to the `_s` variant above for our purposes.
+#[no_mangle]
+pub unsafe extern "C" fn __stdio_common_vsnwprintf_s(
+    options: u64,
+    buffer: *mut u16,
+    count: usize,
+    _max_count: usize,
+    format: *const u16,
+    locale: *const c_void,
+    valist: *const u64,
+) -> i32 {
+    __stdio_common_vswprintf(options, buffer, count, format, locale, valist)
+}
+
 /// `__wgetmainargs(&argc, &wargv, &wenvp, doWildcard, startInfo)` — the wide
 /// counterpart of `__getmainargs`: fetch the command line, widen it, and
 /// tokenize into a UTF-16 argv.
