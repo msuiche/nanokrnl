@@ -2258,6 +2258,7 @@ pub unsafe extern "C" fn VerQueryValueW(
 const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
 const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_NO_MORE_FILES: u32 = 18;
+const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 
 /// `GetUserDefaultLCID()` — US English.
 #[no_mangle]
@@ -2894,20 +2895,79 @@ pub unsafe extern "C" fn GetDateFormatW(
     wcopy(buffer, cch.max(0) as u32, &s) as i32
 }
 
-/// `FindFirstFileExW(...)` — directory enumeration. We have no directory model
-/// yet, so report "no matching files"; a search tool then prints its
-/// not-found message. Returns INVALID_HANDLE_VALUE.
+/// `GetLocaleInfoW(Locale, LCType, lpLCData, cchData)` — return locale data for
+/// the LCTYPEs callers actually query (date/time format strings, separators,
+/// AM/PM markers). Real Windows reads these from NLS data; we hardcode a stable
+/// en-US-style set. Returning a valid string (nonzero length) matters: cmd's
+/// `dir` date formatter falls back to copying from an uninitialized global when
+/// `GetLocaleInfoW(LOCALE_SSHORTDATE)` returns 0, which then faults. The return
+/// value is the character count *including* the terminating NUL, or 0 on error
+/// (with `cchData == 0` it returns the required size without writing).
+#[no_mangle]
+pub unsafe extern "C" fn GetLocaleInfoW(
+    _locale: u32,
+    lc_type: u32,
+    data: *mut u16,
+    cch: i32,
+) -> i32 {
+    // The low 16 bits select the field; high bits are flags (e.g. LOCALE_RETURN_NUMBER).
+    let wide = |s: &str| -> [u16; 32] {
+        let mut b = [0u16; 32];
+        for (i, c) in s.bytes().take(31).enumerate() {
+            b[i] = c as u16;
+        }
+        b
+    };
+    let buf = match lc_type & 0xFFFF {
+        0x001F => wide("M/d/yyyy"),          // LOCALE_SSHORTDATE
+        0x0020 => wide("dddd, MMMM d, yyyy"),// LOCALE_SLONGDATE
+        0x1003 => wide("h:mm:ss tt"),        // LOCALE_STIMEFORMAT
+        0x0079 => wide("h:mm tt"),           // LOCALE_SSHORTTIME
+        0x001D => wide("/"),                 // LOCALE_SDATE (date separator)
+        0x001E => wide(":"),                 // LOCALE_STIME (time separator)
+        0x0028 => wide("AM"),                // LOCALE_S1159
+        0x0029 => wide("PM"),                // LOCALE_S2359
+        0x000E => wide("."),                 // LOCALE_SDECIMAL
+        0x000F => wide(","),                 // LOCALE_STHOUSAND
+        // Numeric/format-order fields default to "0" (a valid one-char value):
+        // IDATE/ILDATE month-day-year order, ITIME 12-hour, ITLZERO, etc.
+        _ => wide("0"),
+    };
+    // Length excluding NUL.
+    let mut n = 0usize;
+    while n < buf.len() && buf[n] != 0 {
+        n += 1;
+    }
+    let need = n + 1; // include NUL
+    if cch == 0 {
+        return need as i32;
+    }
+    if data.is_null() || (cch as usize) < need {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    for i in 0..n {
+        *data.add(i) = buf[i];
+    }
+    *data.add(n) = 0;
+    need as i32
+}
+
+/// `FindFirstFileExW(...)` — directory enumeration. For the info levels we
+/// support (FindExInfoStandard/Basic both fill a WIN32_FIND_DATAW), route to
+/// the same RAM-filesystem enumeration as `FindFirstFileW`; the extra
+/// parameters (search op, filter, flags) don't change which entries match for
+/// our flat namespace.
 #[no_mangle]
 pub unsafe extern "C" fn FindFirstFileExW(
-    _name: *const u16,
+    name: *const u16,
     _info_level: i32,
-    _find_data: *mut c_void,
+    find_data: *mut c_void,
     _search_op: i32,
     _filter: *mut c_void,
     _flags: u32,
 ) -> u64 {
-    SetLastError(ERROR_FILE_NOT_FOUND);
-    INVALID_HANDLE_VALUE
+    FindFirstFileW(name, find_data)
 }
 
 /// Enumeration state behind a find handle: the wildcard pattern (so
