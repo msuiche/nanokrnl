@@ -397,6 +397,23 @@ static PROC_TABLE: crate::ke::spinlock::SpinLock<[ProcEntry; MAX_PROCS]> =
 /// Create a new process from a PE `image`: build its address space, spawn its
 /// initial ring-3 thread, record it, and return a process handle (0 on error).
 /// `cmdline` becomes the child's command line.
+/// The `.mui` resource module that goes with an embedded program image, or an
+/// empty slice if it has none. Matched by image length: the embedded programs
+/// have distinct sizes, and `const` byte blobs are not guaranteed a single
+/// address across use sites (so pointer identity is unreliable here).
+fn mui_for_image(image: &[u8]) -> &'static [u8] {
+    let n = image.len();
+    if !CHOICE_IMAGE.is_empty() && n == CHOICE_IMAGE.len() {
+        CHOICE_MUI
+    } else if !WHERE_IMAGE.is_empty() && n == WHERE_IMAGE.len() {
+        WHERE_MUI
+    } else if !CMD_IMAGE.is_empty() && n == CMD_IMAGE.len() {
+        CMD_MUI
+    } else {
+        &[]
+    }
+}
+
 pub(crate) fn create_user_process(image: &[u8], cmdline: &[u8]) -> u64 {
     let proc = match crate::ldr::pe::load_user_process(image) {
         Ok(p) => p,
@@ -406,6 +423,17 @@ pub(crate) fn create_user_process(image: &[u8], cmdline: &[u8]) -> u64 {
         Ok(t) => t,
         Err(_) => return 0,
     };
+    // Give the child its program's `.mui` so its resource strings (prompts,
+    // info/error messages) resolve — the same as the boot harness does for the
+    // standalone runs. Matched by image identity (the const blobs are unique);
+    // stored per-thread because every process shares the same image base.
+    let mui = mui_for_image(image);
+    if !mui.is_empty() {
+        unsafe {
+            (*t).tcb.mui_ptr = mui.as_ptr() as u64;
+            (*t).tcb.mui_len = mui.len() as u32;
+        }
+    }
     let mut tbl = PROC_TABLE.lock();
     let Some(i) = (0..MAX_PROCS).find(|&i| !tbl[i].in_use) else {
         return 0;

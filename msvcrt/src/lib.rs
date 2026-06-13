@@ -1276,6 +1276,125 @@ pub unsafe extern "C" fn __stdio_common_vsnwprintf_s(
     __stdio_common_vswprintf(options, buffer, count, format, locale, valist)
 }
 
+/// `__acrt_iob_func(index)` — return the `FILE*` for a standard stream
+/// (0=stdin, 1=stdout, 2=stderr). The ucrt's `printf`/`fprintf`/`fwrite`
+/// inlines call this to get the stream they then pass to
+/// `__stdio_common_vfprintf`. Our stdio has a single console sink, so the
+/// pointer is only an opaque, non-NULL token (callers that NULL-check it must
+/// see a valid stream); it is never dereferenced. Shares the same [`IOB`] array
+/// as [`__iob_func`].
+#[no_mangle]
+pub unsafe extern "C" fn __acrt_iob_func(index: u32) -> *mut File {
+    let i = (index as usize).min(2);
+    ((&raw mut IOB) as *mut File).add(i)
+}
+
+/// `__stdio_common_vfprintf(options, stream, format, locale, valist)` — the
+/// ucrt backend behind `printf`/`fprintf`/`vfprintf`. On Win64 the public
+/// narrow-printf functions inline forward here with a `va_list` (a pointer to
+/// the stacked arguments). We format into our console sink — the same engine as
+/// [`fprintf`], but reading arguments through the `va_list` rather than the
+/// register-resident fixed parameters. Resolving this is what lets a real CRT
+/// console binary (e.g. `where.exe`) emit its `printf`-formatted output;
+/// leaving it an unresolved stub silently dropped every such write. The output
+/// goes straight to `\Device\Console` via [`console_write`], independent of the
+/// process's standard-handle/file-descriptor state.
+#[no_mangle]
+pub unsafe extern "C" fn __stdio_common_vfprintf(
+    _options: u64,
+    _stream: *mut File,
+    format: *const u8,
+    _locale: *const c_void,
+    valist: *const u64,
+) -> i32 {
+    if format.is_null() {
+        return -1;
+    }
+    let mut argi = 0usize;
+    let mut next = || {
+        let v = if valist.is_null() { 0 } else { *valist.add(argi) };
+        argi += 1;
+        v
+    };
+    let mut out = FmtBuf::new();
+    let mut p = format;
+    while *p != 0 {
+        let c = *p;
+        p = p.add(1);
+        if c != b'%' {
+            out.push(c);
+            continue;
+        }
+        // Skip flags/width/precision (not honored), track the length modifier.
+        let mut long = 0u8;
+        loop {
+            match *p {
+                b'-' | b'+' | b' ' | b'#' | b'0'..=b'9' | b'.' | b'*' => p = p.add(1),
+                b'l' => {
+                    long += 1;
+                    p = p.add(1);
+                }
+                b'h' | b'z' | b't' => p = p.add(1),
+                _ => break,
+            }
+        }
+        let conv = *p;
+        p = p.add(1);
+        match conv {
+            b'd' | b'i' => {
+                let raw = next();
+                let v = if long >= 1 { raw as i64 } else { raw as u32 as i32 as i64 };
+                out.push_i64(v);
+            }
+            b'u' => {
+                let raw = next();
+                let v = if long >= 1 { raw } else { raw as u32 as u64 };
+                out.push_u64(v, 10, false);
+            }
+            b'x' | b'X' => {
+                let raw = next();
+                let v = if long >= 1 { raw } else { raw as u32 as u64 };
+                out.push_u64(v, 16, conv == b'X');
+            }
+            b'p' => {
+                out.push_bytes(b"0x");
+                out.push_u64(next(), 16, false);
+            }
+            b'c' => out.push(next() as u8),
+            b's' => {
+                // `%s` is a narrow string; `%ls` (long) is a wide string.
+                let ptr = next();
+                if ptr != 0 {
+                    if long >= 1 {
+                        let s = ptr as *const u16;
+                        let mut n = 0;
+                        while *s.add(n) != 0 {
+                            let u = *s.add(n);
+                            out.push(if u < 0x80 { u as u8 } else { b'?' });
+                            n += 1;
+                        }
+                    } else {
+                        let s = ptr as *const u8;
+                        let mut n = 0;
+                        while *s.add(n) != 0 {
+                            n += 1;
+                        }
+                        out.push_bytes(core::slice::from_raw_parts(s, n));
+                    }
+                }
+            }
+            b'%' => out.push(b'%'),
+            0 => break,
+            other => {
+                out.push(b'%');
+                out.push(other);
+            }
+        }
+    }
+    console_write(&out.buf[..out.len]);
+    out.len as i32
+}
+
 /// `__wgetmainargs(&argc, &wargv, &wenvp, doWildcard, startInfo)` — the wide
 /// counterpart of `__getmainargs`: fetch the command line, widen it, and
 /// tokenize into a UTF-16 argv.

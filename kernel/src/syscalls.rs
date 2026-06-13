@@ -202,7 +202,16 @@ extern "C" fn nt_load_message(base: u64, id: u64, buf: u64, cch: u64) -> u64 {
     }
     let mut tmp = [0u16; 512];
     let want = cch.saturating_sub(1).min(tmp.len());
-    let n = crate::ldr::mui::load_message(base, id as u32, &mut tmp[..want]);
+    let cur = crate::ke::pcr::ke_get_current_thread();
+    let n = unsafe {
+        let (mp, ml) = ((*cur).mui_ptr, (*cur).mui_len as usize);
+        if mp != 0 && ml != 0 {
+            let bytes = core::slice::from_raw_parts(mp as *const u8, ml);
+            crate::ldr::mui::load_message_from(bytes, id as u32, &mut tmp[..want])
+        } else {
+            crate::ldr::mui::load_message(base, id as u32, &mut tmp[..want])
+        }
+    };
     if n == 0 {
         return 0;
     }
@@ -665,7 +674,19 @@ extern "C" fn nt_load_mui_string(base: u64, id: u64, buf: u64, cch: u64) -> u64 
     }
     let mut tmp = [0u16; 512];
     let want = cch.saturating_sub(1).min(tmp.len());
-    let n = crate::ldr::mui::load_string(base, id as u32, &mut tmp[..want]);
+    // Prefer the calling thread's own `.mui` (every process loads at the same
+    // image base, so a base→mui registry would collide between a parent and its
+    // child); fall back to the base registry for threads that set none.
+    let cur = crate::ke::pcr::ke_get_current_thread();
+    let n = unsafe {
+        let (mp, ml) = ((*cur).mui_ptr, (*cur).mui_len as usize);
+        if mp != 0 && ml != 0 {
+            let bytes = core::slice::from_raw_parts(mp as *const u8, ml);
+            crate::ldr::mui::load_string_from(bytes, id as u32, &mut tmp[..want])
+        } else {
+            crate::ldr::mui::load_string(base, id as u32, &mut tmp[..want])
+        }
+    };
     if n == 0 {
         return 0;
     }

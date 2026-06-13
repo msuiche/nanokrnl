@@ -148,6 +148,12 @@ pub struct Kthread {
     /// `PEB.ProcessParameters.CommandLine`.
     pub cmdline_ptr: u64,
     pub cmdline_len: u32,
+    /// The program's `.mui` resource bytes (UI strings behind `LoadStringW`),
+    /// per-thread because every process loads at the same image base, so a
+    /// global base→mui registry would have a parent and its child collide.
+    /// Points at static bytes; 0/0 means "fall back to the base registry".
+    pub mui_ptr: u64,
+    pub mui_len: u32,
     /// Exit code recorded when the thread terminates (set by `ExitProcess` /
     /// `NtTerminateThread`), read back by `GetExitCodeProcess`.
     pub exit_code: u32,
@@ -190,6 +196,8 @@ impl Kthread {
             last_error: 0,
             cmdline_ptr: 0,
             cmdline_len: 0,
+            mui_ptr: 0,
+            mui_len: 0,
             exit_code: 0,
             gs_base: 0,
         }

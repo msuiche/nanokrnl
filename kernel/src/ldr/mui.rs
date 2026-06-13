@@ -120,10 +120,15 @@ fn dir_find(mui: &[u8], res_off: usize, dir_rel: usize, want_id: u32) -> Option<
 /// strings in bundles of 16: string `id` is item `id & 15` of bundle
 /// `(id >> 4) + 1`, each item a `u16` length then that many `u16` chars.
 pub fn load_string(module_base: u64, id: u32, out: &mut [u16]) -> usize {
-    let mui = match lookup(module_base) {
-        Some(m) => m,
-        None => return 0,
-    };
+    match lookup(module_base) {
+        Some(mui) => load_string_from(mui, id, out),
+        None => 0,
+    }
+}
+
+/// As [`load_string`], but against `.mui` bytes given directly (the per-thread
+/// registration in the thread control block) rather than the base→mui table.
+pub fn load_string_from(mui: &[u8], id: u32, out: &mut [u16]) -> usize {
     (|| -> Option<usize> {
         let res_rva = rsrc_rva(mui)?;
         let res_off = rva_to_off(mui, res_rva)?;
@@ -159,10 +164,15 @@ const RT_MESSAGETABLE: u32 = 11;
 /// blocks; entries at `Offset` are `{u16 Length, u16 Flags, text[Length-4]}`
 /// (Unicode when `Flags & 1`).
 pub fn load_message(module_base: u64, id: u32, out: &mut [u16]) -> usize {
-    let mui = match lookup(module_base) {
-        Some(m) => m,
-        None => return 0,
-    };
+    match lookup(module_base) {
+        Some(mui) => load_message_from(mui, id, out),
+        None => 0,
+    }
+}
+
+/// As [`load_message`], but against `.mui` bytes given directly (the per-thread
+/// registration in the thread control block) rather than the base→mui table.
+pub fn load_message_from(mui: &[u8], id: u32, out: &mut [u16]) -> usize {
     (|| -> Option<usize> {
         let res_rva = rsrc_rva(mui)?;
         let res_off = rva_to_off(mui, res_rva)?;
