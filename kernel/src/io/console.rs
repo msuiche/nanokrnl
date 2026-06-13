@@ -258,6 +258,13 @@ pub fn set_input_mode(mode: u32) {
     INPUT_MODE.store(mode as u64, Ordering::Release);
 }
 
+/// The current console input mode. Saved before launching a child (which may
+/// change it, e.g. `choice` switches to raw single-key input) and restored
+/// when the child exits, so the shell's line discipline isn't left broken.
+pub fn input_mode() -> u32 {
+    INPUT_MODE.load(Ordering::Acquire) as u32
+}
+
 fn line_mode() -> bool {
     INPUT_MODE.load(Ordering::Acquire) as u32 & ENABLE_LINE_INPUT != 0
 }

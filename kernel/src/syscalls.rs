@@ -526,6 +526,8 @@ extern "C" fn nt_terminate_thread(exit_code: u64, _a2: u64, _a3: u64, _a4: u64) 
     unsafe {
         let cur = crate::ke::pcr::ke_get_current_thread();
         (*cur).exit_code = exit_code as u32;
+        // Restore the console mode if this is a created process that changed it.
+        crate::init::on_user_thread_exit(cur as u64);
         scheduler::ki_terminate_current_thread()
     }
 }

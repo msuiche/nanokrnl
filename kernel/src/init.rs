@@ -387,11 +387,21 @@ struct ProcEntry {
     ethread: u64, // *mut ps::Ethread as address (kept as u64 for Sync)
     cmdline: [u8; PROC_CMDLINE_MAX],
     cmdline_len: usize,
+    /// The console input mode at launch, restored when the child exits — a
+    /// child (e.g. `choice`) may switch to raw single-key input and not put it
+    /// back, which would leave the launching shell's line discipline broken.
+    saved_console_mode: u32,
 }
 
 static PROC_TABLE: crate::ke::spinlock::SpinLock<[ProcEntry; MAX_PROCS]> =
     crate::ke::spinlock::SpinLock::new(
-        [ProcEntry { in_use: false, ethread: 0, cmdline: [0; PROC_CMDLINE_MAX], cmdline_len: 0 }; MAX_PROCS],
+        [ProcEntry {
+            in_use: false,
+            ethread: 0,
+            cmdline: [0; PROC_CMDLINE_MAX],
+            cmdline_len: 0,
+            saved_console_mode: 0,
+        }; MAX_PROCS],
     );
 
 /// Create a new process from a PE `image`: build its address space, spawn its
@@ -440,6 +450,7 @@ pub(crate) fn create_user_process(image: &[u8], cmdline: &[u8]) -> u64 {
     };
     tbl[i].in_use = true;
     tbl[i].ethread = t as u64;
+    tbl[i].saved_console_mode = crate::io::console::input_mode();
     let n = cmdline.len().min(PROC_CMDLINE_MAX);
     tbl[i].cmdline[..n].copy_from_slice(&cmdline[..n]);
     tbl[i].cmdline_len = n;
@@ -452,6 +463,22 @@ pub(crate) fn create_user_process(image: &[u8], cmdline: &[u8]) -> u64 {
         (*t).tcb.cmdline_len = n as u32;
     }
     PROC_HANDLE_BASE + i as u64
+}
+
+/// Called when a user thread terminates. If it is a tracked created-process
+/// thread, restore the console input mode the process was launched with — a
+/// child (e.g. `choice`) may switch to raw single-key input and exit without
+/// restoring it, which would leave the launching shell reading raw bytes.
+pub(crate) fn on_user_thread_exit(thread: u64) {
+    let mode = {
+        let tbl = PROC_TABLE.lock();
+        (0..MAX_PROCS)
+            .find(|&i| tbl[i].in_use && tbl[i].ethread == thread)
+            .map(|i| tbl[i].saved_console_mode)
+    };
+    if let Some(mode) = mode {
+        crate::io::console::set_input_mode(mode);
+    }
 }
 
 fn proc_ethread(handle: u64) -> Option<*mut ps::Ethread> {

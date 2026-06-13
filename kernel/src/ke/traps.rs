@@ -217,7 +217,14 @@ extern "C" fn ki_dispatch_trap(frame: &mut KtrapFrame) {
                     frame.error_code,
                     frame.rip
                 );
-                unsafe { crate::ke::scheduler::ki_terminate_current_thread() };
+                unsafe {
+                    // A crashing child can leave console state (e.g. raw input
+                    // mode) changed; restore it for the launching shell.
+                    crate::init::on_user_thread_exit(
+                        crate::ke::pcr::ke_get_current_thread() as u64,
+                    );
+                    crate::ke::scheduler::ki_terminate_current_thread()
+                };
             }
             kd_println!(
                 "!! page fault: va={:#018X} err={:#X} rip={:#018X}",
@@ -270,7 +277,14 @@ extern "C" fn ki_dispatch_trap(frame: &mut KtrapFrame) {
                     frame.r8,
                     frame.r9
                 );
-                unsafe { crate::ke::scheduler::ki_terminate_current_thread() };
+                unsafe {
+                    // A crashing child can leave console state (e.g. raw input
+                    // mode) changed; restore it for the launching shell.
+                    crate::init::on_user_thread_exit(
+                        crate::ke::pcr::ke_get_current_thread() as u64,
+                    );
+                    crate::ke::scheduler::ki_terminate_current_thread()
+                };
             }
             kd_println!(
                 "!! exception vec={} err={:#X} rip={:#018X} rsp={:#018X}",

@@ -1302,6 +1302,17 @@ pub unsafe extern "C" fn WaitForSingleObject(handle: u64, millis: u32) -> u32 {
     0 // WAIT_OBJECT_0
 }
 
+/// `WaitForSingleObjectEx(hHandle, dwMilliseconds, bAlertable)` — same as
+/// `WaitForSingleObject` but with an alertable flag (for APCs, which we don't
+/// deliver). cmd waits on its child through this entry point, so leaving it an
+/// unresolved stub made the wait return immediately — the child ran
+/// concurrently with the shell, scrambling console state. Forward to the
+/// non-Ex form, ignoring `bAlertable`.
+#[no_mangle]
+pub unsafe extern "C" fn WaitForSingleObjectEx(handle: u64, millis: u32, _alertable: i32) -> u32 {
+    WaitForSingleObject(handle, millis)
+}
+
 /// `CreateProcessW(...)` — launch a new process. We take the image path from
 /// `lpApplicationName` (or the first token of `lpCommandLine`), load it from
 /// the filesystem, and start it. `lpProcessInformation` receives the process
