@@ -44,6 +44,7 @@ pub static FILES: &[RamFile] = &[
     RamFile { path: "C:\\choice.exe", data: crate::init::CHOICE_IMAGE },
     RamFile { path: "C:\\where.exe", data: crate::init::WHERE_IMAGE },
     RamFile { path: "C:\\cmd.exe", data: crate::init::CMD_IMAGE },
+    RamFile { path: "C:\\more.com", data: crate::init::MORE_IMAGE },
 ];
 
 /// Object-manager type for RAM files, distinct from `DEVICE_TYPE` so the read
@@ -124,10 +125,12 @@ fn path_eq_norm(a: &str, b: &str) -> bool {
 }
 
 /// Look up a file's bytes by path (tolerating `.` segments and separator style).
+/// Entries whose data is empty (an embedded image that wasn't staged) are
+/// treated as absent, so an unbuilt binary is not a phantom zero-byte file.
 pub fn lookup(path: &str) -> Option<&'static [u8]> {
     FILES
         .iter()
-        .find(|f| path_eq_norm(f.path, path))
+        .find(|f| !f.data.is_empty() && path_eq_norm(f.path, path))
         .map(|f| f.data)
 }
 
@@ -182,6 +185,9 @@ pub fn find(pattern: &str, index: usize) -> Option<DirEntry> {
     let pat_name = if pat_name.is_empty() { "*" } else { pat_name };
     let mut n = 0;
     for f in FILES {
+        if f.data.is_empty() {
+            continue; // an embedded image that wasn't staged: not a real file
+        }
         let (dir, name) = split_path(f.path);
         if dir_eq(dir, pat_dir) && glob_match(pat_name.as_bytes(), name.as_bytes()) {
             if n == index {

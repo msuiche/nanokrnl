@@ -1551,6 +1551,10 @@ pub(crate) const WHERE_IMAGE: &[u8] = include_bytes!(env!("NTOS_WHERE_IMAGE"));
 static WHERE_MUI: &[u8] = include_bytes!(env!("NTOS_WHERE_MUI_IMAGE"));
 pub(crate) const CMD_IMAGE: &[u8] = include_bytes!(env!("NTOS_CMD_IMAGE"));
 static CMD_MUI: &[u8] = include_bytes!(env!("NTOS_CMD_MUI_IMAGE"));
+/// `more.com` — the console pager (a PE despite the `.com` name). Needs
+/// `ulib.dll` to actually run; embedded so it can be enumerated and launched
+/// once dependent-DLL loading exists.
+pub(crate) const MORE_IMAGE: &[u8] = include_bytes!(env!("NTOS_MORE_IMAGE"));
 
 /// A second, independent console app — proves the loader runs arbitrary
 /// programs. Empty when not built (see `scripts/build-userapp2.sh`).

@@ -103,6 +103,11 @@ fn main() {
         "NTOS_CMD_IMAGE",
     );
     resolve(
+        workspace.join("winbin").join("more.com"),
+        "no_more.bin",
+        "NTOS_MORE_IMAGE",
+    );
+    resolve(
         workspace.join("winbin").join("cmd.exe.mui"),
         "no_cmd_mui.bin",
         "NTOS_CMD_MUI_IMAGE",
