@@ -178,6 +178,25 @@ fn ingest_serial_byte(b: u8) {
                 crate::kd_print!("^C\r\n");
             }
         }
+        0x1a => {
+            // Ctrl-Z: end-of-file for the console input stream (the Windows
+            // console EOF key). Commit any text typed before it on this line,
+            // then mark EOF so a program reading stdin (e.g. `sort`) stops
+            // instead of blocking forever. The flag is consumed by the next
+            // read, so the shell that launched the program is unaffected.
+            if echo_mode() {
+                crate::kd_print!("^Z\r\n");
+            }
+            let mut edit = EDIT.lock();
+            let mut input = INPUT.lock();
+            for i in 0..edit.len {
+                input.push(edit.buf[i]);
+            }
+            edit.len = 0;
+            drop(input);
+            drop(edit);
+            set_input_eof(true);
+        }
         _ => {
             let mut edit = EDIT.lock();
             let n = edit.len;
@@ -325,8 +344,12 @@ unsafe extern "win64" fn console_dispatch(_device: *mut DeviceObject, irp: *mut 
                             break n as u64;
                         }
                         // Empty buffer: report EOF if input has ended, else
-                        // block (yield) until more arrives.
+                        // block (yield) until more arrives. EOF is one-shot —
+                        // consumed here — so a Ctrl-Z that ends one program's
+                        // input doesn't also feed end-of-file to the next reader
+                        // (e.g. the shell that launched it).
                         if input_at_eof() {
+                            set_input_eof(false);
                             break 0;
                         }
                         crate::ke::dispatcher::ke_delay_execution_thread(1);
