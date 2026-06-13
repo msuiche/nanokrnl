@@ -1564,6 +1564,72 @@ unsafe fn peb_image_base() -> u64 {
     *((peb + 0x10) as *const u64)
 }
 
+// --- Thread-local storage (dynamic, Win32 TlsAlloc family) -----------------
+//
+// Each thread keeps 64 TLS slots in its TEB at offset 0x1480 (`TEB.TlsSlots`),
+// set up by the loader. `TlsAlloc` hands out a slot index; `TlsGetValue`/
+// `TlsSetValue` read/write the calling thread's own slot at that index via GS.
+// The index allocator (the bitmap) lives in shared DLL data, so indices are
+// drawn from one space across processes — harmless, since the *storage* is the
+// per-thread TEB slot, only the index number is shared.
+
+/// `TEB.TlsSlots` byte offset, and the number of inline slots.
+const TLS_SLOTS_OFF: u64 = 0x1480;
+const TLS_SLOT_COUNT: u32 = 64;
+const TLS_OUT_OF_INDEXES: u32 = 0xFFFF_FFFF;
+static TLS_BITMAP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `TlsAlloc()` — reserve a TLS slot index (0..64), or `TLS_OUT_OF_INDEXES`.
+#[no_mangle]
+pub unsafe extern "C" fn TlsAlloc() -> u32 {
+    use core::sync::atomic::Ordering::{AcqRel, Acquire};
+    loop {
+        let cur = TLS_BITMAP.load(Acquire);
+        let free = (!cur).trailing_zeros();
+        if free >= TLS_SLOT_COUNT {
+            return TLS_OUT_OF_INDEXES;
+        }
+        let bit = 1u64 << free;
+        if TLS_BITMAP.compare_exchange(cur, cur | bit, AcqRel, Acquire).is_ok() {
+            TlsSetValue(free, 0); // slots start cleared
+            return free;
+        }
+    }
+}
+
+/// `TlsFree(index)` — release a slot index. Returns TRUE on success.
+#[no_mangle]
+pub extern "C" fn TlsFree(index: u32) -> i32 {
+    if index >= TLS_SLOT_COUNT {
+        return 0;
+    }
+    TLS_BITMAP.fetch_and(!(1u64 << index), core::sync::atomic::Ordering::AcqRel);
+    1
+}
+
+/// `TlsGetValue(index)` — the calling thread's value in slot `index`.
+#[no_mangle]
+pub unsafe extern "C" fn TlsGetValue(index: u32) -> u64 {
+    if index >= TLS_SLOT_COUNT {
+        return 0;
+    }
+    let off = TLS_SLOTS_OFF + index as u64 * 8;
+    let v: u64;
+    core::arch::asm!("mov {v}, gs:[{o}]", v = out(reg) v, o = in(reg) off, options(nostack, readonly));
+    v
+}
+
+/// `TlsSetValue(index, value)` — store `value` in the calling thread's slot.
+#[no_mangle]
+pub unsafe extern "C" fn TlsSetValue(index: u32, value: u64) -> i32 {
+    if index >= TLS_SLOT_COUNT {
+        return 0;
+    }
+    let off = TLS_SLOTS_OFF + index as u64 * 8;
+    core::arch::asm!("mov gs:[{o}], {v}", o = in(reg) off, v = in(reg) value, options(nostack));
+    1
+}
+
 /// `lstrlenW(lpString)`.
 #[no_mangle]
 pub unsafe extern "C" fn lstrlenW(s: *const u16) -> i32 {

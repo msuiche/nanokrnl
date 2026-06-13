@@ -51,6 +51,7 @@ const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 const IMAGE_NT_OPTIONAL_HDR64_MAGIC: u16 = 0x20B;
 const DIR_IMPORT: usize = 1;
 const DIR_BASERELOC: usize = 5;
+const DIR_TLS: usize = 9;
 const IMAGE_REL_BASED_ABSOLUTE: u16 = 0;
 const IMAGE_REL_BASED_DIR64: u16 = 10;
 const IMAGE_ORDINAL_FLAG64: u64 = 1 << 63;
@@ -146,9 +147,23 @@ const USER_STACK_TOP: u64 = 0x0000_7FFF_FFF0_0000;
 /// User stack size in pages. Sized for a real MSVC CRT startup (security
 /// init, locale, buffered I/O), not just our minimal apps.
 const USER_STACK_PAGES: usize = 64; // 256 KiB
-/// TEB / PEB virtual bases, two pages just below the user stack region.
+/// Per-process control-block region, just below the user stack. A real binary
+/// reaches these through GS (the TEB) and the PEB pointer chained from it. We
+/// lay them out at fixed offsets from [`TEB_BASE`]:
+///   TEB (2 pages — `TlsSlots` lives at 0x1480), PEB, the process parameters
+///   (with its UNICODE_STRING buffers), the loader module list, a TLS array,
+///   and an environment block.
 const TEB_BASE: u64 = 0x0000_7FFF_FFE0_0000;
-const PEB_BASE: u64 = TEB_BASE + 0x1000;
+const PEB_BASE: u64 = TEB_BASE + 0x2000;
+const PARAMS_BASE: u64 = TEB_BASE + 0x3000;
+const LDR_BASE: u64 = TEB_BASE + 0x4000;
+const TLS_BASE: u64 = TEB_BASE + 0x5000;
+const ENV_BASE: u64 = TEB_BASE + 0x6000;
+/// Pages backing the whole TEB…environment region above.
+const USER_BLOCK_PAGES: usize = 8;
+/// `GetProcessHeap` returns this; mirror it in `PEB.ProcessHeap` so a binary
+/// that reads the field directly and a binary that calls the API agree.
+const PROCESS_HEAP: u64 = 1;
 
 /// Load a PE32+ user image into a **fresh per-process address space**, mapped
 /// at its preferred ImageBase in the low (user) half. The image and a user
@@ -183,6 +198,11 @@ pub fn load_user_process(data: &[u8]) -> Result<LoadedProcess, NtStatus> {
     let num_dirs = u32le(data, opt + 108).ok_or(bad())? as usize;
     let import_rva = if DIR_IMPORT < num_dirs {
         u32le(data, opt + 112 + DIR_IMPORT * 8).unwrap_or(0) as usize
+    } else {
+        0
+    };
+    let tls_rva = if DIR_TLS < num_dirs {
+        u32le(data, opt + 112 + DIR_TLS * 8).unwrap_or(0) as usize
     } else {
         0
     };
@@ -252,33 +272,20 @@ pub fn load_user_process(data: &[u8]) -> Result<LoadedProcess, NtStatus> {
         *slot = super::ntdll::trampoline_base(); // NtTerminateThread stub (svc 0)
     }
 
-    // ---- TEB + PEB: a real binary reaches the thread/process blocks via GS.
-    // Two pages just below the stack region; the user-mode GS base points at
-    // the TEB. We fill only the fields an early CRT reads (stack bounds, the
-    // TEB self-pointer, the PEB pointer, the image base); the rest is zero.
-    let tp = crate::mm::phys::mm_allocate_contiguous_pages(2)
-        .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
-    unsafe { crate::mm::virt::mm_map_user_range(cr3, TEB_BASE, tp, 2, true, false) };
-    unsafe {
-        let teb = crate::mm::phys_to_virt(tp);
-        core::ptr::write_bytes(teb, 0, 2 * 0x1000);
-        let w = |off: usize, v: u64| *(teb.add(off) as *mut u64) = v;
-        // NT_TIB / TEB
-        w(0x08, USER_STACK_TOP); // NtTib.StackBase
-        w(0x10, stk_base); // NtTib.StackLimit
-        w(0x30, TEB_BASE); // NtTib.Self
-        w(0x60, PEB_BASE); // ProcessEnvironmentBlock
-        // PEB (second page)
-        w(0x1000 + 0x10, preferred_base); // PEB.ImageBaseAddress
-        // OS version fields — a placeholder version a binary can report (e.g.
-        // cmd.exe's banner reads major.minor.build from here). 1.0.1.
-        let w32 = |off: usize, v: u32| *(teb.add(off) as *mut u32) = v;
-        let w16 = |off: usize, v: u16| *(teb.add(off) as *mut u16) = v;
-        w32(0x1000 + 0x118, 1); // PEB.OSMajorVersion
-        w32(0x1000 + 0x11C, 0); // PEB.OSMinorVersion
-        w16(0x1000 + 0x120, 1); // PEB.OSBuildNumber
-        w32(0x1000 + 0x124, 2); // PEB.OSPlatformId = VER_PLATFORM_WIN32_NT
-    }
+    // ---- TEB / PEB / process parameters / loader list / TLS / environment.
+    // A real binary reaches the thread block through GS and the process block
+    // (PEB) chained from it; the CRT and many APIs read standard handles, the
+    // current directory, the loaded-module list and thread-local storage from
+    // these. Lay them all out below the stack.
+    setup_user_blocks(SetupBlocks {
+        cr3,
+        preferred_base,
+        stk_base,
+        entry_rva,
+        size_of_image,
+        img_phys,
+        tls_rva,
+    })?;
 
     Ok(LoadedProcess {
         cr3,
@@ -288,6 +295,187 @@ pub fn load_user_process(data: &[u8]) -> Result<LoadedProcess, NtStatus> {
         image_base: preferred_base,
         image_size: size_of_image as u64,
     })
+}
+
+/// Inputs for [`setup_user_blocks`] (grouped to keep the argument list sane).
+struct SetupBlocks {
+    cr3: crate::mm::PhysAddr,
+    preferred_base: u64,
+    stk_base: u64,
+    entry_rva: usize,
+    size_of_image: usize,
+    img_phys: crate::mm::PhysAddr,
+    tls_rva: usize,
+}
+
+/// Open a fresh handle to `\Device\Console` in the (system-wide) handle table,
+/// for the process's standard input/output/error. 0 if the device is absent.
+fn open_console_handle() -> u64 {
+    let name = crate::io::AbiUnicodeString::from_units(crate::w!("\\Device\\Console"));
+    match crate::io::namespace::lookup_device(&name) {
+        Ok(dev) => crate::ob::handle::ob_create_handle(dev as *mut u8, 0),
+        Err(_) => 0,
+    }
+}
+
+/// Per-load (process, thread) id pair for `TEB.ClientId`. The real scheduler ids
+/// aren't known until the thread is created; these are unique, non-zero values
+/// so code that only checks "is this a valid id" is satisfied.
+fn next_client_id() -> (u64, u64) {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0x100);
+    let n = NEXT.fetch_add(8, Ordering::Relaxed);
+    (n, n + 4)
+}
+
+/// Populate the TEB, PEB, `RTL_USER_PROCESS_PARAMETERS`, `PEB_LDR_DATA`, the
+/// static-TLS array, and an environment block for a freshly loaded image.
+/// Offsets follow the x64 NT layout. Best-effort: a field we can't fill yet
+/// (e.g. the real command line, set later per-thread) gets a sane placeholder.
+fn setup_user_blocks(s: SetupBlocks) -> Result<(), NtStatus> {
+    let blk = crate::mm::phys::mm_allocate_contiguous_pages(USER_BLOCK_PAGES)
+        .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
+    unsafe {
+        crate::mm::virt::mm_map_user_range(s.cr3, TEB_BASE, blk, USER_BLOCK_PAGES, true, false)
+    };
+    let console = open_console_handle();
+    let (pid, tid) = next_client_id();
+
+    // Region offsets within the mapped block (VA == TEB_BASE + offset).
+    const PEB_OFF: usize = (PEB_BASE - TEB_BASE) as usize;
+    const PARAMS_OFF: usize = (PARAMS_BASE - TEB_BASE) as usize;
+    const LDR_OFF: usize = (LDR_BASE - TEB_BASE) as usize;
+    const TLS_OFF: usize = (TLS_BASE - TEB_BASE) as usize;
+    const ENV_OFF: usize = (ENV_BASE - TEB_BASE) as usize;
+
+    unsafe {
+        let b = crate::mm::phys_to_virt(blk);
+        core::ptr::write_bytes(b, 0, USER_BLOCK_PAGES * 0x1000);
+        let w64 = |off: usize, v: u64| *(b.add(off) as *mut u64) = v;
+        let w32 = |off: usize, v: u32| *(b.add(off) as *mut u32) = v;
+        let w16 = |off: usize, v: u16| *(b.add(off) as *mut u16) = v;
+        let w8 = |off: usize, v: u8| *(b.add(off) as *mut u8) = v;
+        // Write a NUL-terminated UTF-16 string (from ASCII) at `off`; returns
+        // its length in characters (excluding the NUL).
+        let wbuf = |off: usize, str: &[u8]| -> usize {
+            for (i, &c) in str.iter().enumerate() {
+                *(b.add(off + i * 2) as *mut u16) = c as u16;
+            }
+            *(b.add(off + str.len() * 2) as *mut u16) = 0;
+            str.len()
+        };
+        // Fill a UNICODE_STRING header at `hdr` for a string at VA `buf_va`,
+        // `nchars` long (Length excludes the NUL, MaximumLength includes it).
+        let wstr = |hdr: usize, buf_va: u64, nchars: usize| {
+            w16(hdr, (nchars * 2) as u16);
+            w16(hdr + 2, ((nchars + 1) * 2) as u16);
+            w64(hdr + 8, buf_va);
+        };
+
+        // ---- TEB (NT_TIB at offset 0) ----
+        w64(0x08, USER_STACK_TOP); // NtTib.StackBase
+        w64(0x10, s.stk_base); // NtTib.StackLimit
+        w64(0x30, TEB_BASE); // NtTib.Self
+        w64(0x40, pid); // ClientId.UniqueProcess
+        w64(0x48, tid); // ClientId.UniqueThread
+        w64(0x58, TLS_BASE); // ThreadLocalStoragePointer (the TLS array)
+        w64(0x60, PEB_BASE); // ProcessEnvironmentBlock
+        w32(0x68, 0); // LastErrorValue
+        // (TlsSlots[64] live at 0x1480 inside the 2-page TEB, zeroed.)
+
+        // ---- PEB ----
+        w8(PEB_OFF + 0x02, 0); // BeingDebugged
+        w64(PEB_OFF + 0x10, s.preferred_base); // ImageBaseAddress
+        w64(PEB_OFF + 0x18, LDR_BASE); // Ldr (PEB_LDR_DATA)
+        w64(PEB_OFF + 0x20, PARAMS_BASE); // ProcessParameters
+        w64(PEB_OFF + 0x30, PROCESS_HEAP); // ProcessHeap
+        w32(PEB_OFF + 0xBC, 0); // NtGlobalFlag
+        w32(PEB_OFF + 0x118, 1); // OSMajorVersion
+        w32(PEB_OFF + 0x11C, 0); // OSMinorVersion
+        w16(PEB_OFF + 0x120, 1); // OSBuildNumber
+        w32(PEB_OFF + 0x124, 2); // OSPlatformId = VER_PLATFORM_WIN32_NT
+
+        // ---- RTL_USER_PROCESS_PARAMETERS ----
+        // String buffers sit after the struct body (well under one page).
+        let cd_off = PARAMS_OFF + 0x400;
+        let cd_n = wbuf(cd_off, b"C:\\");
+        let ip_off = cd_off + (cd_n + 1) * 2;
+        let ip_n = wbuf(ip_off, b"C:\\program.exe");
+        w32(PARAMS_OFF, (USER_BLOCK_PAGES * 0x1000) as u32); // MaximumLength
+        w32(PARAMS_OFF + 0x04, (USER_BLOCK_PAGES * 0x1000) as u32); // Length
+        w64(PARAMS_OFF + 0x10, console); // ConsoleHandle
+        w64(PARAMS_OFF + 0x20, console); // StandardInput
+        w64(PARAMS_OFF + 0x28, console); // StandardOutput
+        w64(PARAMS_OFF + 0x30, console); // StandardError
+        // CurrentDirectory: CURDIR { UNICODE_STRING DosPath @0x38; HANDLE @0x48 }
+        wstr(PARAMS_OFF + 0x38, TEB_BASE + cd_off as u64, cd_n);
+        wstr(PARAMS_OFF + 0x60, TEB_BASE + (ip_off) as u64, ip_n); // ImagePathName
+        wstr(PARAMS_OFF + 0x70, TEB_BASE + (ip_off) as u64, ip_n); // CommandLine
+        w64(PARAMS_OFF + 0x80, ENV_BASE); // Environment
+
+        // ---- PEB_LDR_DATA + one LDR_DATA_TABLE_ENTRY for the image ----
+        // The three module lists are circular; with a single entry each list
+        // head and the entry's links point at each other.
+        let entry = LDR_OFF + 0x100;
+        let entry_va = LDR_BASE + 0x100;
+        w32(LDR_OFF, 0x58); // Length
+        w8(LDR_OFF + 0x04, 1); // Initialized
+        // InLoadOrder (head @ +0x10 ↔ entry @ +0x00)
+        w64(LDR_OFF + 0x10, entry_va);
+        w64(LDR_OFF + 0x18, entry_va);
+        w64(entry, LDR_BASE + 0x10);
+        w64(entry + 0x08, LDR_BASE + 0x10);
+        // InMemoryOrder (head @ +0x20 ↔ entry @ +0x10)
+        w64(LDR_OFF + 0x20, entry_va + 0x10);
+        w64(LDR_OFF + 0x28, entry_va + 0x10);
+        w64(entry + 0x10, LDR_BASE + 0x20);
+        w64(entry + 0x18, LDR_BASE + 0x20);
+        // InInitializationOrder (head @ +0x30 ↔ entry @ +0x20)
+        w64(LDR_OFF + 0x30, entry_va + 0x20);
+        w64(LDR_OFF + 0x38, entry_va + 0x20);
+        w64(entry + 0x20, LDR_BASE + 0x30);
+        w64(entry + 0x28, LDR_BASE + 0x30);
+        // Entry body
+        w64(entry + 0x30, s.preferred_base); // DllBase
+        w64(entry + 0x38, s.preferred_base + s.entry_rva as u64); // EntryPoint
+        w32(entry + 0x40, s.size_of_image as u32); // SizeOfImage
+        let nm_off = LDR_OFF + 0x200;
+        let nm_n = wbuf(nm_off, b"program.exe");
+        wstr(entry + 0x48, LDR_BASE + 0x200, nm_n); // FullDllName
+        wstr(entry + 0x58, LDR_BASE + 0x200, nm_n); // BaseDllName
+
+        // ---- Static TLS: array slot 0 → the image's TLS template copy ----
+        // The array itself is at TLS_BASE (TEB.ThreadLocalStoragePointer). When
+        // the image declares a TLS directory, copy its template into the block
+        // after the array and set the module's `_tls_index` to 0.
+        if s.tls_rva != 0 && s.tls_rva + 0x28 <= s.size_of_image {
+            let iw = crate::mm::phys_to_virt(s.img_phys);
+            let rd = |o: usize| *(iw.add(s.tls_rva + o) as *const u64);
+            let start = rd(0x00);
+            let end = rd(0x08);
+            let idx_va = rd(0x10);
+            let zero_fill = *(iw.add(s.tls_rva + 0x20) as *const u32) as usize;
+            let in_image = |va: u64| {
+                va >= s.preferred_base && va < s.preferred_base + s.size_of_image as u64
+            };
+            let raw = end.saturating_sub(start) as usize;
+            let total = raw + zero_fill;
+            let block_off = TLS_OFF + 0x80;
+            if end >= start && in_image(start) && total <= 0x1000 - 0x80 {
+                let src = iw.add((start - s.preferred_base) as usize);
+                core::ptr::copy_nonoverlapping(src, b.add(block_off), raw);
+                w64(TLS_OFF, TLS_BASE + 0x80); // tls array[0] -> block
+                if in_image(idx_va) {
+                    *(iw.add((idx_va - s.preferred_base) as usize) as *mut u32) = 0;
+                }
+            }
+        }
+
+        // ---- Environment block (double-NUL-terminated UTF-16) ----
+        let e_n = wbuf(ENV_OFF, b"PATH=C:\\");
+        *(b.add(ENV_OFF + (e_n + 1) * 2) as *mut u16) = 0; // block terminator
+    }
+    Ok(())
 }
 
 /// Parse, allocate, copy sections, and apply base relocations. Shared by
