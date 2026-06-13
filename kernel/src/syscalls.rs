@@ -231,7 +231,7 @@ extern "C" fn nt_set_console_mode(mode: u64, _a2: u64, _a3: u64, _a4: u64) -> u6
 /// `NtCreateProcess` backend (a1 = UTF-16 path ptr, a2 = char count). Looks the
 /// image up in the RAM filesystem, builds a new process from it, and returns a
 /// process handle (0 on failure). This is the kernel side of `CreateProcessW`.
-extern "C" fn nt_create_process(path_ptr: u64, path_len: u64, _a3: u64, _a4: u64) -> u64 {
+extern "C" fn nt_create_process(path_ptr: u64, path_len: u64, cmd_ptr: u64, cmd_len: u64) -> u64 {
     let mut wbuf = [0u16; 128];
     let Some(w) = read_user_u16(path_ptr, path_len as usize, &mut wbuf) else {
         return 0;
@@ -251,7 +251,23 @@ extern "C" fn nt_create_process(path_ptr: u64, path_len: u64, _a3: u64, _a4: u64
     let Some(image) = io::ramfs::lookup(path) else {
         return 0;
     };
-    crate::init::create_user_process(image, &abuf[..n])
+    // The child's command line (its argv) comes separately from the image path
+    // so launching `where cmd` gives the child "where cmd", not the image path.
+    let mut cwbuf = [0u16; 128];
+    let mut cbuf = [0u8; 128];
+    let mut cn = 0;
+    if cmd_ptr != 0 && cmd_len != 0 {
+        if let Some(cw) = read_user_u16(cmd_ptr, cmd_len as usize, &mut cwbuf) {
+            for &c in cw {
+                if cn < cbuf.len() {
+                    cbuf[cn] = c as u8;
+                    cn += 1;
+                }
+            }
+        }
+    }
+    let cmdline: &[u8] = if cn > 0 { &cbuf[..cn] } else { &abuf[..n] };
+    crate::init::create_user_process(image, cmdline)
 }
 
 /// `NtWaitForSingleObject` on a process handle (a2 = timeout ms). Returns the

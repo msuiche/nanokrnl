@@ -1340,7 +1340,22 @@ pub unsafe extern "C" fn CreateProcessW(
         return 0; // FALSE — no image specified
     };
     let len = wlen(path);
-    let handle = syscall3(NT_CREATE_PROCESS, path as u64, len as u64, 0);
+    // The image is loaded from `path`, but the child's command line (its argv)
+    // must be `lpCommandLine` — the arguments the user typed — not the image
+    // path. Falling back to the path only when no command line was given.
+    let (cl_ptr, cl_len): (*const u16, usize) =
+        if !command_line.is_null() && *command_line != 0 {
+            (command_line, wlen(command_line))
+        } else {
+            (path, len)
+        };
+    let handle = syscall4(
+        NT_CREATE_PROCESS,
+        path as u64,
+        len as u64,
+        cl_ptr as u64,
+        cl_len as u64,
+    );
     if handle == 0 {
         return 0; // FALSE
     }
@@ -1355,6 +1370,84 @@ pub unsafe extern "C" fn CreateProcessW(
     }
     1 // TRUE
 }
+
+/// `CreateProcessAsUserW(hToken, ...)` — identical to `CreateProcessW` but with
+/// a leading access-token handle. We have no token model, so ignore the token
+/// and forward the remaining ten arguments. cmd launches external programs
+/// through this entry point (not `CreateProcessW`), so leaving it as an
+/// unresolved stub made every command fail with "cannot execute the specified
+/// program" even after the executable was located.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn CreateProcessAsUserW(
+    _token: u64,
+    application_name: *const u16,
+    command_line: *const u16,
+    proc_attrs: *const c_void,
+    thread_attrs: *const c_void,
+    inherit: i32,
+    flags: u32,
+    environment: *const c_void,
+    cur_dir: *const u16,
+    startup_info: *const c_void,
+    process_information: *mut u8,
+) -> i32 {
+    CreateProcessW(
+        application_name,
+        command_line,
+        proc_attrs,
+        thread_attrs,
+        inherit,
+        flags,
+        environment,
+        cur_dir,
+        startup_info,
+        process_information,
+    )
+}
+
+/// `InitializeProcThreadAttributeList(list, count, flags, lpSize)` — cmd builds
+/// a `STARTUPINFOEX` attribute list (handle inheritance) before launching a
+/// child. We don't model attribute lists, but the call must follow the
+/// documented two-step protocol or cmd aborts the launch: a NULL list is a
+/// size query (set `*lpSize`, fail with ERROR_INSUFFICIENT_BUFFER); a non-NULL
+/// list succeeds.
+#[no_mangle]
+pub unsafe extern "C" fn InitializeProcThreadAttributeList(
+    list: *mut c_void,
+    _count: u32,
+    _flags: u32,
+    size: *mut usize,
+) -> i32 {
+    if list.is_null() {
+        if !size.is_null() {
+            *size = 48; // any nonzero buffer size the caller will allocate
+        }
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    1
+}
+
+/// `UpdateProcThreadAttribute(...)` — record an attribute. We ignore them all
+/// (no handle-inheritance model); report success so cmd proceeds to launch.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn UpdateProcThreadAttribute(
+    _list: *mut c_void,
+    _flags: u32,
+    _attribute: usize,
+    _value: *mut c_void,
+    _size: usize,
+    _prev: *mut c_void,
+    _ret_size: *mut usize,
+) -> i32 {
+    1
+}
+
+/// `DeleteProcThreadAttributeList(list)` — nothing was allocated; no-op.
+#[no_mangle]
+pub extern "C" fn DeleteProcThreadAttributeList(_list: *mut c_void) {}
 
 /// `GetExitCodeProcess(hProcess, lpExitCode)` — the process's exit code.
 #[no_mangle]

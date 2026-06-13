@@ -83,9 +83,52 @@ fn path_eq(a: &str, b: &str) -> bool {
     })
 }
 
-/// Look up a file's bytes by path.
+/// Collapse a path to its meaningful segments — dropping empty and `.`
+/// (current-directory) segments — joined by `\`, into `out`; returns the byte
+/// length written. cmd builds paths like `C:\.\where.exe`, so the `.` must be
+/// normalized away before any comparison.
+fn normalize_path(s: &str, out: &mut [u8]) -> usize {
+    let mut n = 0;
+    for seg in s.split(|c| c == '\\' || c == '/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if n > 0 && n < out.len() {
+            out[n] = b'\\';
+            n += 1;
+        }
+        for &c in seg.as_bytes() {
+            if n < out.len() {
+                out[n] = c;
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Compare two paths for equality after normalizing `.` segments and separator
+/// style, case-insensitively.
+fn path_eq_norm(a: &str, b: &str) -> bool {
+    let mut ba = [0u8; 280];
+    let mut bb = [0u8; 280];
+    let na = normalize_path(a, &mut ba);
+    let nb = normalize_path(b, &mut bb);
+    match (
+        core::str::from_utf8(&ba[..na]),
+        core::str::from_utf8(&bb[..nb]),
+    ) {
+        (Ok(sa), Ok(sb)) => path_eq(sa, sb),
+        _ => false,
+    }
+}
+
+/// Look up a file's bytes by path (tolerating `.` segments and separator style).
 pub fn lookup(path: &str) -> Option<&'static [u8]> {
-    FILES.iter().find(|f| path_eq(f.path, path)).map(|f| f.data)
+    FILES
+        .iter()
+        .find(|f| path_eq_norm(f.path, path))
+        .map(|f| f.data)
 }
 
 /// `GetFileAttributesW` backend: Win32 file attributes for `path`, or
@@ -164,12 +207,11 @@ fn split_path(p: &str) -> (&str, &str) {
 }
 
 /// Case-insensitive directory comparison (`/`≡`\`) tolerating a missing
-/// trailing separator on either side, so `C:\` and `C:` compare equal.
+/// trailing separator on either side and `.` (current-directory) segments, so
+/// `C:\`, `C:`, and `C:\.\` all compare equal. cmd builds current-directory
+/// search patterns like `C:\.\sort.*`, so the `.` must be normalized away.
 fn dir_eq(a: &str, b: &str) -> bool {
-    fn trim(s: &str) -> &str {
-        s.trim_end_matches(|c| c == '\\' || c == '/')
-    }
-    path_eq(trim(a), trim(b))
+    path_eq_norm(a, b)
 }
 
 /// Case-insensitive ASCII byte equality.
