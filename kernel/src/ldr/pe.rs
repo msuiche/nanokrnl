@@ -471,9 +471,25 @@ fn setup_user_blocks(s: SetupBlocks) -> Result<(), NtStatus> {
             }
         }
 
-        // ---- Environment block (double-NUL-terminated UTF-16) ----
-        let e_n = wbuf(ENV_OFF, b"PATH=C:\\");
-        *(b.add(ENV_OFF + (e_n + 1) * 2) as *mut u16) = 0; // block terminator
+        // ---- Environment block (NUL-separated UTF-16, double-NUL at end) ----
+        // Mirror the kernel32 shim's defaults so a binary that reads the block
+        // from the PEB (rather than via GetEnvironmentStrings) sees the same
+        // variables — notably PATHEXT, which `where` needs to resolve a bare
+        // command name to its `.exe`.
+        let env_vars: &[&[u8]] = &[
+            b"COMSPEC=C:\\cmd.exe",
+            b"OS=nanokrnl",
+            b"PATH=C:\\",
+            b"PATHEXT=.EXE;.BAT;.CMD",
+            b"PROMPT=$P$G",
+            b"SystemRoot=C:\\fxcknmc",
+        ];
+        let mut eo = ENV_OFF;
+        for v in env_vars {
+            let n = wbuf(eo, v);
+            eo += (n + 1) * 2;
+        }
+        *(b.add(eo) as *mut u16) = 0; // block terminator (extra NUL)
     }
     Ok(())
 }
