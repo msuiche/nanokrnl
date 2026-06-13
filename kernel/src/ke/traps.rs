@@ -260,11 +260,15 @@ extern "C" fn ki_dispatch_trap(frame: &mut KtrapFrame) {
             // signals, so the launcher wakes. Kernel-mode faults stay fatal.
             if frame.cs & 3 == 3 {
                 kd_println!(
-                    "!! user fault vec={} err={:#X} rip={:#018X} rsp={:#018X} -> terminating thread",
+                    "!! user fault vec={} err={:#X} rip={:#018X} rsp={:#018X} rcx={:#x} rdx={:#x} r8={:#x} r9={:#x} -> terminating thread",
                     v,
                     frame.error_code,
                     frame.rip,
-                    frame.rsp
+                    frame.rsp,
+                    frame.rcx,
+                    frame.rdx,
+                    frame.r8,
+                    frame.r9
                 );
                 unsafe { crate::ke::scheduler::ki_terminate_current_thread() };
             }

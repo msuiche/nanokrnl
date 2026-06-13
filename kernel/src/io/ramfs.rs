@@ -133,10 +133,12 @@ pub struct DirEntry {
 /// which is how the caller detects `ERROR_NO_MORE_FILES`.
 pub fn find(pattern: &str, index: usize) -> Option<DirEntry> {
     let (pat_dir, pat_name) = split_path(pattern);
-    // A bare directory pattern ("C:\", which has an empty name part) means
-    // "everything in that directory" — cmd's `dir` enumerates a directory path
-    // directly rather than appending `*`.
-    let pat_name = if pat_name.is_empty() { "*" } else { pat_name };
+    // A bare directory pattern ("C:\", empty name part) matches nothing, like a
+    // real FindFirstFile on a root — callers (e.g. cmd's `dir`) then retry with
+    // an explicit "C:\*".
+    if pat_name.is_empty() {
+        return None;
+    }
     let mut n = 0;
     for f in FILES {
         let (dir, name) = split_path(f.path);

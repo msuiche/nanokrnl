@@ -1733,6 +1733,26 @@ pub unsafe extern "C" fn FormatMessageW(
     const FROM_SYSTEM: u32 = 0x1000;
     const IGNORE_INSERTS: u32 = 0x0200;
     const ARGUMENT_ARRAY: u32 = 0x2000;
+    const ALLOCATE_BUFFER: u32 = 0x0100;
+
+    // FORMAT_MESSAGE_ALLOCATE_BUFFER: lpBuffer is an LPWSTR* that receives a
+    // freshly allocated buffer (freed by the caller via LocalFree/GlobalFree);
+    // nSize is a minimum size. Writing the message *into* lpBuffer instead would
+    // leave the caller's pointer holding string bytes — which faults when it's
+    // later dereferenced (cmd's `dir` header path does exactly this). Redirect
+    // to a process-heap buffer and store its address back at the end.
+    let alloc_mode = flags & ALLOCATE_BUFFER != 0;
+    let out_param = buffer as *mut *mut u16;
+    let (buffer, size) = if alloc_mode {
+        let chars = (size as usize).max(1024);
+        let p = HeapAlloc(1, 0, (chars * 2) as u64) as *mut u16;
+        if p.is_null() {
+            return 0;
+        }
+        (p, chars as u32)
+    } else {
+        (buffer, size)
+    };
 
     // Load the raw message template from the module's RT_MESSAGETABLE (.mui).
     let mut tmpl = [0u16; 512];
@@ -1760,6 +1780,9 @@ pub unsafe extern "C" fn FormatMessageW(
             *buffer.add(i) = msg[i];
         }
         *buffer.add(n) = 0;
+        if alloc_mode {
+            *out_param = buffer;
+        }
         return n as u32;
     }
 
@@ -1843,6 +1866,9 @@ pub unsafe extern "C" fn FormatMessageW(
     }
     let term = di.min(cap);
     *buffer.add(term) = 0;
+    if alloc_mode {
+        *out_param = buffer;
+    }
     term as u32
 }
 
@@ -2637,6 +2663,77 @@ pub unsafe extern "C" fn GetFileAttributesExW(
     core::ptr::write_bytes(out, 0, 36);
     *(out as *mut u32) = attrs;
     1
+}
+
+/// `GetVolumeInformationW(...)` — describe the volume. cmd's `dir` prints a
+/// header from this; a failing stub made dir abort with "Unknown error". We
+/// report an unlabeled NTFS volume with a fixed serial. Returns TRUE.
+#[no_mangle]
+pub unsafe extern "C" fn GetVolumeInformationW(
+    _root: *const u16,
+    vol_name: *mut u16,
+    vol_name_size: u32,
+    serial: *mut u32,
+    max_comp: *mut u32,
+    fs_flags: *mut u32,
+    fs_name: *mut u16,
+    fs_name_size: u32,
+) -> i32 {
+    if !vol_name.is_null() && vol_name_size > 0 {
+        let label: &[u8] = b"NANOKRNL";
+        let cnt = label.len().min((vol_name_size - 1) as usize);
+        for i in 0..cnt {
+            *vol_name.add(i) = label[i] as u16;
+        }
+        *vol_name.add(cnt) = 0;
+    }
+    if !serial.is_null() {
+        *serial = 0x00C0_FFEE;
+    }
+    if !max_comp.is_null() {
+        *max_comp = 255;
+    }
+    if !fs_flags.is_null() {
+        *fs_flags = 0;
+    }
+    if !fs_name.is_null() && fs_name_size > 0 {
+        let n: &[u8] = b"NTFS";
+        let cnt = n.len().min((fs_name_size - 1) as usize);
+        for i in 0..cnt {
+            *fs_name.add(i) = n[i] as u16;
+        }
+        *fs_name.add(cnt) = 0;
+    }
+    1
+}
+
+/// `GetDiskFreeSpaceExW(...)` — report free/total bytes for `dir`'s footer.
+/// Fixed plausible values for the RAM disk. Returns TRUE.
+#[no_mangle]
+pub unsafe extern "C" fn GetDiskFreeSpaceExW(
+    _dir: *const u16,
+    free_avail: *mut u64,
+    total: *mut u64,
+    total_free: *mut u64,
+) -> i32 {
+    const TOTAL: u64 = 256 * 1024 * 1024;
+    const FREE: u64 = 64 * 1024 * 1024;
+    if !free_avail.is_null() {
+        *free_avail = FREE;
+    }
+    if !total.is_null() {
+        *total = TOTAL;
+    }
+    if !total_free.is_null() {
+        *total_free = FREE;
+    }
+    1
+}
+
+/// `GetDriveTypeW(lpRootPathName)` — our single drive is a fixed disk.
+#[no_mangle]
+pub extern "C" fn GetDriveTypeW(_root: *const u16) -> u32 {
+    3 // DRIVE_FIXED
 }
 
 /// `NeedCurrentDirectoryForExePathW(ExeName)` — whether the current directory
