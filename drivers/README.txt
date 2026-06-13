@@ -1,7 +1,7 @@
 Staging area for unmodified Microsoft kernel drivers (.sys).
 
 Drop a real driver here to have the kernel load it at boot against our
-ntoskrnl.exe export table, the same way sortexe/ holds real user binaries.
+ntoskrnl.exe export table, the same way winbin/ holds real user binaries.
 
   null.sys   The Windows NULL device driver. Copy it from a Windows machine:
                C:\Windows\System32\drivers\null.sys

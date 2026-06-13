@@ -83,14 +83,22 @@ unsafe extern "win64" fn k_ex_free_pool_with_tag(p: *mut u8, tag: u32) {
     pool::pool_free(p, tag)
 }
 
-/// `IoCreateDevice` (simplified): create a device named `device_name` owned
-/// by `driver`, with `ext_size` bytes of zeroed device extension. Writes
-/// the new device pointer to `*out_device`. Enough for a driver to stand up
-/// a device in its DriverEntry.
+/// `IoCreateDevice(DriverObject, DeviceExtensionSize, DeviceName, DeviceType,
+/// DeviceCharacteristics, Exclusive, DeviceObject)` — the real NT prototype.
+/// Create a device named `device_name` owned by `driver`, with `ext_size`
+/// bytes of zeroed device extension, writing the new device to `*out_device`.
+/// We don't model device types, characteristics, or exclusivity, so those
+/// arguments are accepted and ignored — but the shim must take all seven so
+/// an unmodified driver (e.g. null.sys) finds `out_device` in the 7th slot,
+/// not where a 4-argument prototype would put it.
+#[allow(clippy::too_many_arguments)]
 unsafe extern "win64" fn k_io_create_device(
     driver: *mut DriverObject,
     ext_size: usize,
     device_name: *mut UnicodeString,
+    _device_type: u32,
+    _device_characteristics: u32,
+    _exclusive: u8,
     out_device: *mut *mut DeviceObject,
 ) -> Ntstatus {
     unsafe {
@@ -489,6 +497,16 @@ unsafe extern "win64" fn k_mm_map_io_space(
 /// mappings (nothing was allocated to release).
 unsafe extern "win64" fn k_mm_unmap_io_space(_base: *mut core::ffi::c_void, _bytes: usize) {}
 
+/// `MmPageEntireDriver(AddressWithinSection)` — a driver calls this to mark its
+/// whole image pageable (an optimization for rarely-used drivers; null.sys
+/// does it from DriverEntry). We never page kernel memory, so this is a no-op
+/// that returns the section base it was given.
+unsafe extern "win64" fn k_mm_page_entire_driver(
+    address_within_section: *mut core::ffi::c_void,
+) -> *mut core::ffi::c_void {
+    address_within_section
+}
+
 // ---------------------------------------------------------------------------
 // The export table
 // ---------------------------------------------------------------------------
@@ -525,8 +543,12 @@ kernel_exports! {
     "ExFreePoolWithTag"
         => k_ex_free_pool_with_tag as unsafe extern "win64" fn(*mut u8, u32),
     "IoCreateDevice" => k_io_create_device
-        as unsafe extern "win64" fn(*mut DriverObject, usize, *mut UnicodeString, *mut *mut DeviceObject) -> Ntstatus,
+        as unsafe extern "win64" fn(*mut DriverObject, usize, *mut UnicodeString, u32, u32, u8, *mut *mut DeviceObject) -> Ntstatus,
     "IoCompleteRequest"
+        => k_io_complete_request as unsafe extern "win64" fn(*mut Irp, i8),
+    // The __fastcall variant real drivers actually import (e.g. null.sys); same
+    // ABI as our other exports on x64, same behavior.
+    "IofCompleteRequest"
         => k_io_complete_request as unsafe extern "win64" fn(*mut Irp, i8),
     "RtlInitUnicodeString"
         => k_rtl_init_unicode_string as unsafe extern "win64" fn(*mut UnicodeString, *const u16),
@@ -611,6 +633,8 @@ kernel_exports! {
     // --- Tier 4: Mm mapping ---
     "MmGetPhysicalAddress"
         => k_mm_get_physical_address as unsafe extern "win64" fn(*mut core::ffi::c_void) -> u64,
+    "MmPageEntireDriver" => k_mm_page_entire_driver
+        as unsafe extern "win64" fn(*mut core::ffi::c_void) -> *mut core::ffi::c_void,
     "MmMapIoSpace" => k_mm_map_io_space
         as unsafe extern "win64" fn(u64, usize, u32) -> *mut core::ffi::c_void,
     "MmUnmapIoSpace"

@@ -41,6 +41,9 @@ extern "win64" {
         driver: *mut DriverObject,
         ext_size: usize,
         device_name: *mut UnicodeString,
+        device_type: u32,
+        device_characteristics: u32,
+        exclusive: u8,
         out_device: *mut *mut DeviceObject,
     ) -> Ntstatus;
     fn IoCreateSymbolicLink(link: *mut UnicodeString, target: *mut UnicodeString) -> Ntstatus;
@@ -247,7 +250,8 @@ pub unsafe extern "win64" fn DriverEntry(
     // Named device + symbolic link.
     let mut device: *mut DeviceObject = core::ptr::null_mut();
     let mut dev_name = make_unicode(&DEVICE_NAME_UNITS);
-    let status = IoCreateDevice(driver, 0, &mut dev_name, &mut device);
+    // FILE_DEVICE_UNKNOWN, no characteristics, non-exclusive.
+    let status = IoCreateDevice(driver, 0, &mut dev_name, 0x22, 0, 0, &mut device);
     if !status.is_success() {
         print("RustDemo: IoCreateDevice FAILED\n");
         return status;

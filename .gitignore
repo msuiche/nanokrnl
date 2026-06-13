@@ -28,8 +28,10 @@ msvcrt/msvcrt.lib
 
 # Large third-party Microsoft binaries used for the real-binary experiments
 # (kept locally; the build falls back to empty placeholders when absent).
-sortexe/*.exe
-sortexe/*.mui
+winbin/*.exe
+winbin/*.mui
+winbin/*.com
+drivers/*.sys
 
 # Generated import libs / DLLs anywhere (rebuilt from source by scripts/)
 *.dll

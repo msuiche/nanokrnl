@@ -257,7 +257,7 @@ binary on the host. macOS `/usr/bin/objdump` reads PE/COFF directly; image VMA =
 preferred base (`0x140000000`) + RVA:
 
 ```sh
-objdump -d --x86-asm-syntax=intel sortexe/where.exe > /tmp/where.asm
+objdump -d --x86-asm-syntax=intel winbin/where.exe > /tmp/where.asm
 awk '/^140004f5/' /tmp/where.asm          # disassemble around RVA 0x4f50
 ```
 

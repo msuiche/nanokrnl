@@ -52,6 +52,7 @@ const IMAGE_NT_OPTIONAL_HDR64_MAGIC: u16 = 0x20B;
 const DIR_IMPORT: usize = 1;
 const DIR_BASERELOC: usize = 5;
 const DIR_TLS: usize = 9;
+const DIR_LOAD_CONFIG: usize = 10;
 const IMAGE_REL_BASED_ABSOLUTE: u16 = 0;
 const IMAGE_REL_BASED_DIR64: u16 = 10;
 const IMAGE_ORDINAL_FLAG64: u64 = 1 << 63;
@@ -90,6 +91,10 @@ pub fn load(data: &[u8]) -> Result<LoadedImage, NtStatus> {
     }
     // Pool is mapped NX by the bootloader; make the code executable.
     unsafe { crate::mm::virt::mm_set_executable(m.base as u64, m.size) };
+    // Seed the /GS security cookie, as the Windows loader does before calling
+    // DriverEntry (a real driver's GsDriverEntry __fastfail()s if the cookie is
+    // still the on-disk default).
+    unsafe { seed_security_cookie(m.base, m.size) };
     let entry_va = m.base as u64 + m.entry_rva as u64;
     Ok(LoadedImage {
         base: m.base,
@@ -98,6 +103,63 @@ pub fn load(data: &[u8]) -> Result<LoadedImage, NtStatus> {
         entry: unsafe { core::mem::transmute::<u64, DriverInitialize>(entry_va) },
         entry_va,
     })
+}
+
+/// Seed a mapped+relocated driver image's `/GS` security cookie, mirroring what
+/// the Windows loader (`MmLoadSystemImage`) does before invoking DriverEntry.
+/// The compiler's `GsDriverEntry` only *validates* `__security_cookie` (it
+/// `__fastfail`s if the value is still 0 or the on-disk default); the OS is
+/// responsible for replacing the default with a per-load value. We locate the
+/// cookie through the Load Config data directory's `SecurityCookie` field
+/// (offset 0x58 in `IMAGE_LOAD_CONFIG_DIRECTORY64`, already relocated to this
+/// image's base) and write a value that is neither 0 nor the default.
+///
+/// # Safety
+/// `base` must point at a fully mapped, relocated image of `size` bytes.
+unsafe fn seed_security_cookie(base: *mut u8, size: usize) {
+    /// The default `__security_cookie` MSVC bakes into x64 images.
+    const DEFAULT_COOKIE: u64 = 0x0000_2B99_2DDF_A232;
+    let hdr = unsafe { core::slice::from_raw_parts(base, size.min(0x1000)) };
+    let Some(e_lfanew) = u32le(hdr, 0x3C) else {
+        return;
+    };
+    let opt = e_lfanew as usize + 4 + 20;
+    let Some(num_dirs) = u32le(hdr, opt + 108) else {
+        return;
+    };
+    if DIR_LOAD_CONFIG >= num_dirs as usize {
+        return;
+    }
+    let lc_rva = u32le(hdr, opt + 112 + DIR_LOAD_CONFIG * 8).unwrap_or(0) as usize;
+    let lc_size = u32le(hdr, opt + 112 + DIR_LOAD_CONFIG * 8 + 4).unwrap_or(0) as usize;
+    // Need the SecurityCookie field at load-config offset 0x58.
+    if lc_rva == 0 || lc_size < 0x60 || lc_rva + 0x60 > size {
+        return;
+    }
+    let cookie_va = unsafe { *((base as u64 + lc_rva as u64 + 0x58) as *const u64) };
+    // The cookie must live inside this (kernel-mapped) image; ignore anything
+    // pointing elsewhere rather than scribbling over unrelated memory.
+    let lo = base as u64;
+    let hi = lo + size as u64;
+    if cookie_va < lo || cookie_va + 16 > hi {
+        return;
+    }
+    // A per-load value from the timestamp counter, kept to 48 bits like a real
+    // cookie and forced away from the two values the check rejects.
+    let tsc: u64;
+    unsafe {
+        let (lo32, hi32): (u32, u32);
+        core::arch::asm!("rdtsc", out("eax") lo32, out("edx") hi32, options(nomem, nostack));
+        tsc = ((hi32 as u64) << 32) | lo32 as u64;
+    }
+    let mut cookie = (tsc ^ lo).rotate_left(17) & 0x0000_FFFF_FFFF_FFFF;
+    if cookie == 0 || cookie == DEFAULT_COOKIE {
+        cookie = DEFAULT_COOKIE ^ 0x1357;
+    }
+    unsafe {
+        *(cookie_va as *mut u64) = cookie; // __security_cookie
+        *((cookie_va + 8) as *mut u64) = !cookie; // __security_cookie_complement
+    }
 }
 
 /// Load a PE32+ **user-mode** image (a ring-3 executable): map, relocate,
@@ -480,9 +542,9 @@ fn setup_user_blocks(s: SetupBlocks) -> Result<(), NtStatus> {
             b"COMSPEC=C:\\cmd.exe",
             b"OS=nanokrnl",
             b"PATH=C:\\",
-            b"PATHEXT=.EXE;.BAT;.CMD",
+            b"PATHEXT=.COM;.EXE;.BAT;.CMD",
             b"PROMPT=$P$G",
-            b"SystemRoot=C:\\fxcknmc",
+            b"SystemRoot=C:\\NanoKrnl",
         ];
         let mut eo = ENV_OFF;
         for v in env_vars {

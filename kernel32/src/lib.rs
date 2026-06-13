@@ -2469,9 +2469,9 @@ const ENV_DEFAULTS: &[&str] = &[
     "COMSPEC=C:\\cmd.exe",
     "OS=nanokrnl",
     "PATH=C:\\",
-    "PATHEXT=.EXE;.BAT;.CMD",
+    "PATHEXT=.COM;.EXE;.BAT;.CMD",
     "PROMPT=$P$G",
-    "SystemRoot=C:\\fxcknmc",
+    "SystemRoot=C:\\NanoKrnl",
 ];
 
 unsafe fn ensure_env() {

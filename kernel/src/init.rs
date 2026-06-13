@@ -1540,7 +1540,7 @@ static MSVCRT_IMAGE: &[u8] = include_bytes!(env!("NTOS_MSVCRT_IMAGE"));
 
 /// A real Windows console binary (`sort.exe`), embedded for the experiment of
 /// running an unmodified `.exe` against our kernel32 + msvcrt shims. Empty
-/// when not present (see `sortexe/`).
+/// when not present (see `winbin/`).
 // `pub(crate) const` so the RAM filesystem ([`crate::io::ramfs`]) can expose
 // these same embedded images as files (e.g. `C:\cmd.exe`) without a second
 // `include_bytes!` copy — a `const &[u8]` references the one emitted blob.

@@ -73,37 +73,37 @@ fn main() {
         "NTOS_MSVCRT_IMAGE",
     );
     resolve(
-        workspace.join("sortexe").join("sort.exe"),
+        workspace.join("winbin").join("sort.exe"),
         "no_sort.bin",
         "NTOS_SORT_IMAGE",
     );
     resolve(
-        workspace.join("sortexe").join("choice.exe"),
+        workspace.join("winbin").join("choice.exe"),
         "no_choice.bin",
         "NTOS_CHOICE_IMAGE",
     );
     resolve(
-        workspace.join("sortexe").join("choice.exe.mui"),
+        workspace.join("winbin").join("choice.exe.mui"),
         "no_choice_mui.bin",
         "NTOS_CHOICE_MUI_IMAGE",
     );
     resolve(
-        workspace.join("sortexe").join("where.exe"),
+        workspace.join("winbin").join("where.exe"),
         "no_where.bin",
         "NTOS_WHERE_IMAGE",
     );
     resolve(
-        workspace.join("sortexe").join("where.exe.mui"),
+        workspace.join("winbin").join("where.exe.mui"),
         "no_where_mui.bin",
         "NTOS_WHERE_MUI_IMAGE",
     );
     resolve(
-        workspace.join("sortexe").join("cmd.exe"),
+        workspace.join("winbin").join("cmd.exe"),
         "no_cmd.bin",
         "NTOS_CMD_IMAGE",
     );
     resolve(
-        workspace.join("sortexe").join("cmd.exe.mui"),
+        workspace.join("winbin").join("cmd.exe.mui"),
         "no_cmd_mui.bin",
         "NTOS_CMD_MUI_IMAGE",
     );
