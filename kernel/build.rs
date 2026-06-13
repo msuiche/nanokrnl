@@ -39,6 +39,14 @@ fn main() {
         "no_driver.bin",
         "NTOS_DRIVER_IMAGE",
     );
+    // A real Microsoft kernel driver (the NULL device driver), dropped into
+    // drivers/ by hand — exercises loading an unmodified .sys against our
+    // ntoskrnl export table. Empty (skipped) when not present.
+    resolve(
+        workspace.join("drivers").join("null.sys"),
+        "no_null_sys.bin",
+        "NTOS_NULL_SYS_IMAGE",
+    );
     resolve(
         workspace.join("userapp").join("userapp.exe"),
         "no_userapp.bin",

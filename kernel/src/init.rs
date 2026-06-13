@@ -1070,6 +1070,57 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
         }
     }
 
+    // --- Ldr: load a real Microsoft kernel driver (null.sys) -------------
+    // Unlike testdriver.sys (our own Rust driver), this is an unmodified
+    // Windows binary. It binds its `ntoskrnl.exe` imports to our export table
+    // and registers \Device\Null. Reported (not gated): it depends on a
+    // hand-staged binary and may surface imports we haven't exported yet —
+    // the loader logs any unresolved ones, which is exactly the signal we want.
+    #[cfg(not(feature = "interactive"))]
+    {
+        if NULL_SYS_IMAGE.is_empty() {
+            kd_println!("  [SKIP] Ldr: no null.sys staged (drop one in drivers/)");
+        } else {
+            kd_println!("NULL.SYS: loading real Microsoft null.sys ({} bytes)", NULL_SYS_IMAGE.len());
+            let name = io::AbiUnicodeString::from_units(crate::w!("\\Driver\\Null"));
+            match crate::ldr::ldr_load_driver(NULL_SYS_IMAGE, name) {
+                Ok(loaded) => {
+                    let device = unsafe { (*loaded.driver).device_object };
+                    kd_println!(
+                        "NULL.SYS: DriverEntry ran; device_object={:p}",
+                        device
+                    );
+                    // \Device\Null should now resolve; a write consumes all
+                    // bytes and a read returns end-of-file (0 bytes).
+                    let by_name = unsafe {
+                        io::namespace::lookup_device(&io::AbiUnicodeString::from_units(crate::w!(
+                            "\\Device\\Null"
+                        )))
+                    };
+                    if let Ok(dev) = by_name {
+                        let src = [0u8; 4];
+                        let w = unsafe {
+                            io::io_synchronous_request(dev, io::IRP_MJ_WRITE, src.as_ptr() as *mut u8, src.len())
+                        };
+                        let mut dst = [0xFFu8; 4];
+                        let r = unsafe {
+                            io::io_synchronous_request(dev, io::IRP_MJ_READ, dst.as_mut_ptr(), dst.len())
+                        };
+                        kd_println!(
+                            "NULL.SYS: \\Device\\Null write={:?} read={:?}",
+                            w.map(|s| s.information),
+                            r.map(|s| s.information)
+                        );
+                    } else {
+                        kd_println!("NULL.SYS: \\Device\\Null did not resolve");
+                    }
+                    unsafe { crate::ldr::ldr_unload_driver(&loaded) };
+                }
+                Err(e) => kd_println!("NULL.SYS: load/DriverEntry failed: {:?}", e),
+            }
+        }
+    }
+
     // --- User mode: load and run a real PE console application -----------
     // The capstone: take a PE executable compiled for Windows, map it into
     // ring-3 pages with the user-mode loader, run it as a user thread, and
@@ -1472,6 +1523,11 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
 /// The embedded PE test driver, located by `build.rs`. Empty when no driver
 /// has been built (see `scripts/build-driver.sh`); the load test skips then.
 static DRIVER_IMAGE: &[u8] = include_bytes!(env!("NTOS_DRIVER_IMAGE"));
+
+/// A real Microsoft kernel driver (`null.sys`), staged by hand in `drivers/`.
+/// Empty when not present; the load test reports "skipped" then. Used to
+/// exercise loading an unmodified `.sys` against our `ntoskrnl.exe` exports.
+static NULL_SYS_IMAGE: &[u8] = include_bytes!(env!("NTOS_NULL_SYS_IMAGE"));
 
 /// The embedded ring-3 console app, located by `build.rs`. Empty when not
 /// built (see `scripts/build-userapp.sh`); the run test skips then.
