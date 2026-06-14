@@ -312,10 +312,32 @@ unsafe extern "win64" fn k_rtl_copy_memory(dst: *mut u8, src: *const u8, len: us
     unsafe { core::ptr::copy_nonoverlapping(src, dst, len) };
 }
 
-/// `IoDeleteDevice` — drop the device object's reference (it was created by
-/// the object manager via IoCreateDevice).
+/// `IoDeleteDevice` — unlink the device from its driver's device list and drop
+/// the reference created by `IoCreateDevice`. The unlink matters: a driver's
+/// unload routine commonly loops `while (DriverObject->DeviceObject != NULL)
+/// IoDeleteDevice(DriverObject->DeviceObject);`, so if we freed the object
+/// without removing it from the list the loop would delete it forever (this is
+/// exactly what real null.sys does). NT's `IoDeleteDevice` performs the unlink.
 unsafe extern "win64" fn k_io_delete_device(device: *mut DeviceObject) {
-    unsafe { crate::ob::ob_dereference_object(device as *mut u8) };
+    unsafe {
+        let driver = (*device).driver;
+        if !driver.is_null() {
+            let next = (*device).next_device;
+            if core::ptr::eq((*driver).device_object, device) {
+                (*driver).device_object = next;
+            } else {
+                let mut cur = (*driver).device_object;
+                while !cur.is_null() {
+                    if core::ptr::eq((*cur).next_device, device) {
+                        (*cur).next_device = next;
+                        break;
+                    }
+                    cur = (*cur).next_device;
+                }
+            }
+        }
+        crate::ob::ob_dereference_object(device as *mut u8);
+    }
 }
 
 // ---------------------------------------------------------------------------

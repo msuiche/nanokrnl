@@ -140,27 +140,143 @@ pub type DriverUnload = unsafe extern "win64" fn(driver: *mut DriverObject);
 #[cfg(not(target_arch = "x86_64"))]
 pub type DriverUnload = unsafe extern "C" fn(driver: *mut DriverObject);
 
-/// `DRIVER_OBJECT` — one per loaded driver. The driver fills
-/// `major_function[]` in its `DriverEntry`, exactly as real WDM code does
-/// (`DriverObject->MajorFunction[IRP_MJ_CREATE] = MyDispatch;`). `Option<fn>`
-/// is null-pointer-optimized, so the slot is ABI-identical to a raw
-/// `PDRIVER_DISPATCH`.
+/// `DRIVER_OBJECT` — one per loaded driver, laid out to match the documented
+/// NT x64 `DRIVER_OBJECT` so an unmodified Windows driver finds every field
+/// where it expects it (notably `MajorFunction[]` at 0x70, `DriverUnload` at
+/// 0x68). The driver fills `major_function[]` in its `DriverEntry` exactly as
+/// real WDM code does. `Option<fn>` is null-pointer-optimized, so each slot is
+/// ABI-identical to a raw `PDRIVER_DISPATCH`. Fields we don't model
+/// (`DriverStart`, `FastIoDispatch`, …) are present for layout only.
 #[repr(C)]
 pub struct DriverObject {
-    pub driver_name: UnicodeString,
-    pub major_function: [Option<DriverDispatch>; IRP_MJ_MAXIMUM_FUNCTION],
-    pub device_object: *mut DeviceObject,
-    /// Optional unload routine (`DriverObject->DriverUnload = MyUnload;`).
-    pub driver_unload: Option<DriverUnload>,
+    pub type_: i16,                       // 0x00 Type (IO_TYPE_DRIVER = 4)
+    pub size: i16,                        // 0x02 Size
+    _reserved_04: u32,                    // 0x04 (alignment)
+    pub device_object: *mut DeviceObject, // 0x08 DeviceObject
+    pub flags: u32,                       // 0x10 Flags
+    _reserved_14: u32,                    // 0x14
+    pub driver_start: *mut core::ffi::c_void, // 0x18 DriverStart
+    pub driver_size: u32,                 // 0x20 DriverSize
+    _reserved_24: u32,                    // 0x24
+    pub driver_section: *mut core::ffi::c_void, // 0x28 DriverSection
+    pub driver_extension: *mut core::ffi::c_void, // 0x30 DriverExtension
+    pub driver_name: UnicodeString,       // 0x38 DriverName (16 bytes)
+    pub hardware_database: *mut core::ffi::c_void, // 0x48 HardwareDatabase
+    pub fast_io_dispatch: *mut core::ffi::c_void,  // 0x50 FastIoDispatch
+    pub driver_init: *mut core::ffi::c_void,       // 0x58 DriverInit
+    pub driver_start_io: *mut core::ffi::c_void,   // 0x60 DriverStartIo
+    pub driver_unload: Option<DriverUnload>,       // 0x68 DriverUnload
+    pub major_function: [Option<DriverDispatch>; IRP_MJ_MAXIMUM_FUNCTION], // 0x70
 }
 
-/// `DEVICE_OBJECT` — the target of IRPs.
+// Lock the NT x64 offsets at compile time.
+const _: () = {
+    use core::mem::offset_of;
+    assert!(offset_of!(DriverObject, device_object) == 0x08);
+    assert!(offset_of!(DriverObject, flags) == 0x10);
+    assert!(offset_of!(DriverObject, driver_name) == 0x38);
+    assert!(offset_of!(DriverObject, driver_unload) == 0x68);
+    assert!(offset_of!(DriverObject, major_function) == 0x70);
+    assert!(core::mem::size_of::<DriverObject>() == 0x150);
+};
+
+/// `DEVICE_OBJECT` — the target of IRPs, laid out to match the documented NT
+/// x64 `DEVICE_OBJECT`. A driver reads/writes `Flags` (0x30), `DeviceExtension`
+/// (0x40), `StackSize` (0x4C) and `AlignmentRequirement` (0x78) directly; those
+/// must be at the NT offsets. The unmodeled tail (device queue, DPC, security
+/// descriptor, the kernel's private `DeviceObjectExtension`) is reserved space
+/// so the object is the right total size. A device's *name* is not a field in
+/// NT — it lives in the object namespace — so it is not stored here.
 #[repr(C)]
 pub struct DeviceObject {
-    pub name: UnicodeString,
-    pub driver: *mut DriverObject,
+    pub type_: i16,                          // 0x00 Type (IO_TYPE_DEVICE = 3)
+    pub size: u16,                           // 0x02 Size
+    pub reference_count: i32,                // 0x04 ReferenceCount
+    pub driver: *mut DriverObject,           // 0x08 DriverObject
+    pub next_device: *mut DeviceObject,      // 0x10 NextDevice
+    pub attached_device: *mut DeviceObject,  // 0x18 AttachedDevice
+    pub current_irp: *mut Irp,               // 0x20 CurrentIrp
+    pub timer: *mut core::ffi::c_void,       // 0x28 Timer
+    pub flags: u32,                          // 0x30 Flags
+    pub characteristics: u32,                // 0x34 Characteristics
+    pub vpb: *mut core::ffi::c_void,         // 0x38 Vpb
     /// `DeviceExtension` — driver-private per-device state.
-    pub device_extension: *mut u8,
+    pub device_extension: *mut u8,           // 0x40 DeviceExtension
+    pub device_type: u32,                    // 0x48 DeviceType
+    pub stack_size: i8,                      // 0x4C StackSize
+    _reserved_4d: [u8; 3],                   // 0x4D
+    _queue: [u8; 0x28],                      // 0x50 Queue union (WAIT_CONTEXT_BLOCK)
+    pub alignment_requirement: u32,          // 0x78 AlignmentRequirement
+    _reserved_7c: u32,                       // 0x7C
+    // 0x80.. KDEVICE_QUEUE, KDPC, ActiveThreadCount, SecurityDescriptor,
+    // DeviceLock (KEVENT), SectorSize, Spare1, DeviceObjectExtension, Reserved.
+    _tail: [u8; 0x150 - 0x80],               // reserved to the full NT size
+}
+
+const _: () = {
+    use core::mem::offset_of;
+    assert!(offset_of!(DeviceObject, driver) == 0x08);
+    assert!(offset_of!(DeviceObject, flags) == 0x30);
+    assert!(offset_of!(DeviceObject, device_extension) == 0x40);
+    assert!(offset_of!(DeviceObject, device_type) == 0x48);
+    assert!(offset_of!(DeviceObject, stack_size) == 0x4C);
+    assert!(offset_of!(DeviceObject, alignment_requirement) == 0x78);
+    assert!(core::mem::size_of::<DeviceObject>() == 0x150);
+};
+
+impl DriverObject {
+    /// A zeroed driver object with `Type`/`Size` set, ready for the loader to
+    /// fill `DriverInit`/`DriverName` and the driver to fill `MajorFunction[]`.
+    pub const fn new(driver_name: UnicodeString) -> Self {
+        DriverObject {
+            type_: 4, // IO_TYPE_DRIVER
+            size: core::mem::size_of::<DriverObject>() as i16,
+            _reserved_04: 0,
+            device_object: core::ptr::null_mut(),
+            flags: 0,
+            _reserved_14: 0,
+            driver_start: core::ptr::null_mut(),
+            driver_size: 0,
+            _reserved_24: 0,
+            driver_section: core::ptr::null_mut(),
+            driver_extension: core::ptr::null_mut(),
+            driver_name,
+            hardware_database: core::ptr::null_mut(),
+            fast_io_dispatch: core::ptr::null_mut(),
+            driver_init: core::ptr::null_mut(),
+            driver_start_io: core::ptr::null_mut(),
+            driver_unload: None,
+            major_function: [None; IRP_MJ_MAXIMUM_FUNCTION],
+        }
+    }
+}
+
+impl DeviceObject {
+    /// A zeroed device object with `Type`/`Size` set and the given driver +
+    /// extension. `StackSize` defaults to 1 (a single-layer device).
+    pub const fn new(driver: *mut DriverObject, device_extension: *mut u8) -> Self {
+        DeviceObject {
+            type_: 3, // IO_TYPE_DEVICE
+            size: core::mem::size_of::<DeviceObject>() as u16,
+            reference_count: 0,
+            driver,
+            next_device: core::ptr::null_mut(),
+            attached_device: core::ptr::null_mut(),
+            current_irp: core::ptr::null_mut(),
+            timer: core::ptr::null_mut(),
+            flags: 0,
+            characteristics: 0,
+            vpb: core::ptr::null_mut(),
+            device_extension,
+            device_type: 0,
+            stack_size: 1,
+            _reserved_4d: [0; 3],
+            _queue: [0; 0x28],
+            alignment_requirement: 0,
+            _reserved_7c: 0,
+            _tail: [0; 0x150 - 0x80],
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

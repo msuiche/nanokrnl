@@ -67,15 +67,7 @@ pub fn io_create_driver(
     name: AbiUnicodeString,
     init: DriverInitialize,
 ) -> Result<*mut DriverObject, NtStatus> {
-    let driver = ob::ob_create_object(
-        &DRIVER_TYPE,
-        DriverObject {
-            driver_name: name,
-            major_function: [None; IRP_MJ_MAXIMUM_FUNCTION],
-            device_object: core::ptr::null_mut(),
-            driver_unload: None,
-        },
-    )?;
+    let driver = ob::ob_create_object(&DRIVER_TYPE, DriverObject::new(name))?;
     // SAFETY: fresh, exclusively-owned object; DriverEntry uses win64 ABI.
     let status = unsafe { init(driver, core::ptr::null_mut()) };
     if !status.is_success() {
@@ -91,15 +83,13 @@ pub fn io_create_device(
     name: AbiUnicodeString,
     extension: *mut u8,
 ) -> Result<*mut DeviceObject, NtStatus> {
-    let device = ob::ob_create_object(
-        &DEVICE_TYPE,
-        DeviceObject {
-            name,
-            driver,
-            device_extension: extension,
-        },
-    )?;
-    unsafe { (*driver).device_object = device };
+    let device = ob::ob_create_object(&DEVICE_TYPE, DeviceObject::new(driver, extension))?;
+    // Link the device at the head of the driver's device list, as NT does:
+    // the new device's NextDevice is the previous head. IoDeleteDevice unlinks.
+    unsafe {
+        (*device).next_device = (*driver).device_object;
+        (*driver).device_object = device;
+    }
     // Register a named device so IoGetDeviceObjectPointer can find it
     // (anonymous devices with an empty name are skipped by the registry).
     namespace::register_device(&name, device);
