@@ -108,6 +108,16 @@ fn main() {
         "NTOS_MORE_IMAGE",
     );
     resolve(
+        workspace.join("winbin").join("whoami.exe"),
+        "no_whoami.bin",
+        "NTOS_WHOAMI_IMAGE",
+    );
+    resolve(
+        workspace.join("winbin").join("whoami.exe.mui"),
+        "no_whoami_mui.bin",
+        "NTOS_WHOAMI_MUI_IMAGE",
+    );
+    resolve(
         workspace.join("winbin").join("cmd.exe.mui"),
         "no_cmd_mui.bin",
         "NTOS_CMD_MUI_IMAGE",

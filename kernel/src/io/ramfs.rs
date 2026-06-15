@@ -45,6 +45,7 @@ pub static FILES: &[RamFile] = &[
     RamFile { path: "C:\\where.exe", data: crate::init::WHERE_IMAGE },
     RamFile { path: "C:\\cmd.exe", data: crate::init::CMD_IMAGE },
     RamFile { path: "C:\\more.com", data: crate::init::MORE_IMAGE },
+    RamFile { path: "C:\\whoami.exe", data: crate::init::WHOAMI_IMAGE },
 ];
 
 /// Object-manager type for RAM files, distinct from `DEVICE_TYPE` so the read

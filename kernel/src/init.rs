@@ -419,6 +419,8 @@ fn mui_for_image(image: &[u8]) -> &'static [u8] {
         WHERE_MUI
     } else if !CMD_IMAGE.is_empty() && n == CMD_IMAGE.len() {
         CMD_MUI
+    } else if !WHOAMI_IMAGE.is_empty() && n == WHOAMI_IMAGE.len() {
+        WHOAMI_MUI
     } else {
         &[]
     }
@@ -1555,6 +1557,10 @@ static CMD_MUI: &[u8] = include_bytes!(env!("NTOS_CMD_MUI_IMAGE"));
 /// `ulib.dll` to actually run; embedded so it can be enumerated and launched
 /// once dependent-DLL loading exists.
 pub(crate) const MORE_IMAGE: &[u8] = include_bytes!(env!("NTOS_MORE_IMAGE"));
+/// `whoami.exe` — prints the current user/token. Needs advapi32/authz token
+/// APIs to actually run; embedded so it enumerates and launches.
+pub(crate) const WHOAMI_IMAGE: &[u8] = include_bytes!(env!("NTOS_WHOAMI_IMAGE"));
+static WHOAMI_MUI: &[u8] = include_bytes!(env!("NTOS_WHOAMI_MUI_IMAGE"));
 
 /// A second, independent console app — proves the loader runs arbitrary
 /// programs. Empty when not built (see `scripts/build-userapp2.sh`).
