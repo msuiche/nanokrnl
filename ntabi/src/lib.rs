@@ -351,14 +351,34 @@ pub struct ReadWriteParams {
     pub byte_offset: u64,
 }
 
-/// Parameters for `IRP_MJ_DEVICE_CONTROL` (the `DeviceIoControl` arm).
+/// Parameters for `IRP_MJ_DEVICE_CONTROL` (the `DeviceIoControl` arm). The NT
+/// union packs each field on an 8-byte boundary (other arms hold pointers), so
+/// `InputBufferLength` is at +0x08, `IoControlCode` at +0x10, `Type3InputBuffer`
+/// at +0x18 — not tightly packed.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DeviceIoControlParams {
-    pub output_buffer_length: u32,
-    pub input_buffer_length: u32,
-    pub io_control_code: u32,
-    pub _type3_input_buffer: *mut core::ffi::c_void,
+    pub output_buffer_length: u32, // +0x00
+    _pad0: u32,                    // +0x04
+    pub input_buffer_length: u32,  // +0x08
+    _pad1: u32,                    // +0x0C
+    pub io_control_code: u32,      // +0x10
+    _pad2: u32,                    // +0x14
+    pub type3_input_buffer: *mut core::ffi::c_void, // +0x18
+}
+
+impl DeviceIoControlParams {
+    pub const fn new(output_buffer_length: u32, input_buffer_length: u32, io_control_code: u32) -> Self {
+        DeviceIoControlParams {
+            output_buffer_length,
+            _pad0: 0,
+            input_buffer_length,
+            _pad1: 0,
+            io_control_code,
+            _pad2: 0,
+            type3_input_buffer: core::ptr::null_mut(),
+        }
+    }
 }
 
 /// `IO_STACK_LOCATION` — per-driver request parameters within an IRP. Real
@@ -370,19 +390,29 @@ pub struct DeviceIoControlParams {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct IoStackLocation {
-    pub major_function: u8,
-    pub minor_function: u8,
-    pub flags: u8,
-    pub control: u8,
-    /// `Parameters` union, widened to its largest arm. Use the
-    /// [`IoStackLocation::read_write`] / [`IoStackLocation::device_io_control`]
-    /// accessors to view it.
-    pub parameters: [u8; 24],
-    pub device_object: *mut DeviceObject,
-    pub file_object: *mut core::ffi::c_void,
-    pub completion_routine: *mut core::ffi::c_void,
-    pub context: *mut core::ffi::c_void,
+    pub major_function: u8, // 0x00
+    pub minor_function: u8, // 0x01
+    pub flags: u8,          // 0x02
+    pub control: u8,        // 0x03
+    _pad04: u32,            // 0x04
+    /// `Parameters` union (NT places it at +0x08), widened to its 32-byte
+    /// span. Use the [`IoStackLocation::read_write`] /
+    /// [`IoStackLocation::device_io_control`] accessors to view it.
+    pub parameters: [u8; 0x20], // 0x08
+    pub device_object: *mut DeviceObject, // 0x28
+    pub file_object: *mut core::ffi::c_void, // 0x30
+    pub completion_routine: *mut core::ffi::c_void, // 0x38
+    pub context: *mut core::ffi::c_void, // 0x40
 }
+
+const _: () = {
+    use core::mem::offset_of;
+    assert!(offset_of!(IoStackLocation, parameters) == 0x08);
+    assert!(offset_of!(IoStackLocation, device_object) == 0x28);
+    assert!(offset_of!(IoStackLocation, completion_routine) == 0x38);
+    assert!(offset_of!(IoStackLocation, context) == 0x40);
+    assert!(core::mem::size_of::<IoStackLocation>() == 0x48);
+};
 
 impl IoStackLocation {
     pub const fn zeroed() -> Self {
@@ -391,7 +421,8 @@ impl IoStackLocation {
             minor_function: 0,
             flags: 0,
             control: 0,
-            parameters: [0; 24],
+            _pad04: 0,
+            parameters: [0; 0x20],
             device_object: core::ptr::null_mut(),
             file_object: core::ptr::null_mut(),
             completion_routine: core::ptr::null_mut(),
@@ -436,30 +467,59 @@ impl IoStackLocation {
 /// a filter + function + bus driver, the common layering depth.
 pub const IRP_MAX_STACK_LOCATIONS: usize = 8;
 
-/// `IRP` — the I/O Request Packet.
-///
-/// Carries an inline array of [`IoStackLocation`]s (real NT allocates them
-/// in a tail; an inline array of fixed depth is the same idea, simpler to
-/// manage). `current_location` indexes the active one; `IoCallDriver`
-/// advances it down the stack, `IoGetCurrentIrpStackLocation` returns it.
-///
-/// `system_buffer`/`buffer_length` hold the METHOD_BUFFERED data (also used
-/// as the IOCTL system buffer). Synchronous completion is signaled through
-/// `completion_event`, an opaque dispatcher-object pointer the kernel sets
-/// up and `IoCompleteRequest` signals; drivers never touch it (real NT IRPs
-/// likewise carry no embedded event).
+/// `IRP` — the I/O Request Packet, laid out to match the documented NT x64
+/// `_IRP` so an unmodified driver finds `IoStatus` (0x30), the system buffer
+/// (`AssociatedIrp.SystemBuffer`, 0x18), `UserBuffer` (0x70) and the current
+/// stack-location pointer (`Tail.Overlay.CurrentStackLocation`, 0xB8) where it
+/// expects them. The per-layer [`IoStackLocation`]s are *not* inline: NT
+/// allocates them in a tail right after the fixed `IRP`, and
+/// `CurrentStackLocation` points into that array. Synchronous completion uses
+/// the NT `UserEvent` field (a `KEVENT*` that `IoCompleteRequest` signals) —
+/// no extra, non-standard field is needed.
 #[repr(C)]
 pub struct Irp {
-    pub io_status: IoStatusBlock,
-    /// METHOD_BUFFERED system buffer (kernel VA) + its length / IOCTL buffer.
-    pub system_buffer: *mut u8,
-    pub buffer_length: usize,
-    /// Index of the current stack location (counts down as the IRP descends).
-    pub current_location: u8,
-    /// Number of valid stack locations.
-    pub stack_count: u8,
-    /// Opaque `*mut DispatcherHeader` signaled on completion, or null.
-    pub completion_event: *mut core::ffi::c_void,
-    /// The per-layer stack locations.
-    pub stack: [IoStackLocation; IRP_MAX_STACK_LOCATIONS],
+    pub type_: i16,                 // 0x00 Type (IO_TYPE_IRP = 6)
+    pub size: u16,                  // 0x02 Size (whole packet, incl. stack tail)
+    _alloc_processor: u32,          // 0x04 AllocationProcessorNumber + Reserved
+    pub mdl_address: *mut core::ffi::c_void, // 0x08 MdlAddress
+    pub flags: u32,                 // 0x10 Flags
+    _pad14: u32,                    // 0x14
+    /// `AssociatedIrp.SystemBuffer` — the METHOD_BUFFERED / IOCTL system buffer.
+    pub system_buffer: *mut u8,     // 0x18
+    _thread_list_entry: [usize; 2], // 0x20 ThreadListEntry (LIST_ENTRY)
+    pub io_status: IoStatusBlock,   // 0x30 IoStatus (Status@0x30, Information@0x38)
+    pub requestor_mode: i8,         // 0x40
+    pub pending_returned: u8,       // 0x41
+    pub stack_count: i8,            // 0x42 StackCount
+    pub current_location: i8,       // 0x43 CurrentLocation (counts down)
+    pub cancel: u8,                 // 0x44
+    pub cancel_irql: u8,            // 0x45
+    pub apc_environment: i8,        // 0x46
+    pub allocation_flags: u8,       // 0x47
+    pub user_iosb: *mut IoStatusBlock, // 0x48
+    /// `UserEvent` — signaled by `IoCompleteRequest`; our synchronous waiters
+    /// point this at a stack `KEVENT`.
+    pub user_event: *mut core::ffi::c_void, // 0x50
+    _overlay: [usize; 2],           // 0x58 Overlay union
+    pub cancel_routine: *mut core::ffi::c_void, // 0x68
+    pub user_buffer: *mut u8,       // 0x70 UserBuffer
+    _driver_context: [usize; 4],    // 0x78 Tail.Overlay.DriverContext[4]
+    pub thread: *mut core::ffi::c_void, // 0x98
+    pub auxiliary_buffer: *mut u8,  // 0xA0
+    _list_entry: [usize; 2],        // 0xA8 Tail.Overlay.ListEntry (LIST_ENTRY)
+    /// `Tail.Overlay.CurrentStackLocation` — points into the stack tail.
+    pub current_stack_location: *mut IoStackLocation, // 0xB8
+    pub original_file_object: *mut core::ffi::c_void,  // 0xC0
+    _reserved_c8: usize,            // 0xC8 (to sizeof(_IRP) = 0xD0)
 }
+
+const _: () = {
+    use core::mem::offset_of;
+    assert!(offset_of!(Irp, mdl_address) == 0x08);
+    assert!(offset_of!(Irp, system_buffer) == 0x18);
+    assert!(offset_of!(Irp, io_status) == 0x30);
+    assert!(offset_of!(Irp, user_event) == 0x50);
+    assert!(offset_of!(Irp, user_buffer) == 0x70);
+    assert!(offset_of!(Irp, current_stack_location) == 0xB8);
+    assert!(core::mem::size_of::<Irp>() == 0xD0);
+};

@@ -101,21 +101,24 @@ pub fn io_create_device(
 /// (`stack_size`), so the initiator fills the top location via
 /// [`io_get_next_stack_location`] and [`io_call_driver`] steps down into it.
 pub fn io_allocate_irp(stack_size: u8) -> Result<*mut Irp, NtStatus> {
-    let n = (stack_size as usize).clamp(1, IRP_MAX_STACK_LOCATIONS) as u8;
-    let irp = pool_alloc_checked(core::mem::size_of::<Irp>(), TAG_IRP)? as *mut Irp;
+    let n = (stack_size as usize).clamp(1, IRP_MAX_STACK_LOCATIONS);
+    // NT lays the stack locations in a tail right after the fixed IRP:
+    // IoSizeOfIrp = sizeof(IRP) + StackSize * sizeof(IO_STACK_LOCATION).
+    let irp_size = core::mem::size_of::<Irp>();
+    let total = irp_size + n * core::mem::size_of::<IoStackLocation>();
+    let irp = pool_alloc_checked(total, TAG_IRP)? as *mut Irp;
     unsafe {
-        irp.write(Irp {
-            io_status: IoStatusBlock {
-                status: Ntstatus(NtStatus::PENDING.0),
-                information: 0,
-            },
-            system_buffer: core::ptr::null_mut(),
-            buffer_length: 0,
-            current_location: n,
-            stack_count: n,
-            completion_event: core::ptr::null_mut(),
-            stack: [IoStackLocation::zeroed(); IRP_MAX_STACK_LOCATIONS],
-        });
+        core::ptr::write_bytes(irp as *mut u8, 0, total);
+        (*irp).type_ = 6; // IO_TYPE_IRP
+        (*irp).size = total as u16;
+        (*irp).io_status.status = Ntstatus(NtStatus::PENDING.0);
+        (*irp).stack_count = n as i8;
+        // CurrentLocation starts one past the top (NT's 1-based convention);
+        // CurrentStackLocation points one beyond the tail array and is stepped
+        // down into it by IoCallDriver.
+        (*irp).current_location = (n + 1) as i8;
+        let stack_base = (irp as *mut u8).add(irp_size) as *mut IoStackLocation;
+        (*irp).current_stack_location = stack_base.add(n);
     }
     Ok(irp)
 }
@@ -130,10 +133,7 @@ pub fn io_free_irp(irp: *mut Irp) {
 /// # Safety
 /// `irp` live; valid only after at least one [`io_call_driver`] step.
 pub unsafe fn io_get_current_stack_location(irp: *mut Irp) -> *mut IoStackLocation {
-    unsafe {
-        let i = (*irp).current_location as usize;
-        &raw mut (*irp).stack[i.min(IRP_MAX_STACK_LOCATIONS - 1)]
-    }
+    unsafe { (*irp).current_stack_location }
 }
 
 /// `IoGetNextIrpStackLocation` — the location set up for the next driver
@@ -142,10 +142,7 @@ pub unsafe fn io_get_current_stack_location(irp: *mut Irp) -> *mut IoStackLocati
 /// # Safety
 /// `irp` live with `current_location >= 1`.
 pub unsafe fn io_get_next_stack_location(irp: *mut Irp) -> *mut IoStackLocation {
-    unsafe {
-        let i = ((*irp).current_location as usize).saturating_sub(1);
-        &raw mut (*irp).stack[i]
-    }
+    unsafe { (*irp).current_stack_location.offset(-1) }
 }
 
 /// `IoCallDriver` — descend one stack location and invoke the target
@@ -157,13 +154,15 @@ pub unsafe fn io_get_next_stack_location(irp: *mut Irp) -> *mut IoStackLocation 
 /// `device` and `irp` must be live; the next stack location must be set up.
 pub unsafe fn io_call_driver(device: *mut DeviceObject, irp: *mut Irp) -> NtStatus {
     unsafe {
-        // Descend to the location the initiator prepared.
-        if (*irp).current_location == 0 {
+        // Descend to the location the initiator prepared (CurrentLocation is
+        // 1-based; 1 is the bottom of the stack).
+        if (*irp).current_location <= 1 {
             (*irp).io_status.status = Ntstatus(NtStatus::INVALID_DEVICE_REQUEST.0);
             return NtStatus::INVALID_DEVICE_REQUEST;
         }
         (*irp).current_location -= 1;
-        let sl = io_get_current_stack_location(irp);
+        (*irp).current_stack_location = (*irp).current_stack_location.offset(-1);
+        let sl = (*irp).current_stack_location;
         (*sl).device_object = device;
         let major = (*sl).major_function as usize;
         let driver = (*device).driver;
@@ -185,7 +184,7 @@ pub unsafe fn io_call_driver(device: *mut DeviceObject, irp: *mut Irp) -> NtStat
 /// `irp` must be live; `io_status` must already be filled in.
 pub unsafe fn io_complete_request(irp: *mut Irp) {
     unsafe {
-        let ev = (*irp).completion_event as *mut crate::ke::dispatcher::DispatcherHeader;
+        let ev = (*irp).user_event as *mut crate::ke::dispatcher::DispatcherHeader;
         if !ev.is_null() {
             crate::ke::scheduler::ki_signal_object(ev);
         }
@@ -210,10 +209,11 @@ pub unsafe fn io_synchronous_request(
         let irp = io_allocate_irp(1)?;
         let mut event = Kevent::new(DispatcherObjectType::NotificationEvent, false);
         (*irp).system_buffer = buffer;
-        (*irp).buffer_length = len;
-        (*irp).completion_event = (&raw mut event.header) as *mut core::ffi::c_void;
+        (*irp).user_event = (&raw mut event.header) as *mut core::ffi::c_void;
 
-        // Fill the next (top) stack location the target device will see.
+        // Fill the next (top) stack location the target device will see. The
+        // length lives in the stack location's Read/Write parameters (NT has no
+        // length field on the IRP itself).
         let next = io_get_next_stack_location(irp);
         (*next).major_function = major;
         (*next).device_object = device;
@@ -254,18 +254,16 @@ pub unsafe fn io_synchronous_ioctl(
         let irp = io_allocate_irp(1)?;
         let mut event = Kevent::new(DispatcherObjectType::NotificationEvent, false);
         (*irp).system_buffer = buffer;
-        (*irp).buffer_length = in_len.max(out_len);
-        (*irp).completion_event = (&raw mut event.header) as *mut core::ffi::c_void;
+        (*irp).user_event = (&raw mut event.header) as *mut core::ffi::c_void;
 
         let next = io_get_next_stack_location(irp);
         (*next).major_function = IRP_MJ_DEVICE_CONTROL;
         (*next).device_object = device;
-        (*next).set_device_io_control(DeviceIoControlParams {
-            output_buffer_length: out_len as u32,
-            input_buffer_length: in_len as u32,
-            io_control_code: control_code,
-            _type3_input_buffer: core::ptr::null_mut(),
-        });
+        (*next).set_device_io_control(DeviceIoControlParams::new(
+            out_len as u32,
+            in_len as u32,
+            control_code,
+        ));
 
         let status = io_call_driver(device, irp);
         if status == NtStatus::PENDING {

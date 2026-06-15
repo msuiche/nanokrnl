@@ -27,8 +27,10 @@ unsafe extern "win64" fn null_dispatch(_device: *mut DeviceObject, irp: *mut Irp
     unsafe {
         let sl = super::io_get_current_stack_location(irp);
         (*irp).io_status.information = match (*sl).major_function {
-            IRP_MJ_WRITE => (*irp).buffer_length as u64, // bit bucket accepts all
-            _ => 0,                                       // reads: instant EOF
+            // Bit bucket accepts all bytes: report the write length from the
+            // stack location (NT keeps the length there, not on the IRP).
+            IRP_MJ_WRITE => (*sl).read_write().length as u64,
+            _ => 0, // reads: instant EOF
         };
         (*irp).io_status.status = Ntstatus(NtStatus::SUCCESS.0);
         io_complete_request(irp);

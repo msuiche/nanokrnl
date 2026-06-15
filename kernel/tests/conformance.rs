@@ -72,13 +72,17 @@ fn ntstatus_values_are_bit_exact() {
 #[test]
 fn driver_object_dispatch_table_layout() {
     use ntabi::{DriverObject, IRP_MJ_MAXIMUM_FUNCTION, IRP_MJ_READ, IRP_MJ_WRITE};
-    // DRIVER_OBJECT starts with the name, then the MajorFunction table that
-    // WDM drivers index directly. The table covers the documented major
-    // range and an Option<fn> slot is pointer-sized (null-optimized).
+    // DRIVER_OBJECT matches the documented NT x64 layout: DriverName at 0x38,
+    // the MajorFunction table WDM drivers index directly at 0x70. The table
+    // covers the documented major range and an Option<fn> slot is pointer-sized
+    // (null-optimized).
     assert_eq!(IRP_MJ_MAXIMUM_FUNCTION, 0x1C);
     assert_eq!(IRP_MJ_READ, 0x03);
     assert_eq!(IRP_MJ_WRITE, 0x04);
-    assert_eq!(offset_of!(DriverObject, driver_name), 0);
+    assert_eq!(offset_of!(DriverObject, driver_name), 0x38);
+    assert_eq!(offset_of!(DriverObject, major_function), 0x70);
+    assert_eq!(offset_of!(DriverObject, driver_unload), 0x68);
+    assert_eq!(size_of::<DriverObject>(), 0x150);
     assert_eq!(
         size_of::<Option<ntabi::DriverDispatch>>(),
         size_of::<usize>()
@@ -88,22 +92,20 @@ fn driver_object_dispatch_table_layout() {
 #[test]
 fn io_stack_location_parameters_union_fits_all_arms() {
     use ntabi::{DeviceIoControlParams, IoStackLocation, ReadWriteParams};
-    // The Parameters union storage must hold the largest arm. Read/Write is
-    // 16 bytes; DeviceIoControl is 24 (with the type-3 buffer pointer).
-    assert!(size_of::<ReadWriteParams>() <= 24);
-    assert!(size_of::<DeviceIoControlParams>() <= 24);
+    // The Parameters union storage (NT: 0x20 bytes, starting at +0x08) must
+    // hold the largest arm. Read/Write is 16 bytes; DeviceIoControl is 32 with
+    // the NT 8-byte field strides (...Type3InputBuffer at +0x18).
+    assert!(size_of::<ReadWriteParams>() <= 0x20);
+    assert!(size_of::<DeviceIoControlParams>() <= 0x20);
     // Round-trip both arms through the union accessors.
     let mut sl = IoStackLocation::zeroed();
     sl.set_read_write(ReadWriteParams { length: 0x1234, key: 7, byte_offset: 0xAABB });
     let rw = sl.read_write();
     assert_eq!((rw.length, rw.key, rw.byte_offset), (0x1234, 7, 0xAABB));
-    sl.set_device_io_control(DeviceIoControlParams {
-        output_buffer_length: 10,
-        input_buffer_length: 20,
-        io_control_code: 0x222000,
-        _type3_input_buffer: core::ptr::null_mut(),
-    });
-    assert_eq!(sl.device_io_control().io_control_code, 0x222000);
+    sl.set_device_io_control(DeviceIoControlParams::new(10, 20, 0x222000));
+    let ioctl = sl.device_io_control();
+    assert_eq!(ioctl.io_control_code, 0x222000);
+    assert_eq!((ioctl.output_buffer_length, ioctl.input_buffer_length), (10, 20));
 }
 
 #[test]
