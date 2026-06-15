@@ -34,6 +34,7 @@ static EXPORTS: &[(&str, usize)] = &[
     ("NtTerminateThread", syscalls::SVC_EXIT_THREAD),
     ("NtWriteFile", syscalls::SVC_NT_WRITE_FILE),
     ("NtCreateFile", syscalls::SVC_NT_CREATE_FILE),
+    ("NtOpenFile", syscalls::SVC_NT_OPEN_FILE),
     ("NtClose", syscalls::SVC_NT_CLOSE),
     ("NtReadFile", syscalls::SVC_NT_READ_FILE),
     ("NtAllocateVirtualMemory", syscalls::SVC_NT_ALLOCATE_VIRTUAL_MEMORY),

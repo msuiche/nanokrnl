@@ -2807,6 +2807,105 @@ pub unsafe extern "C" fn GetLongPathNameW(short: *const u16, long: *mut u16, cch
     GetFullPathNameW(short, cch, long, core::ptr::null_mut())
 }
 
+/// `RtlDosPathNameToNtPathName_U(DosFileName, NtFileName, FilePart, Reserved)`
+/// — convert a DOS path (`hello.txt`, `C:\dir\file`) to its NT form
+/// (`\??\C:\dir\file`), which `NtOpenFile`/`NtCreateFile` consume. ulib-based
+/// tools (more.com, …) open files this way. We canonicalize to an absolute DOS
+/// path via `GetFullPathNameW`, prefix `\??\`, and return the result in a
+/// freshly heap-allocated `UNICODE_STRING` buffer (the caller frees it with
+/// `RtlFreeHeap`). `NtFileName` points at a caller-provided `UNICODE_STRING`
+/// (Length u16 @0, MaximumLength u16 @2, Buffer ptr @8). Returns TRUE/FALSE.
+#[no_mangle]
+pub unsafe extern "C" fn RtlDosPathNameToNtPathName_U(
+    dos: *const u16,
+    nt_file_name: *mut u8,
+    file_part: *mut *mut u16,
+    _reserved: *mut c_void,
+) -> i32 {
+    if dos.is_null() || nt_file_name.is_null() {
+        return 0;
+    }
+    let mut full = [0u16; 320];
+    // "\??\" device prefix.
+    let prefix = [b'\\' as u16, b'?' as u16, b'?' as u16, b'\\' as u16];
+    full[..4].copy_from_slice(&prefix);
+    // Canonicalize the DOS path (resolves a relative name against C:\) right
+    // after the prefix.
+    let n = GetFullPathNameW(dos, (full.len() - 4) as u32, full.as_mut_ptr().add(4), core::ptr::null_mut()) as usize;
+    if n == 0 || n + 4 >= full.len() {
+        return 0;
+    }
+    let total = 4 + n; // wide chars, excluding NUL
+    let buf = HeapAlloc(GetProcessHeap(), 0, ((total + 1) * 2) as u64) as *mut u16;
+    if buf.is_null() {
+        return 0;
+    }
+    for i in 0..total {
+        *buf.add(i) = full[i];
+    }
+    *buf.add(total) = 0;
+    // Fill the caller's UNICODE_STRING.
+    *(nt_file_name as *mut u16) = (total * 2) as u16; // Length (bytes, no NUL)
+    *(nt_file_name.add(2) as *mut u16) = ((total + 1) * 2) as u16; // MaximumLength
+    *(nt_file_name.add(8) as *mut u64) = buf as u64; // Buffer
+    // FilePart: the last path component (after the final separator).
+    if !file_part.is_null() {
+        let mut fp = buf;
+        for i in 0..total {
+            if *buf.add(i) == b'\\' as u16 {
+                fp = buf.add(i + 1);
+            }
+        }
+        *file_part = fp;
+    }
+    1
+}
+
+/// `RtlDosPathNameToRelativeNtPathName_U(DosFileName, NtFileName, FilePart,
+/// RelativeName)` — the relative-path variant ulib actually calls. We produce
+/// the same absolute NT path as [`RtlDosPathNameToNtPathName_U`], and report
+/// "no relative directory" by zeroing the optional `RTL_RELATIVE_NAME_U`
+/// (RelativeName.Length = 0, ContainingDirectory = NULL) — valid for our flat
+/// `C:\` namespace, so the caller opens via the absolute `NtFileName`.
+#[no_mangle]
+pub unsafe extern "C" fn RtlDosPathNameToRelativeNtPathName_U(
+    dos: *const u16,
+    nt_file_name: *mut u8,
+    file_part: *mut *mut u16,
+    relative_name: *mut u8,
+) -> i32 {
+    if !relative_name.is_null() {
+        // RTL_RELATIVE_NAME_U: UNICODE_STRING RelativeName (0x10),
+        // HANDLE ContainingDirectory (0x10), PVOID CurDirRef (0x18).
+        for i in 0..0x20 {
+            *relative_name.add(i) = 0;
+        }
+    }
+    RtlDosPathNameToNtPathName_U(dos, nt_file_name, file_part, core::ptr::null_mut())
+}
+
+/// `RtlDosPathNameToRelativeNtPathName_U_WithStatus(...)` — the NTSTATUS-
+/// returning form (used by cmd). Same behavior; 0 (STATUS_SUCCESS) on success,
+/// else STATUS_OBJECT_PATH_NOT_FOUND.
+#[no_mangle]
+pub unsafe extern "C" fn RtlDosPathNameToRelativeNtPathName_U_WithStatus(
+    dos: *const u16,
+    nt_file_name: *mut u8,
+    file_part: *mut *mut u16,
+    relative_name: *mut u8,
+) -> i32 {
+    if RtlDosPathNameToRelativeNtPathName_U(dos, nt_file_name, file_part, relative_name) != 0 {
+        0 // STATUS_SUCCESS
+    } else {
+        0xC000_003Au32 as i32 // STATUS_OBJECT_PATH_NOT_FOUND
+    }
+}
+
+/// `RtlReleaseRelativeName(RelativeName)` — frees a `RTL_RELATIVE_NAME_U`'s
+/// containing-directory reference. We never take one, so it's a no-op.
+#[no_mangle]
+pub extern "C" fn RtlReleaseRelativeName(_relative_name: *mut c_void) {}
+
 /// `GetCurrentDirectoryW(nBufferLength, lpBuffer)` — `C:\`.
 #[no_mangle]
 pub unsafe extern "C" fn GetCurrentDirectoryW(len: u32, buffer: *mut u16) -> u32 {

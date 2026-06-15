@@ -57,6 +57,7 @@ pub const SVC_SET_CONSOLE_MODE: usize = 30;
 pub const SVC_LOAD_MESSAGE: usize = 31;
 pub const SVC_QUERY_ATTRIBUTES: usize = 32;
 pub const SVC_QUERY_DIRECTORY: usize = 33;
+pub const SVC_NT_OPEN_FILE: usize = 34;
 
 /// A shared kernel counter incremented atomically by [`SVC_INCREMENT_COUNTER`].
 /// Used to prove concurrent ring-3 threads both make progress through the
@@ -90,6 +91,7 @@ pub fn register_all() {
     register_service(SVC_DEBUG_WRITE, dbg_write_string);
     register_service(SVC_NT_WRITE_FILE, nt_write_file);
     register_service(SVC_NT_CREATE_FILE, nt_create_file);
+    register_service(SVC_NT_OPEN_FILE, nt_open_file);
     register_service(SVC_NT_CLOSE, nt_close);
     register_service(SVC_NT_READ_FILE, nt_read_file);
     register_service(SVC_NT_ALLOCATE_VIRTUAL_MEMORY, nt_allocate_virtual_memory);
@@ -618,6 +620,87 @@ extern "C" fn nt_create_file(name_ptr: u64, name_len: u64, _a3: u64, _a4: u64) -
         }
     }
     0
+}
+
+/// `NtOpenFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, …)`
+/// — the real ntdll file-open path that ulib-based tools (more.com, …) use.
+/// Unlike our simplified `NtCreateFile`, this takes the genuine NT prototype:
+/// the path is a UNICODE_STRING reached through `ObjectAttributes->ObjectName`,
+/// in NT form (`\??\C:\file`). We strip the `\??\` device prefix, open the
+/// RAM-fs file, write the handle to `*FileHandle`, fill the IO_STATUS_BLOCK,
+/// and return an NTSTATUS (0 on success). ShareAccess/OpenOptions (on the
+/// stack) are ignored — we have no sharing model. The first four arguments map
+/// to our four syscall registers.
+extern "C" fn nt_open_file(
+    file_handle_out: u64,
+    _desired_access: u64,
+    object_attributes: u64,
+    io_status_block: u64,
+) -> u64 {
+    const STATUS_INVALID_PARAMETER: u64 = 0xC000_000D;
+    const STATUS_OBJECT_NAME_NOT_FOUND: u64 = 0xC000_0034;
+    const FILE_OPENED: u64 = 1;
+    if file_handle_out == 0 || object_attributes == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // OBJECT_ATTRIBUTES.ObjectName (PUNICODE_STRING) sits at +0x10.
+    if crate::mm::virt::probe_for_read(object_attributes, 0x18, 8).is_err() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let name_ptr = unsafe {
+        crate::mm::virt::user_access_begin();
+        let p = *((object_attributes + 0x10) as *const u64);
+        crate::mm::virt::user_access_end();
+        p
+    };
+    if name_ptr == 0 || crate::mm::virt::probe_for_read(name_ptr, 16, 8).is_err() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // UNICODE_STRING { u16 Length; u16 MaximumLength; u32 _pad; u64 Buffer; }
+    let (len_bytes, buf_va) = unsafe {
+        crate::mm::virt::user_access_begin();
+        let l = *(name_ptr as *const u16) as usize;
+        let b = *((name_ptr + 8) as *const u64);
+        crate::mm::virt::user_access_end();
+        (l, b)
+    };
+    let mut wbuf = [0u16; 260];
+    let Some(w) = read_user_u16(buf_va, (len_bytes / 2).min(260), &mut wbuf) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    let mut abuf = [0u8; 260];
+    let mut n = 0;
+    for &c in w {
+        if n < abuf.len() {
+            abuf[n] = c as u8;
+            n += 1;
+        }
+    }
+    let Ok(mut path) = core::str::from_utf8(&abuf[..n]) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    // DOS paths arrive in NT form: "\??\C:\file" — strip the device prefix.
+    if let Some(rest) = path.strip_prefix("\\??\\") {
+        path = rest;
+    }
+    let Some(file) = io::ramfs::open(path) else {
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    };
+    let h = handle::ob_create_handle(file as *mut u8, 0);
+    if crate::mm::virt::probe_for_write(file_handle_out, 8, 8).is_ok() {
+        crate::mm::virt::user_access_begin();
+        unsafe { *(file_handle_out as *mut u64) = h };
+        crate::mm::virt::user_access_end();
+    }
+    if io_status_block != 0 && crate::mm::virt::probe_for_write(io_status_block, 16, 8).is_ok() {
+        crate::mm::virt::user_access_begin();
+        unsafe {
+            *(io_status_block as *mut u32) = 0; // Status = STATUS_SUCCESS
+            *((io_status_block + 8) as *mut u64) = FILE_OPENED; // Information
+        }
+        crate::mm::virt::user_access_end();
+    }
+    0 // STATUS_SUCCESS
 }
 
 /// `NtReadFile(Handle, Buffer, Length)` — resolve the handle to its device
