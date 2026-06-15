@@ -903,6 +903,10 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
         if !MSVCRT_IMAGE.is_empty() {
             crate::ldr::loaded::load_msvcrt(MSVCRT_IMAGE).expect("load msvcrt.dll");
         }
+        // Load ulib.dll (after the shims it depends on): a real dependent DLL
+        // whose own imports the loader binds against kernel32/msvcrt/ntdll, so
+        // that ulib-based tools (more.com, …) can resolve their ulib imports.
+        crate::ldr::loaded::load_ulib(ULIB_IMAGE).expect("load ulib.dll");
         let console = io::console::initialize().expect("console device");
 
         // Handle table: open/lookup/close round trip on the console device.
@@ -1539,6 +1543,9 @@ static USERAPP_IMAGE: &[u8] = include_bytes!(env!("NTOS_USERAPP_IMAGE"));
 /// built (see `scripts/build-kernel32.sh`).
 static KERNEL32_IMAGE: &[u8] = include_bytes!(env!("NTOS_KERNEL32_IMAGE"));
 static MSVCRT_IMAGE: &[u8] = include_bytes!(env!("NTOS_MSVCRT_IMAGE"));
+/// `ulib.dll` — real Microsoft utility library (dependent DLL for more.com et
+/// al.), loaded as a module so consumers' `ulib` imports resolve.
+static ULIB_IMAGE: &[u8] = include_bytes!(env!("NTOS_ULIB_IMAGE"));
 
 /// A real Windows console binary (`sort.exe`), embedded for the experiment of
 /// running an unmodified `.exe` against our kernel32 + msvcrt shims. Empty

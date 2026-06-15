@@ -117,6 +117,14 @@ fn main() {
         "no_whoami_mui.bin",
         "NTOS_WHOAMI_MUI_IMAGE",
     );
+    // ulib.dll — the utility library more.com (and format/chkdsk/…) depend on.
+    // A real DLL with its own imports; the dependent-DLL loader binds those
+    // against the shims, then a console tool's ulib imports bind to it.
+    resolve(
+        workspace.join("winbin").join("ulib.dll"),
+        "no_ulib.bin",
+        "NTOS_ULIB_IMAGE",
+    );
     resolve(
         workspace.join("winbin").join("cmd.exe.mui"),
         "no_cmd_mui.bin",

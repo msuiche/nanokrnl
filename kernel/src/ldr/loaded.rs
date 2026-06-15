@@ -17,6 +17,8 @@ static KERNEL32_BASE: AtomicU64 = AtomicU64::new(0);
 static KERNEL32_SIZE: AtomicUsize = AtomicUsize::new(0);
 static MSVCRT_BASE: AtomicU64 = AtomicU64::new(0);
 static MSVCRT_SIZE: AtomicUsize = AtomicUsize::new(0);
+static ULIB_BASE: AtomicU64 = AtomicU64::new(0);
+static ULIB_SIZE: AtomicUsize = AtomicUsize::new(0);
 
 /// Load the `kernel32` shim DLL into user-accessible memory. It has no
 /// imports of its own (its functions issue syscalls inline), so loading is a
@@ -47,6 +49,31 @@ pub fn load_msvcrt(image: &[u8]) -> Result<(), NtStatus> {
         loaded.size
     );
     Ok(())
+}
+
+/// Load `ulib.dll` — a real dependent DLL (unlike the shims, it has imports of
+/// its own). `load_user` binds those imports against the already-loaded shims
+/// (kernel32/msvcrt/ntdll), maps it user-executable in the shared high half,
+/// and we record its export table so a consumer's `ulib` imports resolve. Must
+/// run after kernel32/msvcrt. Skips cleanly if `ulib.dll` wasn't staged.
+pub fn load_ulib(image: &[u8]) -> Result<(), NtStatus> {
+    if image.is_empty() {
+        return Ok(());
+    }
+    let loaded = pe::load_user(image)?;
+    ULIB_BASE.store(loaded.base as u64, Ordering::Release);
+    ULIB_SIZE.store(loaded.size, Ordering::Release);
+    crate::kd_println!(
+        "LDR: loaded ulib.dll @ {:p} ({} bytes)",
+        loaded.base,
+        loaded.size
+    );
+    Ok(())
+}
+
+/// `(base, size)` of the loaded ulib.dll (for the debugger's module map).
+pub fn ulib_range() -> (u64, usize) {
+    (ULIB_BASE.load(Ordering::Acquire), ULIB_SIZE.load(Ordering::Acquire))
 }
 
 /// `(base, size)` of the loaded kernel32 shim (for the debugger's module map).
@@ -85,6 +112,9 @@ pub fn module_base(name: &str) -> u64 {
     }
     if module_name_matches(name, "msvcrt") {
         return MSVCRT_BASE.load(Ordering::Acquire);
+    }
+    if module_name_matches(name, "ulib") {
+        return ULIB_BASE.load(Ordering::Acquire);
     }
     0
 }
@@ -178,6 +208,11 @@ pub fn proc_address(module_base: u64, name: &str) -> usize {
         let size = MSVCRT_SIZE.load(Ordering::Acquire);
         return resolve_export_in(module_base, size, name).map(|va| va as usize).unwrap_or(0);
     }
+    let ulib = ULIB_BASE.load(Ordering::Acquire);
+    if module_base == ulib && ulib != 0 {
+        let size = ULIB_SIZE.load(Ordering::Acquire);
+        return resolve_export_in(module_base, size, name).map(|va| va as usize).unwrap_or(0);
+    }
     if module_base == ntdll::trampoline_base() {
         return ntdll::resolve_import(name).unwrap_or(0);
     }
@@ -208,6 +243,15 @@ pub fn resolve(name: &str) -> Option<usize> {
     if let Some(va) = resolve_export_in(
         MSVCRT_BASE.load(Ordering::Acquire),
         MSVCRT_SIZE.load(Ordering::Acquire),
+        name,
+    ) {
+        return Some(va as usize);
+    }
+    // Dependent DLLs (ulib.dll, …) loaded after the shims. Their exports —
+    // e.g. ulib's mangled C++ class methods — resolve here by name.
+    if let Some(va) = resolve_export_in(
+        ULIB_BASE.load(Ordering::Acquire),
+        ULIB_SIZE.load(Ordering::Acquire),
         name,
     ) {
         return Some(va as usize);

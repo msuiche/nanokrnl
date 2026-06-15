@@ -447,6 +447,52 @@ pub unsafe extern "C" fn HeapFree(_heap: u64, _flags: u32, mem: *mut u8) -> i32 
     1
 }
 
+/// `RtlAllocateHeap(HeapHandle, Flags, Size)` — the ntdll heap entry point real
+/// binaries (e.g. more.com via ulib) call directly. Same semantics and flags as
+/// `HeapAlloc`; forward to it.
+#[no_mangle]
+pub unsafe extern "C" fn RtlAllocateHeap(heap: u64, flags: u32, bytes: u64) -> *mut u8 {
+    HeapAlloc(heap, flags, bytes)
+}
+
+/// `RtlFreeHeap(HeapHandle, Flags, BaseAddress)` — ntdll counterpart of
+/// `HeapFree`. Returns TRUE on success.
+#[no_mangle]
+pub unsafe extern "C" fn RtlFreeHeap(heap: u64, flags: u32, mem: *mut u8) -> i32 {
+    HeapFree(heap, flags, mem)
+}
+
+/// `IsDBCSLeadByte(TestChar)` — whether a byte begins a double-byte character.
+/// Our console code page is single-byte, so never.
+#[no_mangle]
+pub extern "C" fn IsDBCSLeadByte(_test_char: u8) -> i32 {
+    0
+}
+
+/// `GenerateConsoleCtrlEvent(dwCtrlEvent, dwProcessGroupId)` — we don't model
+/// process groups / Ctrl signal delivery; report success without doing it.
+#[no_mangle]
+pub extern "C" fn GenerateConsoleCtrlEvent(_event: u32, _group: u32) -> i32 {
+    1
+}
+
+/// `WakeAllConditionVariable(ConditionVariable)` — no-op: nothing blocks on a
+/// condition variable in our cooperative model.
+#[no_mangle]
+pub extern "C" fn WakeAllConditionVariable(_cv: *mut c_void) {}
+
+/// `SleepConditionVariableSRW(...)` — report the variable was signaled (TRUE)
+/// rather than block; callers re-check their predicate and proceed.
+#[no_mangle]
+pub extern "C" fn SleepConditionVariableSRW(
+    _cv: *mut c_void,
+    _lock: *mut c_void,
+    _ms: u32,
+    _flags: u32,
+) -> i32 {
+    1
+}
+
 /// `lstrlenA(lpString)` — length of a NUL-terminated ANSI string.
 #[no_mangle]
 pub unsafe extern "C" fn lstrlenA(s: *const u8) -> i32 {
