@@ -157,11 +157,20 @@ target runs. Same evidence-driven loop that cracked whoami/more natively. Flags
     `_initterm` C++ ctors, `main`, and `exit`/`_cexit` → clean HALT, with **no
     unimplemented opcode**. Imports are still faked (return 0), so it doesn't
     print the user *yet*. 12 emu host tests pass.
-  - **Next: service imports for real** — route the IAT traps (GetStdHandle,
-    WriteFile/WriteConsoleW, OpenProcessToken, GetTokenInformation,
-    LookupAccountSidW, …) to the kernel's implementations so `whoami` actually
-    prints `nanokrnl\user`. Then wire the interpreter into the kernel's `run`
-    path so it's invocable from the `C:\>` shell.
+  - **Import servicing** (`cargo run --example run_whoami`): a win64-ABI import
+    dispatch (`import_name` → handler reading rcx/rdx/r8/r9 + stack args, writing
+    rax + the interpreter does the `ret`). Implemented console (WriteConsoleW/
+    WriteFile print), heap, command line, std handles, and the token/identity
+    path. Opcodes added to follow the real (non-faked) path: `cmovcc` (0F 40..4F),
+    accumulator-immediate ALU (0x04/05/.../3C/3D + `test` A8/A9), `lstrlenW`,
+    `CharLowerW`/`CharUpperW`. whoami now runs end to end **and reaches
+    `WriteConsoleW`** — but with serviced imports it currently takes a path that
+    writes an empty buffer (no username API called).
+  - **Next:** fix the username path — whoami isn't calling the token APIs; the
+    likely cause is argv/`__getmainargs` not being set up (so it mis-parses
+    invocation). Service `__getmainargs`/`__wgetmainargs` (argc=1, argv=["whoami"])
+    and re-trace until it prints `nanokrnl\user`. Then move the dispatch into the
+    kernel and wire it to the `C:\>` `run` path; then cmd/more; then drivers.
 - [ ] **B1 — usermode core.** Implement the ALU/mov/stack/jump/string/SSE2 subset
   the MSVC CRT + our shims use; wire `syscall` → existing SSDT. Milestone: a
   tiny own-ABI program, then **`whoami` runs in the browser**.

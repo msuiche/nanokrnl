@@ -349,17 +349,14 @@ impl Cpu {
         // rest are consumed — size/rep semantics handled per-opcode as needed).
         self.seg_base = 0;
         let mut opsize16 = false;
-        let mut mp: u8 = 0; // mandatory prefix for SSE (0x66/0xF2/0xF3)
         loop {
             match fetch(pc) {
                 0x65 => self.seg_base = self.gs_base,
                 0x64 => self.seg_base = self.fs_base,
-                0x66 => {
-                    opsize16 = true;
-                    mp = 0x66;
-                }
-                0xf2 | 0xf3 => mp = fetch(pc),
-                0x67 | 0xf0 | 0x2e | 0x36 | 0x3e | 0x26 => {}
+                0x66 => opsize16 = true,
+                // 0xF2/0xF3 are REP/mandatory-SSE prefixes; 0x67/0xF0/seg are
+                // consumed. (SSE move variants are handled identically here.)
+                0x67 | 0xf0 | 0xf2 | 0xf3 | 0x2e | 0x36 | 0x3e | 0x26 => {}
                 _ => break,
             }
             pc += 1;
@@ -491,6 +488,52 @@ impl Cpu {
                 if !ok {
                     return self.fault(rm);
                 }
+                self.rip = pc as u64;
+                StepResult::Ok
+            }
+            // accumulator-immediate ALU: AL,imm8 (0x04/0C/14/1C/24/2C/34/3C) and
+            // eAX,imm32 (0x05/0D/15/1D/25/2D/35/3D). op = (opcode>>3)&7.
+            0x04 | 0x0c | 0x14 | 0x1c | 0x24 | 0x2c | 0x34 | 0x3c => {
+                let sel = (b >> 3) & 7;
+                pc += 1;
+                let imm = fetch(pc) as u64;
+                pc += 1;
+                let al = self.regs[RAX] & 0xff;
+                let (res, wb) = self.apply_alu(sel, al, imm, 1);
+                if wb {
+                    self.regs[RAX] = (self.regs[RAX] & !0xff) | (res & 0xff);
+                }
+                self.rip = pc as u64;
+                StepResult::Ok
+            }
+            0x05 | 0x0d | 0x15 | 0x1d | 0x25 | 0x2d | 0x35 | 0x3d => {
+                let sel = (b >> 3) & 7;
+                pc += 1;
+                let imm = imm32(pc) as u64; // sign-extended to 64
+                pc += 4;
+                let a = if size == 4 { self.regs[RAX] & 0xFFFF_FFFF } else { self.regs[RAX] };
+                let (res, wb) = self.apply_alu(sel, a, imm, size);
+                if wb {
+                    self.regs[RAX] = if size == 4 { res & 0xFFFF_FFFF } else { res };
+                }
+                self.rip = pc as u64;
+                StepResult::Ok
+            }
+            // test AL,imm8 (0xA8) and test eAX,imm32 (0xA9) — flags only.
+            0xa8 => {
+                pc += 1;
+                let imm = fetch(pc) as u64;
+                pc += 1;
+                self.apply_alu(4, self.regs[RAX] & 0xff, imm, 1);
+                self.rip = pc as u64;
+                StepResult::Ok
+            }
+            0xa9 => {
+                pc += 1;
+                let imm = imm32(pc) as u64;
+                pc += 4;
+                let a = if size == 4 { self.regs[RAX] & 0xFFFF_FFFF } else { self.regs[RAX] };
+                self.apply_alu(4, a, imm, size);
                 self.rip = pc as u64;
                 StepResult::Ok
             }
@@ -918,6 +961,21 @@ impl Cpu {
                         // services it from the register state and resumes.
                         self.rip = (pc + 2) as u64;
                         StepResult::Syscall
+                    }
+                    // cmovcc reg, r/m (0F 40..4F): move r/m to reg if condition.
+                    0x40..=0x4f => {
+                        pc += 2;
+                        let (reg, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                        pc = npc;
+                        let v = match self.read_rm(mem, rm, size) {
+                            Some(v) => v,
+                            None => return self.fault(rm),
+                        };
+                        if self.cond(b2 & 0x0f) {
+                            self.regs[reg] = if size == 4 { v & 0xFFFF_FFFF } else { v };
+                        }
+                        self.rip = pc as u64;
+                        StepResult::Ok
                     }
                     // cmpxchg r/m, reg (0F B1): compare RAX with r/m; if equal,
                     // store reg into r/m and set ZF; else load r/m into RAX.
