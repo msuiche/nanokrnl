@@ -862,6 +862,79 @@ pub unsafe extern "C" fn VirtualFree(address: *mut c_void, size: u64, _free_type
     (syscall3(NT_FREE_VIRTUAL_MEMORY, address as u64, size.max(4096), 0) == 0) as i32
 }
 
+/// `CreateFileMappingW(hFile, attrs, protect, sizeHigh, sizeLow, name)` — create
+/// a file-mapping object. We have no shared section objects; for a file-backed
+/// mapping we just carry the file handle through as the mapping handle (the
+/// actual read happens in `MapViewOfFile`). ulib-based tools (more.com) map a
+/// file to read it. Returns the mapping handle, or 0 on a null file handle.
+#[no_mangle]
+pub unsafe extern "C" fn CreateFileMappingW(
+    file: u64,
+    _attrs: *const c_void,
+    _protect: u32,
+    _size_high: u32,
+    _size_low: u32,
+    _name: *const u16,
+) -> u64 {
+    if file == 0 {
+        return 0;
+    }
+    file // the mapping handle is the file handle; MapViewOfFile reads from it
+}
+
+/// `MapViewOfFile(hMapping, access, offHigh, offLow, bytes)` — map a view of a
+/// file mapping. With no real sections, we materialize the view: allocate a
+/// buffer and read the file's bytes into it, returning the buffer as the "view".
+/// `bytes == 0` maps the whole file. Offsets are assumed 0 (a freshly opened
+/// file is at position 0) — enough for a pager that maps a file to read it.
+#[no_mangle]
+pub unsafe extern "C" fn MapViewOfFile(
+    mapping: u64,
+    _access: u32,
+    _off_high: u32,
+    _off_low: u32,
+    bytes: u64,
+) -> *mut c_void {
+    if mapping == 0 {
+        return core::ptr::null_mut();
+    }
+    let size = if bytes != 0 {
+        bytes
+    } else {
+        let n = GetFileSize(mapping, core::ptr::null_mut()) as u64;
+        if n == 0 || n == 0xFFFF_FFFF {
+            return core::ptr::null_mut();
+        }
+        n
+    };
+    let buf = VirtualAlloc(core::ptr::null_mut(), size, 0, 0) as *mut u8;
+    if buf.is_null() {
+        return core::ptr::null_mut();
+    }
+    let mut read = 0u32;
+    ReadFile(mapping, buf, size as u32, &mut read, core::ptr::null_mut());
+    buf as *mut c_void
+}
+
+/// `UnmapViewOfFile(lpBaseAddress)` — release a view. Our view is a plain
+/// allocation; we leave it (bounded, freed at process exit). Returns TRUE.
+#[no_mangle]
+pub extern "C" fn UnmapViewOfFile(_base: *const c_void) -> i32 {
+    1
+}
+
+/// `RtlIsTextUnicode(buffer, size, result)` — heuristic "is this UTF-16 text?".
+/// Our staged text files are ANSI/OEM, so report FALSE and clear the result
+/// flags; the caller then widens via the OEM→Unicode path rather than treating
+/// raw bytes as UTF-16 (which rendered as garbage "????").
+#[no_mangle]
+pub unsafe extern "C" fn RtlIsTextUnicode(_buffer: *const c_void, _size: i32, result: *mut i32) -> i32 {
+    if !result.is_null() {
+        *result = 0;
+    }
+    0 // FALSE — not Unicode text
+}
+
 /// `TerminateProcess(hProcess, uExitCode)` — for the current-process
 /// pseudo-handle, end the (single-threaded) process; otherwise report success
 /// without acting (we have no other processes to signal).
