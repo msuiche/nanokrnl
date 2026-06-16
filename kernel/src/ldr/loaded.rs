@@ -137,19 +137,23 @@ pub fn ordinal_stub() -> Option<usize> {
 // Behaviour is identical (return 0), but the API tracer's call target now
 // uniquely identifies WHICH missing import a binary actually calls — essential
 // for finding the next function to implement (e.g. cmd.exe's command dispatch).
-const UNRESOLVED_MAX: usize = 384;
-const UNRESOLVED_STRIDE: usize = 8;
+const UNRESOLVED_MAX: usize = 256; // 256 * 16-byte stubs == one page
+const UNRESOLVED_STRIDE: usize = 16;
 static UNRESOLVED_PAGE: AtomicU64 = AtomicU64::new(0);
 static UNRESOLVED_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// Assign a distinct return-0 stub to an unresolved import `name`, logging the
-/// mapping. Returns the stub's VA (or `None` if the page is full / unallocated).
+/// Assign a distinct stub to an unresolved import `name`, logging the mapping.
+/// Each unimplemented by-name import gets its OWN return-0 stub at a unique
+/// address (rather than all sharing `__ordinal_stub`), so the API tracer's call
+/// target — cross-referenced with the boot-time "unresolved import" log below —
+/// identifies exactly WHICH missing import a binary calls. Returns the stub VA.
 pub fn unresolved_stub(name: &str) -> Option<usize> {
-    // Lazily build a user-executable page of `xor eax,eax; ret` stubs.
     let mut base = UNRESOLVED_PAGE.load(Ordering::Acquire);
     if base == 0 {
         let pa = crate::mm::phys::mm_allocate_page()?;
         let va = crate::mm::phys_to_virt(pa) as u64;
+        // Fill the page with identical `xor eax,eax ; ret` stubs (return 0)
+        // while it is still writable, then mark it user-executable (read-only).
         unsafe {
             for i in 0..UNRESOLVED_MAX {
                 let s = (va as *mut u8).add(i * UNRESOLVED_STRIDE);
@@ -164,7 +168,6 @@ pub fn unresolved_stub(name: &str) -> Option<usize> {
     }
     let i = UNRESOLVED_COUNT.fetch_add(1, Ordering::AcqRel);
     if i >= UNRESOLVED_MAX {
-        // Out of slots: fall back to the shared stub.
         return ordinal_stub();
     }
     let addr = base + (i * UNRESOLVED_STRIDE) as u64;

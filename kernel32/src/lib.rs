@@ -1042,6 +1042,24 @@ pub extern "C" fn GetCurrentProcess() -> u64 {
 /// `TOKEN_USER` / `TOKEN_GROUPS` information classes.
 const TOKEN_USER: u32 = 1;
 const TOKEN_GROUPS: u32 = 2;
+/// Claim classes `whoami` queries: `TokenUserClaimAttributes` (33) and
+/// `TokenDeviceClaimAttributes` (34). Both return a
+/// `CLAIM_SECURITY_ATTRIBUTES_INFORMATION` — we report none.
+const TOKEN_USER_CLAIM_ATTRIBUTES: u32 = 33;
+const TOKEN_DEVICE_CLAIM_ATTRIBUTES: u32 = 34;
+/// `CLAIM_SECURITY_ATTRIBUTES_INFORMATION` size: WORD Version + WORD Reserved +
+/// DWORD AttributeCount + a pointer union (16 bytes on x64).
+const CLAIM_INFO_SIZE: u32 = 16;
+/// `TokenPrivileges` (3). A real token always holds at least
+/// `SeChangeNotifyPrivilege`; an empty privilege set is rejected by `whoami`.
+const TOKEN_PRIVILEGES_CLASS: u32 = 3;
+/// `TOKEN_PRIVILEGES { DWORD PrivilegeCount; LUID_AND_ATTRIBUTES Privileges[]; }`
+/// with one privilege: DWORD count + one 12-byte `LUID_AND_ATTRIBUTES`.
+const TOKEN_PRIVILEGES_SIZE: u32 = 4 + 12;
+/// `SeChangeNotifyPrivilege` LUID low part.
+const SE_CHANGE_NOTIFY_PRIVILEGE: u32 = 23;
+/// `SE_PRIVILEGE_ENABLED_BY_DEFAULT | SE_PRIVILEGE_ENABLED`.
+const SE_PRIVILEGE_FLAGS: u32 = 0x2 | 0x1;
 /// `SidTypeUser`.
 const SID_TYPE_USER: u32 = 1;
 /// Opaque value `OpenProcessToken` hands back; we never dereference it.
@@ -1059,6 +1077,24 @@ static USER_SID: [u8; 28] = [
     3, 0, 0, 0, // [3]
     0xE8, 3, 0, 0, // [4] = 1000 (RID)
 ];
+
+/// Well-known group SIDs our single user belongs to. A real access token always
+/// carries groups (Everyone, Authenticated Users, the local Users alias, the
+/// logon SID, …); `whoami` rejects an empty group set, so we present a minimal
+/// but valid membership.
+/// `Everyone` — S-1-1-0.
+static SID_EVERYONE: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+/// `NT AUTHORITY\Authenticated Users` — S-1-5-11.
+static SID_AUTH_USERS: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 5, 11, 0, 0, 0];
+/// `BUILTIN\Users` — S-1-5-32-545.
+static SID_BUILTIN_USERS: [u8; 16] = [1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x21, 2, 0, 0];
+
+/// Group attribute flags: MANDATORY | ENABLED_BY_DEFAULT | ENABLED.
+const SE_GROUP_FLAGS: u32 = 0x1 | 0x2 | 0x4;
+/// Number of groups we report and the size of the `TOKEN_GROUPS` buffer:
+/// `DWORD GroupCount` (padded to 8) + N * `SID_AND_ATTRIBUTES` (16 each, x64).
+const GROUP_COUNT: u32 = 3;
+const TOKEN_GROUPS_SIZE: u32 = 8 + GROUP_COUNT * 16;
 
 /// `OpenProcessToken(ProcessHandle, DesiredAccess, TokenHandle)` — hand back an
 /// opaque token for the (single) current user.
@@ -1100,7 +1136,9 @@ pub unsafe extern "C" fn GetTokenInformation(
     // report no groups (GroupCount 0), enough for "whoami" with no /groups.
     let need = match class {
         TOKEN_USER => 16u32,
-        TOKEN_GROUPS => 8u32,
+        TOKEN_GROUPS => TOKEN_GROUPS_SIZE,
+        TOKEN_USER_CLAIM_ATTRIBUTES | TOKEN_DEVICE_CLAIM_ATTRIBUTES => CLAIM_INFO_SIZE,
+        TOKEN_PRIVILEGES_CLASS => TOKEN_PRIVILEGES_SIZE,
         _ => {
             SetLastError(87); // ERROR_INVALID_PARAMETER
             return 0;
@@ -1118,8 +1156,36 @@ pub unsafe extern "C" fn GetTokenInformation(
             *(info as *mut u64) = (&raw const USER_SID) as u64; // User.Sid
             *(info.add(8) as *mut u32) = 0; // User.Attributes
         }
+        TOKEN_USER_CLAIM_ATTRIBUTES | TOKEN_DEVICE_CLAIM_ATTRIBUTES => {
+            // CLAIM_SECURITY_ATTRIBUTES_INFORMATION: no claims.
+            *(info as *mut u16) = 1; // Version = CLAIM_SECURITY_ATTRIBUTES_INFORMATION_VERSION_V1
+            *(info.add(2) as *mut u16) = 0; // Reserved
+            *(info.add(4) as *mut u32) = 0; // AttributeCount = 0
+            *(info.add(8) as *mut u64) = 0; // Attribute.pAttributeV1 = NULL
+        }
+        TOKEN_PRIVILEGES_CLASS => {
+            // TOKEN_PRIVILEGES { DWORD PrivilegeCount; LUID_AND_ATTRIBUTES[] }.
+            // One privilege: SeChangeNotifyPrivilege, enabled.
+            *(info as *mut u32) = 1; // PrivilegeCount
+            *(info.add(4) as *mut u32) = SE_CHANGE_NOTIFY_PRIVILEGE; // Luid.LowPart
+            *(info.add(8) as *mut u32) = 0; // Luid.HighPart
+            *(info.add(12) as *mut u32) = SE_PRIVILEGE_FLAGS; // Attributes
+        }
         _ => {
-            *(info as *mut u32) = 0; // GroupCount = 0
+            // TOKEN_GROUPS { DWORD GroupCount; SID_AND_ATTRIBUTES Groups[]; }.
+            // The array starts at +8 (PSID is 8-byte aligned); each entry is
+            // { PSID Sid; DWORD Attributes; } padded to 16 bytes on x64.
+            *(info as *mut u32) = GROUP_COUNT;
+            let groups: [*const u8; 3] = [
+                (&raw const SID_EVERYONE) as *const u8,
+                (&raw const SID_AUTH_USERS) as *const u8,
+                (&raw const SID_BUILTIN_USERS) as *const u8,
+            ];
+            for (i, &sid) in groups.iter().enumerate() {
+                let e = info.add(8 + i * 16);
+                *(e as *mut u64) = sid as u64; // Sid
+                *(e.add(8) as *mut u32) = SE_GROUP_FLAGS; // Attributes
+            }
         }
     }
     1
@@ -1210,6 +1276,148 @@ pub unsafe extern "C" fn InitializeSid(sid: *mut u8, authority: *const u8, count
     1
 }
 
+/// Compare a NUL-terminated wide string against an ASCII byte slice.
+unsafe fn wname_eq(name: *const u16, ascii: &[u8]) -> bool {
+    for (i, &b) in ascii.iter().enumerate() {
+        if *name.add(i) != b as u16 {
+            return false;
+        }
+    }
+    *name.add(ascii.len()) == 0
+}
+
+/// `LookupPrivilegeValueW(System, Name, Luid)` — map a privilege name to its
+/// well-known LUID. The standard privileges have fixed low parts (their
+/// `SE_*_PRIVILEGE` index) and a zero high part; unrecognized names get
+/// `SeChangeNotifyPrivilege`'s value so callers still receive a usable LUID.
+#[no_mangle]
+pub unsafe extern "C" fn LookupPrivilegeValueW(
+    _system: *const u16,
+    name: *const u16,
+    luid: *mut u64,
+) -> i32 {
+    if luid.is_null() || name.is_null() {
+        SetLastError(87); // ERROR_INVALID_PARAMETER
+        return 0;
+    }
+    // (name, LUID low part) for the privileges a tool is likely to request.
+    const TABLE: &[(&[u8], u32)] = &[
+        (b"SeAssignPrimaryTokenPrivilege", 3),
+        (b"SeTcbPrivilege", 7),
+        (b"SeSecurityPrivilege", 8),
+        (b"SeTakeOwnershipPrivilege", 9),
+        (b"SeLoadDriverPrivilege", 10),
+        (b"SeSystemProfilePrivilege", 11),
+        (b"SeBackupPrivilege", 17),
+        (b"SeRestorePrivilege", 18),
+        (b"SeShutdownPrivilege", 19),
+        (b"SeDebugPrivilege", 20),
+        (b"SeChangeNotifyPrivilege", 23),
+        (b"SeRemoteShutdownPrivilege", 24),
+        (b"SeUndockPrivilege", 25),
+        (b"SeIncreaseWorkingSetPrivilege", 33),
+        (b"SeTimeZonePrivilege", 34),
+    ];
+    let low = TABLE
+        .iter()
+        .find(|&&(n, _)| wname_eq(name, n))
+        .map(|&(_, v)| v)
+        .unwrap_or(SE_CHANGE_NOTIFY_PRIVILEGE);
+    *luid = low as u64; // LUID { LowPart = low, HighPart = 0 }
+    1
+}
+
+/// `LookupPrivilegeNameW(System, Luid, Name, cchName)` — the reverse map: a LUID
+/// back to its `Se…Privilege` name. `cchName` is an in/out char count.
+#[no_mangle]
+pub unsafe extern "C" fn LookupPrivilegeNameW(
+    _system: *const u16,
+    luid: *const u64,
+    name: *mut u16,
+    cch_name: *mut u32,
+) -> i32 {
+    if luid.is_null() || cch_name.is_null() {
+        SetLastError(87);
+        return 0;
+    }
+    let low = (*luid & 0xFFFF_FFFF) as u32;
+    let s: &[u8] = match low {
+        3 => b"SeAssignPrimaryTokenPrivilege",
+        7 => b"SeTcbPrivilege",
+        17 => b"SeBackupPrivilege",
+        18 => b"SeRestorePrivilege",
+        20 => b"SeDebugPrivilege",
+        _ => b"SeChangeNotifyPrivilege",
+    };
+    let need = s.len() as u32 + 1;
+    if name.is_null() || *cch_name < need {
+        *cch_name = need;
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    for (i, &c) in s.iter().enumerate() {
+        *name.add(i) = c as u16;
+    }
+    *name.add(s.len()) = 0;
+    *cch_name = s.len() as u32;
+    1
+}
+
+/// `LookupPrivilegeDisplayNameW(System, Name, DisplayName, cch, LangId)` — a
+/// human-readable description. We echo the privilege name itself.
+#[no_mangle]
+pub unsafe extern "C" fn LookupPrivilegeDisplayNameW(
+    _system: *const u16,
+    name: *const u16,
+    display: *mut u16,
+    cch: *mut u32,
+    lang: *mut u32,
+) -> i32 {
+    if name.is_null() || cch.is_null() {
+        SetLastError(87);
+        return 0;
+    }
+    let mut len = 0usize;
+    while *name.add(len) != 0 {
+        len += 1;
+    }
+    let need = len as u32 + 1;
+    if display.is_null() || *cch < need {
+        *cch = need;
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    for i in 0..len {
+        *display.add(i) = *name.add(i);
+    }
+    *display.add(len) = 0;
+    *cch = len as u32;
+    if !lang.is_null() {
+        *lang = 0x0409; // en-US
+    }
+    1
+}
+
+/// `AdjustTokenPrivileges(Token, DisableAll, NewState, BufLen, Prev, RetLen)` —
+/// we have no real privilege model, so every adjustment "succeeds". Per the
+/// API, success sets last-error to `ERROR_SUCCESS`.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn AdjustTokenPrivileges(
+    _token: u64,
+    _disable_all: i32,
+    _new_state: *const u8,
+    _buf_len: u32,
+    _prev: *mut u8,
+    return_length: *mut u32,
+) -> i32 {
+    if !return_length.is_null() {
+        *return_length = 0;
+    }
+    SetLastError(ERROR_SUCCESS);
+    1
+}
+
 /// `LookupAccountSidW(System, Sid, Name, cchName, Domain, cchDomain, Use)` — map
 /// any SID to our single user `NANOKRNL\User`. `cch*` are in/out char counts:
 /// on a too-small buffer we set the required size (incl. NUL) and fail with
@@ -1224,7 +1432,8 @@ pub unsafe extern "C" fn LookupAccountSidW(
     domain: *mut u16,
     cch_domain: *mut u32,
     use_: *mut u32,
-) -> i32 {    let name_str = b"User";
+) -> i32 {
+    let name_str = b"User";
     let dom_str = b"NANOKRNL";
     let need_name = name_str.len() as u32 + 1;
     let need_dom = dom_str.len() as u32 + 1;
@@ -1263,7 +1472,8 @@ pub unsafe extern "C" fn LookupAccountSidW(
 /// too-small buffer we set the required size (incl. NUL) and fail with
 /// ERROR_MORE_DATA, as the real API does.
 #[no_mangle]
-pub unsafe extern "C" fn GetUserNameExW(format: u32, buffer: *mut u16, size: *mut u32) -> i32 {    if size.is_null() {
+pub unsafe extern "C" fn GetUserNameExW(format: u32, buffer: *mut u16, size: *mut u32) -> i32 {
+    if size.is_null() {
         return 0;
     }
     let s: &[u8] = if format == 2 { b"NANOKRNL\\User" } else { b"User" };
