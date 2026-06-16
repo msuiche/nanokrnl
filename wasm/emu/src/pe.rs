@@ -37,6 +37,9 @@ pub struct Loaded {
     pub entry: u64,
     /// Total mapped image size (bytes), i.e. SizeOfImage.
     pub image_size: usize,
+    /// Number of imported functions whose IAT slots were bound to import traps
+    /// (`IMPORT_BASE + index*8`). Use [`import_name`] to map an index to a name.
+    pub import_count: u32,
 }
 
 /// Map `data` (a PE32+ image) into `mem` at VA 0 and apply base relocations.
@@ -124,7 +127,123 @@ pub fn load_pe(data: &[u8], mem: &mut [u8]) -> Result<Loaded, PeError> {
         }
     }
 
-    Ok(Loaded { entry: entry_rva, image_size: size_of_image })
+    // Imports (data directory 1): bind each IAT slot to an import trap address
+    // (IMPORT_BASE + index*8). A call/jmp through the slot then traps to the host
+    // as StepResult::Import{index}; the host maps the index to a name (in IAT
+    // order) and services the function. We don't resolve forwarders/ordinals
+    // specially — every imported thunk gets an index.
+    const DIR_IMPORT: usize = 1;
+    let mut import_count: u32 = 0;
+    if DIR_IMPORT < num_dirs {
+        let imp_rva = u32le(data, opt + 112 + DIR_IMPORT * 8).unwrap_or(0) as usize;
+        if imp_rva != 0 {
+            let mut desc = imp_rva;
+            loop {
+                let oft = u32le(mem, desc).unwrap_or(0) as usize;
+                let iat = u32le(mem, desc + 16).unwrap_or(0) as usize;
+                if oft == 0 && iat == 0 {
+                    break; // null terminator descriptor
+                }
+                let names = if oft != 0 { oft } else { iat };
+                let mut i = 0usize;
+                loop {
+                    if names + i * 8 + 8 > size_of_image || iat + i * 8 + 8 > size_of_image {
+                        break;
+                    }
+                    let thunk = u64le(mem, names + i * 8).unwrap_or(0);
+                    if thunk == 0 {
+                        break; // end of this DLL's thunks
+                    }
+                    if (import_count as u64) < crate::IMPORT_MAX {
+                        let sentinel = crate::IMPORT_BASE + import_count as u64 * 8;
+                        let slot = iat + i * 8;
+                        mem[slot..slot + 8].copy_from_slice(&sentinel.to_le_bytes());
+                        import_count += 1;
+                    }
+                    i += 1;
+                }
+                desc += 20;
+            }
+        }
+    }
+
+    Ok(Loaded { entry: entry_rva, image_size: size_of_image, import_count })
+}
+
+/// Map an import trap `index` (from a [`crate::StepResult::Import`]) back to its
+/// `(dll, function)` names by walking `data`'s import table in IAT order. The
+/// returned `&str`s borrow from `data`. Function name only (ordinal imports
+/// yield an empty name). `None` if the index is out of range.
+pub fn import_name(data: &[u8], index: u32) -> Option<(&str, &str)> {
+    let e_lfanew = u32le(data, 0x3c)? as usize;
+    let coff = e_lfanew + 4;
+    let opt = coff + 20;
+    let num_dirs = u32le(data, opt + 108)? as usize;
+    const DIR_IMPORT: usize = 1;
+    if DIR_IMPORT >= num_dirs {
+        return None;
+    }
+    let imp_rva = u32le(data, opt + 112 + DIR_IMPORT * 8)? as usize;
+    if imp_rva == 0 {
+        return None;
+    }
+    // Sections map raw file offsets to RVAs; we read the import tables from the
+    // file `data`, so convert RVAs through the section table.
+    let num_sections = u16le(data, coff + 2)? as usize;
+    let opt_size = u16le(data, coff + 16)? as usize;
+    let sec_table = opt + opt_size;
+    let rva_to_off = |rva: usize| -> Option<usize> {
+        for s in 0..num_sections {
+            let sh = sec_table + s * 40;
+            let va = u32le(data, sh + 12)? as usize;
+            let raw_size = u32le(data, sh + 16)? as usize;
+            let raw_ptr = u32le(data, sh + 20)? as usize;
+            if rva >= va && rva < va + raw_size {
+                return Some(raw_ptr + (rva - va));
+            }
+        }
+        None
+    };
+    let read_cstr = |off: usize| -> &str {
+        let mut n = 0;
+        while data.get(off + n).copied().unwrap_or(0) != 0 {
+            n += 1;
+        }
+        core::str::from_utf8(&data[off..off + n]).unwrap_or("")
+    };
+
+    let mut idx = 0u32;
+    let mut desc = rva_to_off(imp_rva)?;
+    loop {
+        let oft = u32le(data, desc)? as usize;
+        let name_rva = u32le(data, desc + 12)? as usize;
+        let iat = u32le(data, desc + 16)? as usize;
+        if oft == 0 && iat == 0 && name_rva == 0 {
+            break;
+        }
+        let dll = rva_to_off(name_rva).map(read_cstr).unwrap_or("");
+        let names = if oft != 0 { oft } else { iat };
+        let names_off = rva_to_off(names)?;
+        let mut i = 0usize;
+        loop {
+            let thunk = u64le(data, names_off + i * 8)?;
+            if thunk == 0 {
+                break;
+            }
+            if idx == index {
+                // High bit set => import by ordinal (no name).
+                if thunk & 0x8000_0000_0000_0000 != 0 {
+                    return Some((dll, ""));
+                }
+                let by_name = rva_to_off(thunk as usize)?;
+                return Some((dll, read_cstr(by_name + 2))); // skip 2-byte hint
+            }
+            idx += 1;
+            i += 1;
+        }
+        desc += 20;
+    }
+    None
 }
 
 #[cfg(test)]

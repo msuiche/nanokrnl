@@ -409,6 +409,13 @@ fn cmd_run86() {
                 }
                 // svc 0 (or any other) would be "exit"; fall through to continue.
             }
+            StepResult::Import { index } => {
+                // The hand-assembled run86 program imports nothing; a real PE
+                // would resolve this against the kernel. Treat as a no-op return.
+                let _ = index;
+                println("run86: unexpected import call");
+                break;
+            }
             StepResult::Halt => break,
             StepResult::Unknown { rip, byte } => {
                 print("run86: unimplemented opcode 0x");

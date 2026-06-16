@@ -134,14 +134,26 @@ target runs. Same evidence-driven loop that cracked whoami/more natively. Flags
   CF/OF/ZF/SF/PF. **Wired into the kernel** via `run86`: real x86-64 machine
   code runs inside the WASM kernel and calls back through a syscall the kernel
   services (write).
-  - **PE loader** (`wasm/emu/src/pe.rs`): maps a real PE32+ image into the
-    interpreter's flat memory at **VA 0** (so VA==RVA, keeping addressing
-    trivial) and applies base relocations (delta = −preferred_base). **Verified
-    it loads the real `whoami.exe`** — headers/sections mapped, relocs applied,
-    entry valid. 12 host tests pass.
-  - Next: a host harness that runs the loaded `whoami` through the interpreter
-    to surface the next unimplemented opcode (trace-driven), then route ntdll
-    `syscall`/imports into a kernel syscall surface.
+  - **PE loader** (`wasm/emu/src/pe.rs`): maps a real PE32+ image at VA 0 (VA==
+    RVA), applies base relocations, and **resolves imports** — binds each IAT
+    slot to an import-trap address (`IMPORT_BASE+idx*8`, a region inside the
+    buffer so *data* imports read/write real memory while *function* imports
+    trap by address). `import_name()` maps a trap index back to `dll!name`.
+  - **Trace harness** (`cargo run --example trace_whoami`) runs the real
+    `whoami.exe` and reports the next unimplemented opcode — driving coverage.
+    Added, trace-driven: the full two-operand integer ALU (all 8 ops, both
+    directions) via `apply_alu`; immediate group; `mov`/`movsxd`/`movzx`/`movsx`;
+    `lea`, `test`, `xchg`, `cmpxchg`; the shift/rotate group (0xC1/D1/D3); the
+    `0xF7` unary group (test/not/neg/mul/imul/div/idiv); group-5 (`0xFF`:
+    inc/dec/call/jmp/push r/m); `jcc` rel8/32 + `setcc` (full 16 condition
+    codes); FS/GS **segment-override prefixes** + `gs_base`/`fs_base` (so
+    `gs:[...]` TEB access works); `syscall`.
+  - **Result: the real `whoami.exe` now executes ~311 instructions** in the
+    interpreter — through `__security_init_cookie`, the CRT startup, IAT import
+    calls (GetSystemTimeAsFileTime, QueryPerformanceCounter, _initterm C++
+    ctors, …). 12 emu host tests pass. **Next frontier: SSE/XMM** (`xorps`,
+    `movdqa`, …) — the CRT zero-inits buffers with 128-bit ops — then route
+    imports/`syscall` into the WASM kernel's services.
 - [ ] **B1 — usermode core.** Implement the ALU/mov/stack/jump/string/SSE2 subset
   the MSVC CRT + our shims use; wire `syscall` → existing SSDT. Milestone: a
   tiny own-ABI program, then **`whoami` runs in the browser**.

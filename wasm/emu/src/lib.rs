@@ -37,11 +37,49 @@ const OF: u64 = 1 << 11;
 /// interpreter stops (mirrors the native loader's NtTerminateThread return stub).
 pub const HALT_ADDR: u64 = u64::MAX;
 
+/// IAT slots are bound to `IMPORT_BASE + index*8`. A call/jmp to such an address
+/// traps to the host as [`StepResult::Import`]. The region sits *inside* the
+/// flat memory buffer (real, zeroed storage) so that **data** imports — IAT
+/// entries the program dereferences as variables rather than calls (e.g. the
+/// CRT's `_commode`/`_fmode`) — read/write harmlessly instead of faulting, while
+/// **function** imports are still trapped by address before any fetch. The host
+/// must size its buffer to cover `[IMPORT_BASE, IMPORT_BASE + IMPORT_MAX*8)`.
+pub const IMPORT_BASE: u64 = 0x0200_0000; // 32 MiB
+/// Max distinct imports (bounds the trap range; 64 KiB of slots).
+pub const IMPORT_MAX: u64 = 8192;
+
 #[derive(Clone)]
 pub struct Cpu {
     pub regs: [u64; 16],
     pub rip: u64,
     pub rflags: u64,
+    /// GS/FS segment bases. Windows user code reaches the TEB via `gs:[...]`
+    /// (gs:[0x30]=self, gs:[0x60]=PEB, gs:[0x58]=TLS array). The host points
+    /// `gs_base` at a TEB it builds in the interpreter's memory.
+    pub gs_base: u64,
+    pub fs_base: u64,
+    /// Transient: the active segment base for the current instruction's memory
+    /// operands (0 unless a 0x64/0x65 prefix selected FS/GS). Reset each step.
+    seg_base: u64,
+}
+
+/// Low-`size`-bytes mask as a u128 (size 8 -> full 64-bit mask).
+fn mask128(size: u8) -> u128 {
+    if size >= 8 {
+        u64::MAX as u128
+    } else {
+        (1u128 << (size as u32 * 8)) - 1
+    }
+}
+
+/// Sign-extend the low `size` bytes of `v` to i64.
+fn sign_ext(v: u64, size: u8) -> i64 {
+    match size {
+        1 => v as u8 as i8 as i64,
+        2 => v as u16 as i16 as i64,
+        4 => v as u32 as i32 as i64,
+        _ => v as i64,
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -52,6 +90,12 @@ pub enum StepResult {
     /// the registers (per our ABI: `eax` = service number, args in the integer
     /// regs), services it against the kernel, and resumes by calling `step`.
     Syscall,
+    /// Called an imported function (the IAT slot held an import trap address).
+    /// `index` is the import's IAT-order index (map it to a name via the PE
+    /// import table). The return address is already on the stack; the caller
+    /// services the import, sets the return value in `rax`, and resumes — the
+    /// interpreter then executes the pending `ret`.
+    Import { index: u32 },
     Unknown { rip: u64, byte: u8 },
     /// Out-of-bounds memory access at `addr` — the program faulted.
     Fault { addr: u64 },
@@ -66,7 +110,7 @@ enum Rm {
 
 impl Default for Cpu {
     fn default() -> Self {
-        Cpu { regs: [0; 16], rip: 0, rflags: 0 }
+        Cpu { regs: [0; 16], rip: 0, rflags: 0, gs_base: 0, fs_base: 0, seg_base: 0 }
     }
 }
 
@@ -234,7 +278,8 @@ impl Cpu {
             pc += 4;
             addr = addr.wrapping_add(d as u64);
         }
-        (reg, Rm::Mem(addr), pc)
+        // Apply an active FS/GS segment base (0 when no override prefix).
+        (reg, Rm::Mem(addr.wrapping_add(self.seg_base)), pc)
     }
 
     fn push64(&mut self, mem: &mut [u8], val: u64) -> bool {
@@ -249,6 +294,11 @@ impl Cpu {
 
     /// Decode and execute one instruction.
     pub fn step(&mut self, mem: &mut [u8]) -> StepResult {
+        // An import trap address (bound into IAT slots by the loader) isn't real
+        // code — surface it so the host can service the imported function.
+        if self.rip >= IMPORT_BASE && self.rip < IMPORT_BASE + IMPORT_MAX * 8 {
+            return StepResult::Import { index: ((self.rip - IMPORT_BASE) / 8) as u32 };
+        }
         let start = self.rip;
         let mut pc = self.rip as usize;
         let fetch = |i: usize| -> u8 { *mem.get(i).unwrap_or(&0) };
@@ -260,6 +310,21 @@ impl Cpu {
             v as i32 as i64
         };
 
+        // Legacy prefixes (segment override sets the operand segment base; the
+        // rest are consumed — size/rep semantics handled per-opcode as needed).
+        self.seg_base = 0;
+        let mut opsize16 = false;
+        loop {
+            match fetch(pc) {
+                0x65 => self.seg_base = self.gs_base,
+                0x64 => self.seg_base = self.fs_base,
+                0x66 => opsize16 = true,
+                0x67 | 0xf0 | 0xf2 | 0xf3 | 0x2e | 0x36 | 0x3e | 0x26 => {}
+                _ => break,
+            }
+            pc += 1;
+        }
+        // REX prefix (must immediately precede the opcode).
         let mut rex_w = false;
         let (mut rex_r, mut rex_x, mut rex_b) = (false, false, false);
         let mut b = fetch(pc);
@@ -271,55 +336,90 @@ impl Cpu {
             pc += 1;
             b = fetch(pc);
         }
-        let size: u8 = if rex_w { 8 } else { 4 };
+        let size: u8 = if rex_w {
+            8
+        } else if opsize16 {
+            2
+        } else {
+            4
+        };
 
         match b {
-            // ALU/MOV with ModRM: 0x01 add, 0x29 sub, 0x31 xor, 0x39 cmp,
-            // 0x89 mov  — all "r/m, reg". 0x03/0x2B/0x8B/0x3B are "reg, r/m".
-            0x01 | 0x29 | 0x31 | 0x39 | 0x89 | 0x03 | 0x2b | 0x3b | 0x8b => {
-                let op = b;
+            // two-operand integer ALU with ModRM: add/or/adc/sbb/and/sub/xor/cmp.
+            // Opcode bits encode op = (opcode>>3)&7 and direction = opcode&2
+            // (0 => r/m,reg ; 2 => reg,r/m). Covers x1 (r/m,r) and x3 (r,r/m) of
+            // each group. `mov` (0x88..0x8B) is handled separately below.
+            0x01 | 0x03 | 0x09 | 0x0b | 0x11 | 0x13 | 0x19 | 0x1b | 0x21 | 0x23 | 0x29 | 0x2b
+            | 0x31 | 0x33 | 0x39 | 0x3b => {
+                let sel = (b >> 3) & 7;
+                let to_reg = b & 2 != 0;
                 pc += 1;
                 let (reg, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
                 pc = npc;
-                let to_reg = matches!(op, 0x03 | 0x2b | 0x3b | 0x8b);
                 let rmv = match self.read_rm(mem, rm, size) {
                     Some(v) => v,
                     None => return self.fault(rm),
                 };
                 let regv = if size == 4 { self.regs[reg] & 0xFFFF_FFFF } else { self.regs[reg] };
                 let (a, src) = if to_reg { (regv, rmv) } else { (rmv, regv) };
-                let res = match op {
-                    0x89 | 0x8b => src,                    // mov
-                    0x01 | 0x03 => a.wrapping_add(src),    // add
-                    0x29 | 0x2b => a.wrapping_sub(src),    // sub
-                    0x31 => a ^ src,                       // xor
-                    0x39 | 0x3b => a.wrapping_sub(src),    // cmp (result discarded)
-                    _ => unreachable!(),
-                };
-                match op {
-                    0x01 | 0x03 => {
-                        self.set_flag(CF, a.checked_add(src).is_none() || a.wrapping_add(src) < a);
-                        self.set_flag(OF, ((a ^ res) & (src ^ res)) >> 63 & 1 == 1);
-                        self.set_zsp(res, size);
+                let (res, writeback) = self.apply_alu(sel as u8, a, src, size);
+                if writeback {
+                    let ok = if to_reg {
+                        self.write_rm(mem, Rm::Reg(reg), res, size)
+                    } else {
+                        self.write_rm(mem, rm, res, size)
+                    };
+                    if !ok {
+                        return self.fault(rm);
                     }
-                    0x29 | 0x2b | 0x39 | 0x3b => {
-                        self.set_flag(CF, a < src);
-                        self.set_flag(OF, ((a ^ src) & (a ^ res)) >> 63 & 1 == 1);
-                        self.set_zsp(res, size);
-                    }
-                    0x31 => {
-                        self.set_flag(CF, false);
-                        self.set_flag(OF, false);
-                        self.set_zsp(res, size);
-                    }
-                    _ => {}
                 }
-                let ok = if op == 0x39 || op == 0x3b {
-                    true // cmp: flags only
-                } else if to_reg {
-                    self.write_rm(mem, Rm::Reg(reg), res, size)
+                self.rip = pc as u64;
+                StepResult::Ok
+            }
+            // xchg r/m, reg (0x87): swap the two operands (no flags).
+            0x87 => {
+                pc += 1;
+                let (reg, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                pc = npc;
+                let rmv = match self.read_rm(mem, rm, size) {
+                    Some(v) => v,
+                    None => return self.fault(rm),
+                };
+                let regv = if size == 4 { self.regs[reg] & 0xFFFF_FFFF } else { self.regs[reg] };
+                if !self.write_rm(mem, rm, regv, size) {
+                    return self.fault(rm);
+                }
+                self.regs[reg] = if size == 4 { rmv & 0xFFFF_FFFF } else { rmv };
+                self.rip = pc as u64;
+                StepResult::Ok
+            }
+            // movsxd r64, r/m32 (0x63): sign-extend a 32-bit source to 64 bits.
+            0x63 => {
+                pc += 1;
+                let (reg, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                pc = npc;
+                let v = match self.read_rm(mem, rm, 4) {
+                    Some(v) => v as u32 as i32 as i64 as u64,
+                    None => return self.fault(rm),
+                };
+                self.regs[reg] = if rex_w { v } else { v & 0xFFFF_FFFF };
+                self.rip = pc as u64;
+                StepResult::Ok
+            }
+            // mov r/m,reg (0x89) and mov reg,r/m (0x8B).
+            0x89 | 0x8b => {
+                let to_reg = b == 0x8b;
+                pc += 1;
+                let (reg, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                pc = npc;
+                let ok = if to_reg {
+                    match self.read_rm(mem, rm, size) {
+                        Some(v) => self.write_rm(mem, Rm::Reg(reg), v, size),
+                        None => return self.fault(rm),
+                    }
                 } else {
-                    self.write_rm(mem, rm, res, size)
+                    let v = if size == 4 { self.regs[reg] & 0xFFFF_FFFF } else { self.regs[reg] };
+                    self.write_rm(mem, rm, v, size)
                 };
                 if !ok {
                     return self.fault(rm);
@@ -473,6 +573,205 @@ impl Cpu {
                 self.rip = (pc + 1) as u64; // nop
                 StepResult::Ok
             }
+            // unary group 3 (0xF7 /digit): test imm / not / neg / mul / imul /
+            // div / idiv on r/m (mul-family use rdx:rax).
+            0xf7 => {
+                pc += 1;
+                let (sub, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                pc = npc;
+                let a = match self.read_rm(mem, rm, size) {
+                    Some(v) => v,
+                    None => return self.fault(rm),
+                };
+                match sub & 7 {
+                    0 | 1 => {
+                        // test r/m, imm32 (sign-extended)
+                        let imm = imm32(pc) as u64;
+                        pc += 4;
+                        self.apply_alu(4, a, imm, size); // AND -> flags only
+                    }
+                    2 => {
+                        // not (no flags)
+                        let res = !a & if size == 4 { 0xFFFF_FFFF } else { u64::MAX };
+                        if !self.write_rm(mem, rm, res, size) {
+                            return self.fault(rm);
+                        }
+                    }
+                    3 => {
+                        // neg = 0 - a
+                        let (res, _) = self.apply_alu(5, 0, a, size);
+                        if !self.write_rm(mem, rm, res, size) {
+                            return self.fault(rm);
+                        }
+                    }
+                    4 | 5 => {
+                        // mul/imul: rdx:rax = rax * r/m
+                        let prod: u128 = if sub & 7 == 4 {
+                            (self.regs[RAX] as u128 & mask128(size)) * (a as u128 & mask128(size))
+                        } else {
+                            let x = sign_ext(self.regs[RAX], size) as i128;
+                            let y = sign_ext(a, size) as i128;
+                            (x * y) as u128
+                        };
+                        if size == 4 {
+                            self.regs[RAX] = (prod as u64) & 0xFFFF_FFFF;
+                            self.regs[RDX] = (prod >> 32) as u64 & 0xFFFF_FFFF;
+                        } else {
+                            self.regs[RAX] = prod as u64;
+                            self.regs[RDX] = (prod >> 64) as u64;
+                        }
+                    }
+                    6 | 7 => {
+                        // div/idiv: (rdx:rax) / r/m
+                        if a == 0 {
+                            return StepResult::Fault { addr: 0 }; // #DE
+                        }
+                        if sub & 7 == 6 {
+                            let num: u128 = if size == 4 {
+                                ((self.regs[RDX] & 0xFFFF_FFFF) << 32 | (self.regs[RAX] & 0xFFFF_FFFF))
+                                    as u128
+                            } else {
+                                ((self.regs[RDX] as u128) << 64) | self.regs[RAX] as u128
+                            };
+                            let d = (a & if size == 4 { 0xFFFF_FFFF } else { u64::MAX }) as u128;
+                            let q = num / d;
+                            let r = num % d;
+                            self.regs[RAX] = q as u64 & if size == 4 { 0xFFFF_FFFF } else { u64::MAX };
+                            self.regs[RDX] = r as u64 & if size == 4 { 0xFFFF_FFFF } else { u64::MAX };
+                        } else {
+                            let num: i128 = if size == 4 {
+                                (((self.regs[RDX] & 0xFFFF_FFFF) << 32
+                                    | (self.regs[RAX] & 0xFFFF_FFFF)) as i64)
+                                    as i128
+                            } else {
+                                (((self.regs[RDX] as i128) << 64) | self.regs[RAX] as i128) as i128
+                            };
+                            let d = sign_ext(a, size) as i128;
+                            self.regs[RAX] = (num / d) as u64 & if size == 4 { 0xFFFF_FFFF } else { u64::MAX };
+                            self.regs[RDX] = (num % d) as u64 & if size == 4 { 0xFFFF_FFFF } else { u64::MAX };
+                        }
+                    }
+                    _ => return StepResult::Unknown { rip: start, byte: 0xf7 },
+                }
+                self.rip = pc as u64;
+                StepResult::Ok
+            }
+            // shift/rotate group: 0xC1 r/m,imm8 ; 0xD1 r/m,1 ; 0xD3 r/m,CL.
+            // ModRM.reg selects: /0 rol /1 ror /4 shl /5 shr /7 sar.
+            0xc1 | 0xd1 | 0xd3 => {
+                pc += 1;
+                let (sel, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                pc = npc;
+                let raw_count = match b {
+                    0xc1 => {
+                        let c = fetch(pc);
+                        pc += 1;
+                        c as u32
+                    }
+                    0xd1 => 1,
+                    _ => (self.regs[RCX] & 0xff) as u32, // 0xD3: count = CL
+                };
+                let bits = size as u32 * 8;
+                let count = raw_count & (if size == 8 { 63 } else { 31 });
+                let a = match self.read_rm(mem, rm, size) {
+                    Some(v) => v,
+                    None => return self.fault(rm),
+                };
+                let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+                let av = a & mask;
+                let res = if count == 0 {
+                    av
+                } else {
+                    match sel & 7 {
+                        4 => {
+                            // shl
+                            self.set_flag(CF, (av >> (bits - count)) & 1 == 1);
+                            (av << count) & mask
+                        }
+                        5 => {
+                            // shr (logical)
+                            self.set_flag(CF, (av >> (count - 1)) & 1 == 1);
+                            av >> count
+                        }
+                        7 => {
+                            // sar (arithmetic)
+                            self.set_flag(CF, (av >> (count - 1)) & 1 == 1);
+                            let sign = (av >> (bits - 1)) & 1 == 1;
+                            let mut r = av >> count;
+                            if sign {
+                                r |= mask & !(mask >> count);
+                            }
+                            r
+                        }
+                        0 => ((av << count) | (av >> (bits - count))) & mask, // rol
+                        1 => ((av >> count) | (av << (bits - count))) & mask, // ror
+                        _ => return StepResult::Unknown { rip: start, byte: b },
+                    }
+                };
+                if matches!(sel & 7, 4 | 5 | 7) {
+                    self.set_zsp(res, size);
+                }
+                if !self.write_rm(mem, rm, res, size) {
+                    return self.fault(rm);
+                }
+                self.rip = pc as u64;
+                StepResult::Ok
+            }
+            // group 5 (0xFF /digit): inc, dec, call, jmp, push of r/m.
+            0xff => {
+                pc += 1;
+                let (sub, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                pc = npc;
+                match sub & 7 {
+                    0 | 1 => {
+                        // inc / dec — affect ZF/SF/OF/PF but not CF.
+                        let v = match self.read_rm(mem, rm, size) {
+                            Some(v) => v,
+                            None => return self.fault(rm),
+                        };
+                        let res = if sub & 7 == 0 { v.wrapping_add(1) } else { v.wrapping_sub(1) };
+                        self.set_zsp(res, size);
+                        if !self.write_rm(mem, rm, res, size) {
+                            return self.fault(rm);
+                        }
+                        self.rip = pc as u64;
+                        StepResult::Ok
+                    }
+                    2 => {
+                        // call r/m64 — push return address, jump indirectly.
+                        let target = match self.read_rm(mem, rm, 8) {
+                            Some(v) => v,
+                            None => return self.fault(rm),
+                        };
+                        if !self.push64(mem, pc as u64) {
+                            return StepResult::Fault { addr: self.regs[RSP] };
+                        }
+                        self.rip = target;
+                        StepResult::Ok
+                    }
+                    4 => {
+                        // jmp r/m64
+                        match self.read_rm(mem, rm, 8) {
+                            Some(t) => self.rip = t,
+                            None => return self.fault(rm),
+                        }
+                        StepResult::Ok
+                    }
+                    6 => {
+                        // push r/m64
+                        let v = match self.read_rm(mem, rm, 8) {
+                            Some(v) => v,
+                            None => return self.fault(rm),
+                        };
+                        if !self.push64(mem, v) {
+                            return StepResult::Fault { addr: self.regs[RSP] };
+                        }
+                        self.rip = pc as u64;
+                        StepResult::Ok
+                    }
+                    _ => StepResult::Unknown { rip: start, byte: 0xff },
+                }
+            }
             // two-byte opcodes (0x0F ...)
             0x0f => {
                 let b2 = fetch(pc + 1);
@@ -483,12 +782,52 @@ impl Cpu {
                         self.rip = (pc + 2) as u64;
                         StepResult::Syscall
                     }
+                    // cmpxchg r/m, reg (0F B1): compare RAX with r/m; if equal,
+                    // store reg into r/m and set ZF; else load r/m into RAX.
+                    0xb1 => {
+                        pc += 2;
+                        let (reg, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                        pc = npc;
+                        let dst = match self.read_rm(mem, rm, size) {
+                            Some(v) => v,
+                            None => return self.fault(rm),
+                        };
+                        let acc = if size == 4 { self.regs[RAX] & 0xFFFF_FFFF } else { self.regs[RAX] };
+                        self.apply_alu(7, acc, dst, size); // cmp -> flags incl. ZF
+                        if acc == dst {
+                            let src = if size == 4 { self.regs[reg] & 0xFFFF_FFFF } else { self.regs[reg] };
+                            if !self.write_rm(mem, rm, src, size) {
+                                return self.fault(rm);
+                            }
+                        } else {
+                            self.regs[RAX] = dst;
+                        }
+                        self.rip = pc as u64;
+                        StepResult::Ok
+                    }
                     // jcc rel32 (near conditional jump): 0F 80..0F 8F.
                     0x80..=0x8f => {
                         let take = self.cond(b2 & 0x0f);
                         let rel = imm32(pc + 2);
                         let next = (pc as u64 + 6).wrapping_add(if take { rel as u64 } else { 0 });
                         self.rip = next;
+                        StepResult::Ok
+                    }
+                    // setcc r/m8 (0F 90..0F 9F): set the byte to 0/1 by condition.
+                    0x90..=0x9f => {
+                        let val = if self.cond(b2 & 0x0f) { 1u64 } else { 0 };
+                        pc += 2;
+                        let (_, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                        pc = npc;
+                        match rm {
+                            Rm::Reg(r) => self.regs[r] = (self.regs[r] & !0xff) | val,
+                            Rm::Mem(a) => {
+                                if !Self::store(mem, a, val, 1) {
+                                    return StepResult::Fault { addr: a };
+                                }
+                            }
+                        }
+                        self.rip = pc as u64;
                         StepResult::Ok
                     }
                     // movzx/movsx reg, r/m8 (B6/BE) and r/m16 (B7/BF).
@@ -528,18 +867,27 @@ impl Cpu {
         }
     }
 
-    /// Evaluate a condition code (low nibble of a 0x7x jcc opcode).
+    /// Evaluate an x86 condition code (low nibble of a jcc/setcc/cmovcc opcode).
     fn cond(&self, cc: u8) -> bool {
-        match cc {
-            0x4 => self.flag(ZF),                          // je/jz
-            0x5 => !self.flag(ZF),                         // jne/jnz
-            0xc => self.flag(SF) != self.flag(OF),         // jl
-            0xd => self.flag(SF) == self.flag(OF),         // jge
-            0xe => self.flag(ZF) || (self.flag(SF) != self.flag(OF)), // jle
-            0xf => !self.flag(ZF) && (self.flag(SF) == self.flag(OF)), // jg
-            0x2 => self.flag(CF),                          // jb
-            0x3 => !self.flag(CF),                         // jae
-            _ => false,
+        let (cf, zf, sf, of, pf) =
+            (self.flag(CF), self.flag(ZF), self.flag(SF), self.flag(OF), self.flag(PF));
+        match cc & 0x0f {
+            0x0 => of,                 // o
+            0x1 => !of,                // no
+            0x2 => cf,                 // b/c
+            0x3 => !cf,                // ae/nc
+            0x4 => zf,                 // e/z
+            0x5 => !zf,                // ne/nz
+            0x6 => cf || zf,           // be
+            0x7 => !cf && !zf,         // a
+            0x8 => sf,                 // s
+            0x9 => !sf,                // ns
+            0xa => pf,                 // p
+            0xb => !pf,                // np
+            0xc => sf != of,           // l
+            0xd => sf == of,           // ge
+            0xe => zf || (sf != of),   // le
+            _ => !zf && (sf == of),    // g (0xf)
         }
     }
 
