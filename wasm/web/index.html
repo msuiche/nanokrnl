@@ -90,7 +90,7 @@ async function boot() {
       host_run(ptr, len) { return runGuest(dec.decode(new Uint8Array(memory.buffer, ptr, len))); },
     },
   };
-  const resp = await fetch("ntoskrnl_wasm.wasm");
+  const resp = await fetch("nanokrnl.wasm");
   ({ instance } = await WebAssembly.instantiateStreaming(resp, imports));
   memory = instance.exports.memory;
   instance.exports.kernel_main(); // boot + first prompt

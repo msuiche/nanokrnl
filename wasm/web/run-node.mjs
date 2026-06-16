@@ -5,7 +5,7 @@
 import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
-const bytes = readFileSync(new URL("./ntoskrnl_wasm.wasm", import.meta.url));
+const bytes = readFileSync(new URL("./nanokrnl.wasm", import.meta.url));
 let memory;
 // Run a guest program: instantiate <name>.wasm synchronously and bridge its
 // `sys_print` syscall to the console. Returns its exit code, or -1 if missing.
