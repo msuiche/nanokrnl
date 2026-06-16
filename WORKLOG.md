@@ -81,11 +81,11 @@ Working today: interactive `cmd.exe`, `echo`, `exit`, `dir`, `where`, `sort`,
 `choice`, **`whoami`** (prints `nanokrnl\user`), real `null.sys` driver. Default
 self-test suite passes (exit 33).
 
-`more.com` (ulib/C++): now runs through ulib init (its `DllMain` is invoked via a
-per-process trampoline) and reaches the file-display stage; remaining gaps are
-`CreateFileMappingW`/`MapViewOfFile` (it memory-maps the file to read) and
+`more.com` (ulib/C++): **working** — `more readme.txt` prints the file. Required
+running ulib's `DllMain` (per-process trampoline), a batch of CRT/console
+functions, and finally file mapping (`CreateFileMappingW`/`MapViewOfFile`) +
 `RtlIsTextUnicode`. Commits: 4657bab (per-process command line), 7cc5960 (ulib
-DllMain + CRT/console surface).
+DllMain + CRT/console surface), 47047aa (file mapping + RtlIsTextUnicode).
 
 ## Log
 
