@@ -467,6 +467,47 @@ pub unsafe extern "C" fn strcpy_s(dst: *mut u8, dstsz: usize, src: *const u8) ->
     }
 }
 
+/// `strlen(s)` — length of a NUL-terminated byte string.
+#[no_mangle]
+pub unsafe extern "C" fn strlen(s: *const u8) -> usize {
+    if s.is_null() {
+        return 0;
+    }
+    let mut n = 0;
+    while *s.add(n) != 0 {
+        n += 1;
+    }
+    n
+}
+
+/// `_ultow(value, buf, radix)` — format an unsigned long into `buf` as a wide
+/// string in base `radix` (2..=36), returning `buf`. Used by tools like whoami
+/// to render SID sub-authorities.
+#[no_mangle]
+pub unsafe extern "C" fn _ultow(mut value: u32, buf: *mut u16, radix: i32) -> *mut u16 {
+    if buf.is_null() || !(2..=36).contains(&radix) {
+        return buf;
+    }
+    let radix = radix as u32;
+    // Emit digits least-significant first into a temporary, then reverse.
+    let mut tmp = [0u8; 32];
+    let mut n = 0;
+    loop {
+        let d = (value % radix) as u8;
+        tmp[n] = if d < 10 { b'0' + d } else { b'a' + (d - 10) };
+        n += 1;
+        value /= radix;
+        if value == 0 {
+            break;
+        }
+    }
+    for i in 0..n {
+        *buf.add(i) = tmp[n - 1 - i] as u16;
+    }
+    *buf.add(n) = 0;
+    buf
+}
+
 // ---------------------------------------------------------------------------
 // Locale-aware compares — "C" locale: plain byte/word ordering with ASCII
 // case folding for the case-insensitive variants.

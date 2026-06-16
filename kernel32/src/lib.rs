@@ -1032,6 +1032,294 @@ pub extern "C" fn GetCurrentProcess() -> u64 {
     u64::MAX // (HANDLE)-1
 }
 
+// ---------------------------------------------------------------------------
+// Security tokens / SIDs (advapi32 surface). We have no real security model,
+// so we present a single fabricated interactive user — `NANOKRNL\User`,
+// SID S-1-5-21-1-2-3-1000 — consistently across the token and SID APIs. Enough
+// for a tool like `whoami` to query "who am I" and print it.
+// ---------------------------------------------------------------------------
+
+/// `TOKEN_USER` / `TOKEN_GROUPS` information classes.
+const TOKEN_USER: u32 = 1;
+const TOKEN_GROUPS: u32 = 2;
+/// `SidTypeUser`.
+const SID_TYPE_USER: u32 = 1;
+/// Opaque value `OpenProcessToken` hands back; we never dereference it.
+const FAKE_TOKEN: u64 = 0x4242;
+
+/// The fabricated current-user SID, `S-1-5-21-1-2-3-1000`, in binary SID form:
+/// Revision(1), SubAuthorityCount(5), IdentifierAuthority(NT=5), then the five
+/// 32-bit sub-authorities (21, 1, 2, 3, 1000) little-endian.
+static USER_SID: [u8; 28] = [
+    1, 5, // Revision, SubAuthorityCount
+    0, 0, 0, 0, 0, 5, // IdentifierAuthority = SECURITY_NT_AUTHORITY
+    21, 0, 0, 0, // SubAuthority[0]
+    1, 0, 0, 0, // [1]
+    2, 0, 0, 0, // [2]
+    3, 0, 0, 0, // [3]
+    0xE8, 3, 0, 0, // [4] = 1000 (RID)
+];
+
+/// `OpenProcessToken(ProcessHandle, DesiredAccess, TokenHandle)` — hand back an
+/// opaque token for the (single) current user.
+#[no_mangle]
+pub unsafe extern "C" fn OpenProcessToken(_process: u64, _access: u32, token: *mut u64) -> i32 {
+    if token.is_null() {
+        return 0;
+    }
+    *token = FAKE_TOKEN;
+    1
+}
+
+/// `OpenThreadToken(...)` — no per-thread impersonation; fail so callers fall
+/// back to the process token.
+#[no_mangle]
+pub unsafe extern "C" fn OpenThreadToken(
+    _thread: u64,
+    _access: u32,
+    _self: i32,
+    _token: *mut u64,
+) -> i32 {
+    SetLastError(1008); // ERROR_NO_TOKEN
+    0
+}
+
+/// `GetTokenInformation(TokenHandle, Class, Info, Length, ReturnLength)` — only
+/// `TokenUser` is modeled: a `TOKEN_USER { SID_AND_ATTRIBUTES { PSID; DWORD } }`
+/// whose SID points at our fabricated [`USER_SID`].
+#[no_mangle]
+pub unsafe extern "C" fn GetTokenInformation(
+    _token: u64,
+    class: u32,
+    info: *mut u8,
+    length: u32,
+    return_length: *mut u32,
+) -> i32 {
+    // TokenUser: TOKEN_USER { SID_AND_ATTRIBUTES { PSID; DWORD } } (16 bytes).
+    // TokenGroups: TOKEN_GROUPS { DWORD GroupCount; SID_AND_ATTRIBUTES[] } — we
+    // report no groups (GroupCount 0), enough for "whoami" with no /groups.
+    let need = match class {
+        TOKEN_USER => 16u32,
+        TOKEN_GROUPS => 8u32,
+        _ => {
+            SetLastError(87); // ERROR_INVALID_PARAMETER
+            return 0;
+        }
+    };
+    if !return_length.is_null() {
+        *return_length = need;
+    }
+    if info.is_null() || length < need {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    match class {
+        TOKEN_USER => {
+            *(info as *mut u64) = (&raw const USER_SID) as u64; // User.Sid
+            *(info.add(8) as *mut u32) = 0; // User.Attributes
+        }
+        _ => {
+            *(info as *mut u32) = 0; // GroupCount = 0
+        }
+    }
+    1
+}
+
+/// `GetLengthSid(Sid)` — total bytes: header (8) + 4 per sub-authority.
+#[no_mangle]
+pub unsafe extern "C" fn GetLengthSid(sid: *const u8) -> u32 {
+    if sid.is_null() {
+        return 0;
+    }
+    8 + (*sid.add(1) as u32) * 4
+}
+
+/// `IsValidSid(Sid)` — revision 1 and a sane sub-authority count.
+#[no_mangle]
+pub unsafe extern "C" fn IsValidSid(sid: *const u8) -> i32 {
+    if sid.is_null() || *sid != 1 || *sid.add(1) > 15 {
+        return 0;
+    }
+    1
+}
+
+/// `CopySid(DestLen, Dest, Src)`.
+#[no_mangle]
+pub unsafe extern "C" fn CopySid(dest_len: u32, dest: *mut u8, src: *const u8) -> i32 {
+    if dest.is_null() || src.is_null() {
+        return 0;
+    }
+    let n = GetLengthSid(src);
+    if dest_len < n {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    core::ptr::copy_nonoverlapping(src, dest, n as usize);
+    1
+}
+
+/// `GetSidSubAuthority(Sid, Index)` — pointer to the index-th sub-authority.
+#[no_mangle]
+pub unsafe extern "C" fn GetSidSubAuthority(sid: *mut u8, index: u32) -> *mut u32 {
+    sid.add(8 + index as usize * 4) as *mut u32
+}
+
+/// `GetSidSubAuthorityCount(Sid)` — pointer to the count byte.
+#[no_mangle]
+pub unsafe extern "C" fn GetSidSubAuthorityCount(sid: *mut u8) -> *mut u8 {
+    sid.add(1)
+}
+
+/// `GetSidIdentifierAuthority(Sid)` — pointer to the 6-byte authority.
+#[no_mangle]
+pub unsafe extern "C" fn GetSidIdentifierAuthority(sid: *mut u8) -> *mut u8 {
+    sid.add(2)
+}
+
+/// `EqualSid(Sid1, Sid2)` — byte-equal over their (equal) lengths.
+#[no_mangle]
+pub unsafe extern "C" fn EqualSid(s1: *const u8, s2: *const u8) -> i32 {
+    if s1.is_null() || s2.is_null() {
+        return 0;
+    }
+    let n = GetLengthSid(s1);
+    if n != GetLengthSid(s2) {
+        return 0;
+    }
+    for i in 0..n as usize {
+        if *s1.add(i) != *s2.add(i) {
+            return 0;
+        }
+    }
+    1
+}
+
+/// `InitializeSid(Sid, IdentifierAuthority, SubAuthorityCount)`.
+#[no_mangle]
+pub unsafe extern "C" fn InitializeSid(sid: *mut u8, authority: *const u8, count: u8) -> i32 {
+    if sid.is_null() {
+        return 0;
+    }
+    *sid = 1; // Revision
+    *sid.add(1) = count;
+    if !authority.is_null() {
+        for i in 0..6 {
+            *sid.add(2 + i) = *authority.add(i);
+        }
+    }
+    1
+}
+
+/// `LookupAccountSidW(System, Sid, Name, cchName, Domain, cchDomain, Use)` — map
+/// any SID to our single user `NANOKRNL\User`. `cch*` are in/out char counts:
+/// on a too-small buffer we set the required size (incl. NUL) and fail with
+/// ERROR_INSUFFICIENT_BUFFER; on success we set the count excluding the NUL.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn LookupAccountSidW(
+    _system: *const u16,
+    _sid: *const u8,
+    name: *mut u16,
+    cch_name: *mut u32,
+    domain: *mut u16,
+    cch_domain: *mut u32,
+    use_: *mut u32,
+) -> i32 {    let name_str = b"User";
+    let dom_str = b"NANOKRNL";
+    let need_name = name_str.len() as u32 + 1;
+    let need_dom = dom_str.len() as u32 + 1;
+    let name_fits = !cch_name.is_null() && !name.is_null() && *cch_name >= need_name;
+    let dom_fits = !cch_domain.is_null() && !domain.is_null() && *cch_domain >= need_dom;
+    if !name_fits || !dom_fits {
+        if !cch_name.is_null() {
+            *cch_name = need_name;
+        }
+        if !cch_domain.is_null() {
+            *cch_domain = need_dom;
+        }
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    for (i, &c) in name_str.iter().enumerate() {
+        *name.add(i) = c as u16;
+    }
+    *name.add(name_str.len()) = 0;
+    for (i, &c) in dom_str.iter().enumerate() {
+        *domain.add(i) = c as u16;
+    }
+    *domain.add(dom_str.len()) = 0;
+    *cch_name = name_str.len() as u32;
+    *cch_domain = dom_str.len() as u32;
+    if !use_.is_null() {
+        *use_ = SID_TYPE_USER;
+    }
+    1
+}
+
+/// `GetUserNameExW(NameFormat, lpNameBuffer, nSize)` — the secur32 entry that
+/// `whoami` (no args) calls to get the current user. We return our single
+/// fabricated identity. For `NameSamCompatible` (2) that's `NANOKRNL\User`;
+/// any other format gets the bare `User`. `nSize` is an in/out char count: on a
+/// too-small buffer we set the required size (incl. NUL) and fail with
+/// ERROR_MORE_DATA, as the real API does.
+#[no_mangle]
+pub unsafe extern "C" fn GetUserNameExW(format: u32, buffer: *mut u16, size: *mut u32) -> i32 {    if size.is_null() {
+        return 0;
+    }
+    let s: &[u8] = if format == 2 { b"NANOKRNL\\User" } else { b"User" };
+    let need = s.len() as u32 + 1;
+    if buffer.is_null() || *size < need {
+        *size = need;
+        SetLastError(234); // ERROR_MORE_DATA
+        return 0;
+    }
+    for (i, &c) in s.iter().enumerate() {
+        *buffer.add(i) = c as u16;
+    }
+    *buffer.add(s.len()) = 0;
+    *size = s.len() as u32;
+    1
+}
+
+/// `GetUserNameW(lpBuffer, pcbBuffer)` — the bare user name (`User`). `pcbBuffer`
+/// is an in/out char count (includes the NUL, per this API).
+#[no_mangle]
+pub unsafe extern "C" fn GetUserNameW(buffer: *mut u16, size: *mut u32) -> i32 {
+    if size.is_null() {
+        return 0;
+    }
+    let s = b"User";
+    let need = s.len() as u32 + 1;
+    if buffer.is_null() || *size < need {
+        *size = need;
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    for (i, &c) in s.iter().enumerate() {
+        *buffer.add(i) = c as u16;
+    }
+    *buffer.add(s.len()) = 0;
+    *size = need; // includes the NUL for GetUserName
+    1
+}
+
+/// `CharLowerW(lpsz)` — lowercase a wide string in place (ASCII fold), or, when
+/// called with a single character packed in the low word (high bits zero),
+/// return that character lowercased.
+#[no_mangle]
+pub unsafe extern "C" fn CharLowerW(s: *mut u16) -> *mut u16 {
+    let lower = |c: u16| if (b'A' as u16..=b'Z' as u16).contains(&c) { c + 32 } else { c };
+    if (s as u64) <= 0xFFFF {
+        return lower(s as u64 as u16) as u64 as *mut u16;
+    }
+    let mut p = s;
+    while *p != 0 {
+        *p = lower(*p);
+        p = p.add(1);
+    }
+    s
+}
+
 /// `GetCurrentThread()` — the thread pseudo-handle, `(HANDLE)-2`.
 #[no_mangle]
 pub extern "C" fn GetCurrentThread() -> u64 {
