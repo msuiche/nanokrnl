@@ -15,7 +15,7 @@
 #![no_std]
 
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 // Phase 1: the kernel's REAL run-time library, compiled into the WASM build
 // unchanged. `rtl` touches no hardware and takes no locks (pure data-structure
@@ -24,7 +24,19 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 #[path = "../../kernel/src/rtl/mod.rs"]
 #[allow(dead_code)] // the full module is included; not every item is exercised yet
 mod rtl;
+use rtl::string::UnicodeString;
 use rtl::NtStatus;
+
+// WASM-side HAL substitutes the kernel's real `ob` compiles against: a
+// single-threaded `SpinLock` (ke) and a pool over a WASM-memory arena (mm). With
+// those in place, the kernel's actual object manager + handle table build for
+// wasm32 unchanged via the `#[path]` include below.
+mod ke;
+mod mm;
+
+#[path = "../../kernel/src/ob/mod.rs"]
+#[allow(dead_code)]
+mod ob;
 
 // --- Host interface (the substituted "hardware") ---------------------------
 // The JS host supplies these; `memory` (WASM linear memory) is exported so the
@@ -68,67 +80,18 @@ fn print_usize(mut v: usize) {
     print(unsafe { core::str::from_utf8_unchecked(&buf[i..]) });
 }
 
-// --- mm: a bump pool over a static "physical memory" arena -----------------
-// Stands in for mm/phys + ex pool. In the x86 kernel this is real RAM behind
-// page tables; here it's a fixed region of WASM linear memory.
-const ARENA_SIZE: usize = 1 << 20; // 1 MiB
-static mut ARENA: [u8; ARENA_SIZE] = [0; ARENA_SIZE];
-static ARENA_BUMP: AtomicUsize = AtomicUsize::new(0);
-
-/// Allocate `n` 16-byte-aligned bytes from the arena; null on exhaustion.
-fn pool_alloc(n: usize) -> *mut u8 {
-    let aligned = (n + 15) & !15;
-    let off = ARENA_BUMP.fetch_add(aligned, Ordering::Relaxed);
-    if off + aligned > ARENA_SIZE {
-        return core::ptr::null_mut();
-    }
-    unsafe { (&raw mut ARENA as *mut u8).add(off) }
+// --- self-test fixtures: a real `ob` object type + its delete procedure -----
+// `ob_dereference_object` must run the type's delete callback on the last ref;
+// this flag lets the self test observe that.
+static DELETED: AtomicBool = AtomicBool::new(false);
+fn null_delete(_body: *mut u8) {
+    DELETED.store(true, Ordering::Relaxed);
 }
-
-fn pool_used() -> usize {
-    ARENA_BUMP.load(Ordering::Relaxed)
-}
-
-// --- ob: a tiny object-manager namespace -----------------------------------
-// Name → opaque token (a real OB would hold an OBJECT_HEADER); enough to show
-// directory insert/lookup, the heart of the object manager.
-const OB_MAX: usize = 32;
-const OB_NAME_MAX: usize = 64;
-struct ObNamespace {
-    names: [[u8; OB_NAME_MAX]; OB_MAX],
-    name_len: [usize; OB_MAX],
-    tokens: [u64; OB_MAX],
-    count: usize,
-}
-static mut OB: ObNamespace = ObNamespace {
-    names: [[0; OB_NAME_MAX]; OB_MAX],
-    name_len: [0; OB_MAX],
-    tokens: [0; OB_MAX],
-    count: 0,
+static NULL_TYPE_NAME: [u16; 4] = [b'N' as u16, b'u' as u16, b'l' as u16, b'l' as u16];
+static NULL_TYPE: ob::ObjectType = ob::ObjectType {
+    name: UnicodeString::from_units(&NULL_TYPE_NAME),
+    delete: Some(null_delete),
 };
-
-fn ob_insert(name: &str, token: u64) -> NtStatus {
-    let ob = unsafe { &mut *(&raw mut OB) };
-    if ob.count >= OB_MAX || name.len() > OB_NAME_MAX {
-        return NtStatus::INSUFFICIENT_RESOURCES;
-    }
-    let i = ob.count;
-    ob.names[i][..name.len()].copy_from_slice(name.as_bytes());
-    ob.name_len[i] = name.len();
-    ob.tokens[i] = token;
-    ob.count += 1;
-    NtStatus::SUCCESS
-}
-
-fn ob_lookup(name: &str) -> Result<u64, NtStatus> {
-    let ob = unsafe { &*(&raw const OB) };
-    for i in 0..ob.count {
-        if ob.name_len[i] == name.len() && &ob.names[i][..name.len()] == name.as_bytes() {
-            return Ok(ob.tokens[i]);
-        }
-    }
-    Err(NtStatus::OBJECT_NAME_NOT_FOUND)
-}
 
 // --- self tests ------------------------------------------------------------
 fn check(name: &str, ok: bool) -> bool {
@@ -148,24 +111,49 @@ pub extern "C" fn kernel_main() -> i32 {
 
     let mut all = true;
 
-    // mm: pool allocate three blocks, confirm distinct + arena accounting.
-    let a = pool_alloc(64);
-    let b = pool_alloc(64);
-    let c = pool_alloc(1024);
+    // mm (real pool API over the WASM-memory arena): distinct non-null blocks.
+    let a = mm::pool::pool_alloc(64, 0);
+    let b = mm::pool::pool_alloc(64, 0);
+    let c = mm::pool::pool_alloc(1024, 0);
     all &= check(
         "mm: pool_alloc returns distinct non-null blocks",
         !a.is_null() && !b.is_null() && !c.is_null() && a != b && b != c,
     );
-    all &= check("mm: arena bump accounts the allocations", pool_used() >= 64 + 64 + 1024);
 
-    // ob: insert a couple of device names, look them up, miss on an absent one.
-    let _ = ob_insert("\\Device\\Null", 0x1000);
-    let _ = ob_insert("\\Device\\Console", 0x2000);
-    all &= check("ob: lookup \\Device\\Null", ob_lookup("\\Device\\Null") == Ok(0x1000));
-    all &= check("ob: lookup \\Device\\Console", ob_lookup("\\Device\\Console") == Ok(0x2000));
+    // ob (REAL object manager + handle table): create a typed object, take a
+    // handle (ref +1), resolve it, close it (ref -1), then drop the last ref and
+    // confirm the type's delete procedure ran.
+    let body = ob::ob_create_object(&NULL_TYPE, 0u32);
+    let ok_create = body.is_ok();
+    let bptr = body.unwrap_or(core::ptr::null_mut()) as *mut u8;
+    let rc_initial = if bptr.is_null() { -1 } else { unsafe { ob::ob_ref_count(bptr) } };
     all &= check(
-        "ob: absent name -> OBJECT_NAME_NOT_FOUND",
-        ob_lookup("\\Device\\Nope") == Err(NtStatus::OBJECT_NAME_NOT_FOUND),
+        "ob: ob_create_object returns a referenced object (refcount 1)",
+        ok_create && rc_initial == 1,
+    );
+
+    let h = if bptr.is_null() { 0 } else { ob::handle::ob_create_handle(bptr, 0) };
+    let resolved = ob::handle::ob_reference_object_by_handle(h);
+    all &= check(
+        "ob: ob_create_handle + resolve by handle",
+        h != 0 && resolved == Ok(bptr),
+    );
+    let rc_with_handle = if bptr.is_null() { -1 } else { unsafe { ob::ob_ref_count(bptr) } };
+    all &= check("ob: an open handle holds a reference (refcount 2)", rc_with_handle == 2);
+
+    let closed = ob::handle::ob_close_handle(h);
+    let rc_after_close = if bptr.is_null() { -1 } else { unsafe { ob::ob_ref_count(bptr) } };
+    all &= check(
+        "ob: closing the handle drops its reference (refcount 1)",
+        closed == NtStatus::SUCCESS && rc_after_close == 1,
+    );
+
+    if !bptr.is_null() {
+        unsafe { ob::ob_dereference_object(bptr) };
+    }
+    all &= check(
+        "ob: last dereference runs the type's delete procedure",
+        DELETED.load(Ordering::Relaxed),
     );
 
     // rtl (REAL kernel module): status codes are the documented Windows values
@@ -190,7 +178,7 @@ pub extern "C" fn kernel_main() -> i32 {
     println("");
     if all {
         print("ALL SELF TESTS PASSED — ");
-        print_usize(pool_used());
+        print_usize(mm::pool::pool_used());
         println(" bytes of pool in use; system idle");
         0
     } else {

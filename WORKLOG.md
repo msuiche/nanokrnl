@@ -47,13 +47,18 @@ Hardware (needs substitution behind a HAL boundary; ~16 files use `asm!`/ports):
   (pool), `ob` (namespace insert/lookup), and `rtl` (status) miniatures as self
   tests. **Verified**: boots headless under Node, all self tests pass, returns 0.
   Build: `sh wasm/build.sh`; test: `node wasm/web/run-node.mjs`.
-- [~] **Phase 1 — reuse real kernel modules / HAL boundary.** The kernel's real
-  `rtl` module (status, bitmap, list, string) now compiles into the WASM build
-  unchanged via a `#[path]` include — first actual kernel code (not a stand-in)
-  running in the browser; verified (NtStatus + RtlBitmap self tests pass). Next:
-  bring in `ob`/`cm`/`io/ramfs` (they reference more of `crate::`, so this is
-  where the `hal` cfg/trait seam goes — `#[cfg]`-gate the x86 asm, stub
-  serial→JS / timer→JS / ports→no-op so the kernel crate itself builds for wasm32).
+- [~] **Phase 1 — reuse real kernel modules / HAL boundary.** Real kernel
+  modules now run in WASM via `#[path]` includes, with WASM-side HAL shims for
+  what they depend on:
+  - `rtl` (status, bitmap, list, string) — hardware-free, included as-is.
+  - `ob` (object manager + handle table) — included as-is; its deps are
+    satisfied by `wasm/src/mm/pool.rs` (pool over a static arena) and
+    `wasm/src/ke/spinlock.rs` (single-threaded no-op `SpinLock`). Self tests
+    exercise the real ref-counting, handle create/resolve/close, and the type
+    delete procedure firing on the last dereference. Verified (exit 0).
+  Next: `cm` (registry) and `io/ramfs` — and eventually fold these shims into a
+  real `hal` cfg seam in the kernel crate so it builds for wasm32 directly
+  (`#[cfg]`-gate the x86 asm; serial→JS, timer→JS, ports→no-op).
 - [ ] **Phase 2 — Memory.** Software phys allocator over a large static/linear
   arena; replace `mm/virt` page-table mapping with a flat software model
   (identity or a translation table) so `mm` APIs work without an MMU.
@@ -99,5 +104,9 @@ DllMain + CRT/console surface), 47047aa (file mapping + RtlIsTextUnicode).
 - Phase 1 started: replaced the rtl miniature with the kernel's **real** `rtl`
   module (`#[path]` include of `kernel/src/rtl/mod.rs`) — it's hardware-free, so
   it builds for wasm32 unchanged. WASM self tests now exercise the real
-  `NtStatus` + `RtlBitmap`. Verified (exit 0). Next: `ob`/`ramfs` need the HAL
-  seam (they pull in more of the kernel).
+  `NtStatus` + `RtlBitmap`. Verified (exit 0).
+- Phase 1 cont.: brought in the **real `ob`** (object manager + handle table)
+  too, with the first HAL shims — `mm::pool` (arena) and `ke::spinlock`
+  (single-threaded). The browser kernel now does real reference-counted object
+  lifetimes (create → handle → close → delete procedure). Verified (exit 0).
+  Next: `cm`/`ramfs`.
