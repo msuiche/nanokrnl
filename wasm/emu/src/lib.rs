@@ -95,6 +95,42 @@ impl Cpu {
         self.set_flag(PF, (masked as u8).count_ones() % 2 == 0);
     }
 
+    /// Apply ALU op `sel` (the `/digit` of the 0x80/0x81/0x83 groups, also used
+    /// for the corresponding two-operand opcodes) to `a` op `b`, set flags, and
+    /// return `(result, writeback)`. `writeback` is false for `cmp` (sel 7).
+    /// sel: 0 add, 1 or, 2 adc, 3 sbb, 4 and, 5 sub, 6 xor, 7 cmp.
+    fn apply_alu(&mut self, sel: u8, a: u64, b: u64, size: u8) -> (u64, bool) {
+        let cin = if self.flag(CF) { 1 } else { 0 };
+        let (res, writeback) = match sel {
+            0 => (a.wrapping_add(b), true),                 // add
+            1 => (a | b, true),                             // or
+            2 => (a.wrapping_add(b).wrapping_add(cin), true), // adc
+            3 => (a.wrapping_sub(b).wrapping_sub(cin), true), // sbb
+            4 => (a & b, true),                             // and
+            5 => (a.wrapping_sub(b), true),                 // sub
+            6 => (a ^ b, true),                             // xor
+            7 => (a.wrapping_sub(b), false),                // cmp
+            _ => (a, false),
+        };
+        match sel {
+            0 | 2 => {
+                self.set_flag(CF, res < a || (sel == 2 && res == a && b != 0));
+                self.set_flag(OF, ((a ^ res) & (b ^ res)) >> 63 & 1 == 1);
+            }
+            5 | 7 | 3 => {
+                self.set_flag(CF, a < b.wrapping_add(if sel == 3 { cin } else { 0 }));
+                self.set_flag(OF, ((a ^ b) & (a ^ res)) >> 63 & 1 == 1);
+            }
+            _ => {
+                // logical ops clear CF/OF
+                self.set_flag(CF, false);
+                self.set_flag(OF, false);
+            }
+        }
+        self.set_zsp(res, size);
+        (res, writeback)
+    }
+
     // --- flat little-endian memory ----------------------------------------
     fn load(mem: &[u8], addr: u64, size: u8) -> Option<u64> {
         let a = addr as usize;
@@ -121,7 +157,10 @@ impl Cpu {
     }
     fn read_rm(&self, mem: &[u8], rm: Rm, size: u8) -> Option<u64> {
         match rm {
-            Rm::Reg(r) => Some(if size == 4 { self.regs[r] & 0xFFFF_FFFF } else { self.regs[r] }),
+            Rm::Reg(r) => {
+                let v = self.regs[r];
+                Some(if size >= 8 { v } else { v & ((1u64 << (size as u32 * 8)) - 1) })
+            }
             Rm::Mem(a) => Self::load(mem, a, size),
         }
     }
@@ -286,6 +325,59 @@ impl Cpu {
                 self.rip = pc as u64;
                 StepResult::Ok
             }
+            // immediate-group ALU: 0x81 r/m, imm32 ; 0x83 r/m, imm8 (sign-ext).
+            // ModRM.reg is the op selector (add/or/adc/sbb/and/sub/xor/cmp).
+            0x81 | 0x83 => {
+                pc += 1;
+                let (sel, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                pc = npc;
+                let imm = if b == 0x83 {
+                    let v = fetch(pc) as i8 as i64 as u64;
+                    pc += 1;
+                    v
+                } else {
+                    let v = imm32(pc) as u64; // sign-extended to 64
+                    pc += 4;
+                    v
+                };
+                let a = match self.read_rm(mem, rm, size) {
+                    Some(v) => v,
+                    None => return self.fault(rm),
+                };
+                let (res, writeback) = self.apply_alu((sel & 7) as u8, a, imm, size);
+                if writeback && !self.write_rm(mem, rm, res, size) {
+                    return self.fault(rm);
+                }
+                self.rip = pc as u64;
+                StepResult::Ok
+            }
+            // lea reg, [mem]  (0x8D): load the effective address (no memory read).
+            0x8d => {
+                pc += 1;
+                let (reg, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                pc = npc;
+                let addr = match rm {
+                    Rm::Mem(a) => a,
+                    Rm::Reg(_) => return StepResult::Unknown { rip: start, byte: 0x8d },
+                };
+                self.regs[reg] = if size == 4 { addr & 0xFFFF_FFFF } else { addr };
+                self.rip = pc as u64;
+                StepResult::Ok
+            }
+            // test r/m, reg  (0x85): set flags from (r/m & reg), no writeback.
+            0x85 => {
+                pc += 1;
+                let (reg, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                pc = npc;
+                let a = match self.read_rm(mem, rm, size) {
+                    Some(v) => v,
+                    None => return self.fault(rm),
+                };
+                let regv = if size == 4 { self.regs[reg] & 0xFFFF_FFFF } else { self.regs[reg] };
+                self.apply_alu(4, a, regv, size); // AND sets ZF/SF/PF, clears CF/OF
+                self.rip = pc as u64;
+                StepResult::Ok
+            }
             // mov reg, imm  (0xB8+r): imm64 with REX.W else imm32 zero-extended.
             0xb8..=0xbf => {
                 let reg = (b - 0xb8) as usize + if rex_b { 8 } else { 0 };
@@ -388,6 +480,37 @@ impl Cpu {
                         // services it from the register state and resumes.
                         self.rip = (pc + 2) as u64;
                         StepResult::Syscall
+                    }
+                    // jcc rel32 (near conditional jump): 0F 80..0F 8F.
+                    0x80..=0x8f => {
+                        let take = self.cond(b2 & 0x0f);
+                        let rel = imm32(pc + 2);
+                        let next = (pc as u64 + 6).wrapping_add(if take { rel as u64 } else { 0 });
+                        self.rip = next;
+                        StepResult::Ok
+                    }
+                    // movzx/movsx reg, r/m8 (B6/BE) and r/m16 (B7/BF).
+                    0xb6 | 0xb7 | 0xbe | 0xbf => {
+                        pc += 2;
+                        let (reg, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                        pc = npc;
+                        let src_size: u8 = if b2 == 0xb6 || b2 == 0xbe { 1 } else { 2 };
+                        let raw = match self.read_rm(mem, rm, src_size) {
+                            Some(v) => v,
+                            None => return self.fault(rm),
+                        };
+                        let bits = src_size as u32 * 8;
+                        let low = raw & ((1u64 << bits) - 1);
+                        let val = if b2 == 0xbe || b2 == 0xbf {
+                            // sign-extend: flip the sign bit then subtract it.
+                            let m = 1u64 << (bits - 1);
+                            (low ^ m).wrapping_sub(m)
+                        } else {
+                            low // zero-extend
+                        };
+                        self.regs[reg] = if size == 4 { val & 0xFFFF_FFFF } else { val };
+                        self.rip = pc as u64;
+                        StepResult::Ok
                     }
                     _ => StepResult::Unknown { rip: start, byte: 0x0f },
                 }
@@ -535,6 +658,74 @@ mod tests {
         assert_eq!(cpu.regs[RAX], 7);
         // resuming continues to the ret -> Halt.
         assert_eq!(cpu.step(&mut mem), StepResult::Halt);
+    }
+
+    #[test]
+    fn imm_group_alu() {
+        // mov rax,5 ; add rax, 0x10 (0x83 /0) ; sub rax, 1 (0x83 /5) ; ret  => 20
+        let mut mem = vec![0u8; 256];
+        let prog = [
+            0x48, 0xb8, 5, 0, 0, 0, 0, 0, 0, 0, // mov rax,5
+            0x48, 0x83, 0xc0, 0x10, // add rax, 0x10  -> 21
+            0x48, 0x83, 0xe8, 0x01, // sub rax, 1     -> 20
+            0xc3,
+        ];
+        mem[..prog.len()].copy_from_slice(&prog);
+        let mut cpu = Cpu::new();
+        assert_eq!(cpu.run_program(&mut mem, 0, 240, 1000), StepResult::Halt);
+        assert_eq!(cpu.regs[RAX], 20);
+    }
+
+    #[test]
+    fn cmp_imm_and_jne_rel32_not_taken() {
+        // mov rax,7 ; cmp rax,7 (0x83 /7) ; jne rel32 +5 ; mov rcx,1 ; ret
+        // equal -> jne not taken -> rcx=1.
+        let mut mem = vec![0u8; 256];
+        let prog = [
+            0x48, 0xb8, 7, 0, 0, 0, 0, 0, 0, 0, // mov rax,7
+            0x48, 0x83, 0xf8, 0x07, // cmp rax,7
+            0x0f, 0x85, 5, 0, 0, 0, // jne +5 (skips the mov rcx,? if taken)
+            0x48, 0xb9, 1, 0, 0, 0, 0, 0, 0, 0, // mov rcx,1
+            0xc3,
+        ];
+        mem[..prog.len()].copy_from_slice(&prog);
+        let mut cpu = Cpu::new();
+        cpu.run_program(&mut mem, 0, 240, 1000);
+        assert_eq!(cpu.regs[RCX], 1); // jne not taken, so rcx set
+    }
+
+    #[test]
+    fn lea_and_movzx() {
+        // mov rbx, 0x1100 ; lea rax, [rbx+0x10] ; ret   -> rax = 0x1110
+        // then movzx via a byte in memory.
+        let mut mem = vec![0u8; 256];
+        let prog = [
+            0x48, 0xbb, 0x00, 0x11, 0, 0, 0, 0, 0, 0, // mov rbx, 0x1100
+            0x48, 0x8d, 0x43, 0x10, // lea rax, [rbx+0x10]
+            0xc3,
+        ];
+        mem[..prog.len()].copy_from_slice(&prog);
+        let mut cpu = Cpu::new();
+        assert_eq!(cpu.run_program(&mut mem, 0, 240, 1000), StepResult::Halt);
+        assert_eq!(cpu.regs[RAX], 0x1110);
+    }
+
+    #[test]
+    fn movsx_sign_extends() {
+        // mov rax, 0xFF ; movsx rcx, al ... we lack r/m8 reg encoding nuance, so
+        // test the decoder path: movzx rcx, al (0F B6 C8) zero-extends 0xFF -> 0xFF;
+        // movsx rcx, al (0F BE C8) sign-extends 0xFF -> 0xFFFF...FF.
+        let mut mem = vec![0u8; 64];
+        // mov rax,0xFF ; movsx rcx, al ; ret
+        let prog = [
+            0x48, 0xb8, 0xff, 0, 0, 0, 0, 0, 0, 0, // mov rax,0xFF
+            0x48, 0x0f, 0xbe, 0xc8, // movsx rcx, al
+            0xc3,
+        ];
+        mem[..prog.len()].copy_from_slice(&prog);
+        let mut cpu = Cpu::new();
+        cpu.run_program(&mut mem, 0, 56, 1000);
+        assert_eq!(cpu.regs[RCX], u64::MAX); // 0xFF sign-extended
     }
 
     #[test]

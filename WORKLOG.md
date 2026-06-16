@@ -124,18 +124,17 @@ target runs. Same evidence-driven loop that cracked whoami/more natively. Flags
   host-testable). Register file + RFLAGS, flat byte-slice memory, REX prefix, a
   `step`/`run_program` loop that returns `Unknown{rip,byte}` / `Fault{addr}` so
   growth is trace-driven. Verified by host unit tests.
-- [~] **B1 — usermode core.** Instruction subset: ModRM addressing (reg-direct,
-  `[base]`, `[base+disp8/32]`, SIB; RIP-relative approximate), reg/mem ALU
-  (`add`/`sub`/`xor`/`cmp`/`mov`, both directions), `mov r,imm`/`mov r/m,imm32`,
-  the stack (`push`/`pop`), control flow (`call`/`ret`+`HALT_ADDR`, `jmp`
-  rel8/32, `jcc` rel8), and **`syscall`** (0F 05) which traps so the caller can
-  service it. 6 host tests pass. **Wired into the kernel**: the `run86` command
-  assembles a tiny x86-64 program (`mov`/`syscall`/`ret`), runs it through the
-  interpreter inside the WASM kernel, and services its `syscall` (service 1 =
-  write) by printing — so **real x86 machine code now executes in the browser
-  kernel and calls back via a syscall**. Verified end to end. Next: grow the
-  opcode set, load a real PE, and route `syscall` into the actual SSDT toward
-  `whoami`.
+- [~] **B1 — usermode core.** Instruction subset (growing trace-driven): ModRM
+  addressing (reg-direct, `[base]`, `[base+disp8/32]`, SIB; RIP-relative
+  approximate), reg/mem ALU both directions, the immediate-group ALU (0x81/0x83
+  `/0../7` = add/or/adc/sbb/and/sub/xor/cmp — covers `sub rsp,N`, `cmp r,imm`,
+  `and`, …), `mov r,imm`/`mov r/m,imm32`, `lea`, `test`, `movzx`/`movsx`, the
+  stack (`push`/`pop`), control flow (`call`/`ret`+`HALT_ADDR`, `jmp` rel8/32,
+  `jcc` rel8 **and rel32**), and `syscall` (0F 05). A shared `apply_alu` sets
+  CF/OF/ZF/SF/PF. **10 host tests pass.** **Wired into the kernel** via `run86`:
+  real x86-64 machine code runs inside the WASM kernel and calls back through a
+  syscall the kernel services (write). Next: load a real PE, route `syscall`
+  into the actual SSDT, fill remaining opcodes toward `whoami`.
 - [ ] **B1 — usermode core.** Implement the ALU/mov/stack/jump/string/SSE2 subset
   the MSVC CRT + our shims use; wire `syscall` → existing SSDT. Milestone: a
   tiny own-ABI program, then **`whoami` runs in the browser**.
