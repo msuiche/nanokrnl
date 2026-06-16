@@ -47,6 +47,11 @@ extern "C" {
     fn host_write(ptr: *const u8, len: usize);
     /// Clear the host console (the `cls` command).
     fn host_clear();
+    /// Load and run a guest program named by `len` UTF-8 bytes at `ptr`.
+    /// Returns the program's exit code, or -1 if no such program. The host
+    /// instantiates the guest `.wasm` and bridges its `sys_print` syscall to the
+    /// console — the WASM analogue of the kernel spawning a ring-3 process.
+    fn host_run(name_ptr: *const u8, name_len: usize) -> i32;
 }
 
 #[panic_handler]
@@ -278,7 +283,9 @@ fn dispatch(line: &str) {
             println("commands:");
             println("  help            this list");
             println("  ver             kernel version banner");
+            println("  whoami          current user");
             println("  echo <text>     print text");
+            println("  run <prog>      load and run a guest program (e.g. 'run hello')");
             println("  mem             pool bytes in use");
             println("  mkobj           create a kernel object + open a handle (real ob)");
             println("  handles         list open handles");
@@ -288,9 +295,15 @@ fn dispatch(line: &str) {
         "ver" => {
             println("ntoskrnl-rs 0.1.0 (wasm32) — NT-compatible kernel in Rust");
         }
+        "whoami" => {
+            // Identity lives in the kernel, so this works as a built-in even
+            // though the x86 whoami.exe can't run here.
+            println("nanokrnl\\user");
+        }
         "echo" => {
             println(args);
         }
+        "run" => cmd_run(args),
         "mem" => {
             print("pool in use: ");
             print_usize(mm::pool::pool_used());
@@ -305,6 +318,29 @@ fn dispatch(line: &str) {
             print(cmd);
             println("' is not recognized as a command. Try 'help'.");
         }
+    }
+}
+
+/// Load and run a guest WASM program through the host (`run <prog>`). The host
+/// instantiates `<prog>.wasm`, bridges its `sys_print` syscall to the console,
+/// runs its `main`, and returns the exit code — the closest thing to "running
+/// an executable" the WASM world allows (x86 PE binaries need an emulator).
+fn cmd_run(name: &str) {
+    let name = name.trim();
+    if name.is_empty() {
+        println("usage: run <program>   (try 'run hello')");
+        return;
+    }
+    let code = unsafe { host_run(name.as_ptr(), name.len()) };
+    if code < 0 {
+        print("run: program not found: ");
+        println(name);
+    } else {
+        print("[");
+        print(name);
+        print(" exited with code ");
+        print_usize(code as usize);
+        println("]");
     }
 }
 

@@ -7,6 +7,27 @@ import { createInterface } from "node:readline";
 
 const bytes = readFileSync(new URL("./ntoskrnl_wasm.wasm", import.meta.url));
 let memory;
+// Run a guest program: instantiate <name>.wasm synchronously and bridge its
+// `sys_print` syscall to the console. Returns its exit code, or -1 if missing.
+function runGuest(name) {
+  let bytes;
+  try {
+    bytes = readFileSync(new URL(`./${name}.wasm`, import.meta.url));
+  } catch {
+    return -1;
+  }
+  let gmem;
+  const gi = new WebAssembly.Instance(new WebAssembly.Module(bytes), {
+    env: {
+      sys_print(ptr, len) {
+        process.stdout.write(Buffer.from(new Uint8Array(gmem.buffer, ptr, len)));
+      },
+    },
+  });
+  gmem = gi.exports.memory;
+  return gi.exports.main();
+}
+
 const imports = {
   env: {
     host_write(ptr, len) {
@@ -14,6 +35,10 @@ const imports = {
     },
     host_clear() {
       process.stdout.write("\x1b[2J\x1b[H"); // ANSI clear + home
+    },
+    host_run(ptr, len) {
+      const name = new TextDecoder().decode(new Uint8Array(memory.buffer, ptr, len));
+      return runGuest(name);
     },
   },
 };

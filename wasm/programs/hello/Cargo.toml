@@ -1,0 +1,19 @@
+# A guest "executable" for the WASM kernel: a separate wasm32 module that the
+# kernel loads and runs via the `run` command. It calls back into the kernel for
+# I/O (the `sys_print` import the host bridges to the kernel's console). This is
+# how "run a program" works in the WASM world — the x86 PE binaries can't run
+# without an emulator, so executables are guest WASM modules over a syscall ABI.
+[package]
+name = "hello"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "s"

@@ -47,3 +47,4 @@ drivers/*.sys
 # WASM build
 wasm/target/
 wasm/web/*.wasm
+wasm/programs/*/target/

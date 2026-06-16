@@ -75,13 +75,16 @@ Hardware (needs substitution behind a HAL boundary; ~16 files use `asm!`/ports):
   real subsystems — e.g. `mkobj`/`close` create and tear down real `ob` objects,
   delete procedure and all. Both hosts updated: browser (input field) and Node
   (readline; also scriptable via a pipe). Verified.
-- [ ] **Phase 5 — running "executables".** WASM cannot execute the x86-64 PE
-  binaries the native kernel runs (no emulation, per the goal). So in the WASM
-  world an "executable" must be a **guest WASM module** that calls the kernel's
-  NT-style syscalls (the host bridges guest↔kernel), or a built-in command.
-  Plan: define a minimal syscall ABI export surface, load a guest `.wasm` as a
-  second instance sharing the kernel's services, and add a `run <prog>` command.
-  This is the path to "give an executable for running" within WASM's limits.
+- [~] **Phase 5 — running "executables".** WASM cannot execute the x86-64 PE
+  binaries the native kernel runs (no emulation, per the goal), so an
+  "executable" here is a **guest WASM module** over a syscall ABI. Working
+  minimal version: `run <prog>` → the kernel calls `host_run`, the host
+  instantiates `<prog>.wasm` as a second instance and bridges its `sys_print`
+  syscall to the console, runs `main`, and returns the exit code. Sample guest
+  in `wasm/programs/hello/`. Verified: `run hello` prints via the syscall and
+  reports exit 0; `run nope` → not found. Next: richer syscall surface (read
+  input, open/read kernel objects/files) and more guest programs; route guest
+  syscalls *through* the kernel (not just the host) for real mediation.
 
 ### Decisions / constraints
 
@@ -124,5 +127,9 @@ DllMain + CRT/console surface), 47047aa (file mapping + RtlIsTextUnicode).
   against the real subsystems (`mkobj`/`handles`/`close` drive real `ob` objects;
   `mem` reports pool use; `ver`/`echo`/`help`/`cls`). Event-driven input via
   `kernel_input`. Browser (input field) + Node (readline / scriptable) hosts.
-  Verified a full scripted session. Next decision for "run executables": guest
-  WASM modules over a syscall ABI (x86 PE binaries can't run without emulation).
+- **Running executables (guest WASM)**: added `whoami` (built-in) and `run <prog>`
+  — the latter loads a separate guest `.wasm` and runs it, bridging its
+  `sys_print` syscall to the console. Sample: `wasm/programs/hello`. Verified
+  `run hello` (prints via syscall, exit 0) and `run nope` (not found). This is
+  the "give it an executable" path within WASM (x86 PE binaries need emulation,
+  which is out of scope).

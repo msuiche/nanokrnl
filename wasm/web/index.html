@@ -50,6 +50,12 @@ function emit(text) {
 
 let instance, memory;
 const enc = new TextEncoder();
+const dec = new TextDecoder("utf-8");
+
+// Guest programs the kernel can `run`. Preloaded at boot so host_run is sync
+// (the kernel calls it synchronously). Add a program: build it, then list it.
+const PROGRAMS = ["hello"];
+const guestBytes = new Map();
 
 function send(line) {
   const buf = enc.encode(line);
@@ -58,14 +64,30 @@ function send(line) {
   instance.exports.kernel_input(buf.length);
 }
 
+// Instantiate <name>.wasm and bridge its sys_print syscall to the console.
+function runGuest(name) {
+  const bytes = guestBytes.get(name);
+  if (!bytes) return -1;
+  let gmem;
+  const gi = new WebAssembly.Instance(new WebAssembly.Module(bytes), {
+    env: { sys_print(ptr, len) { emit(dec.decode(new Uint8Array(gmem.buffer, ptr, len))); } },
+  });
+  gmem = gi.exports.memory;
+  return gi.exports.main();
+}
+
 async function boot() {
   consoleEl.textContent = "";
-  // The kernel's "hardware" is this page: console out (host_write), clear
-  // (host_clear). WASM linear memory is its RAM.
+  // Preload guest programs so the kernel's synchronous host_run can find them.
+  for (const p of PROGRAMS) {
+    try { guestBytes.set(p, new Uint8Array(await (await fetch(`${p}.wasm`)).arrayBuffer())); } catch {}
+  }
+  // The kernel's "hardware" is this page: console out, clear, and run-a-guest.
   const imports = {
     env: {
-      host_write(ptr, len) { emit(new TextDecoder("utf-8").decode(new Uint8Array(memory.buffer, ptr, len))); },
+      host_write(ptr, len) { emit(dec.decode(new Uint8Array(memory.buffer, ptr, len))); },
       host_clear() { consoleEl.textContent = ""; },
+      host_run(ptr, len) { return runGuest(dec.decode(new Uint8Array(memory.buffer, ptr, len))); },
     },
   };
   const resp = await fetch("ntoskrnl_wasm.wasm");
