@@ -597,6 +597,73 @@ pub extern "C" fn setlocale(_category: i32, _locale: *const u8) -> *const u8 {
     b"C\0".as_ptr()
 }
 
+/// The "C" locale name as a wide string, returned by [`_wsetlocale`].
+static C_LOCALE_W: [u16; 2] = [b'C' as u16, 0];
+
+/// `_wsetlocale(category, locale)` — wide `setlocale`. Returns the (non-NULL)
+/// "C" locale name; the old return-0 stub made callers (ulib's WSTRING/locale
+/// setup) treat locale init as failed.
+#[no_mangle]
+pub extern "C" fn _wsetlocale(_category: i32, _locale: *const u16) -> *const u16 {
+    C_LOCALE_W.as_ptr()
+}
+
+/// `wcscspn(s, set)` — length of the initial run of `s` containing no character
+/// from `set` (the wide complement-span used to scan to a delimiter).
+#[no_mangle]
+pub unsafe extern "C" fn wcscspn(s: *const u16, set: *const u16) -> usize {
+    let mut i = 0;
+    while *s.add(i) != 0 {
+        let c = *s.add(i);
+        let mut j = 0;
+        while *set.add(j) != 0 {
+            if *set.add(j) == c {
+                return i;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    i
+}
+
+/// `strcspn(s, set)` — narrow counterpart of [`wcscspn`].
+#[no_mangle]
+pub unsafe extern "C" fn strcspn(s: *const u8, set: *const u8) -> usize {
+    let mut i = 0;
+    while *s.add(i) != 0 {
+        let c = *s.add(i);
+        let mut j = 0;
+        while *set.add(j) != 0 {
+            if *set.add(j) == c {
+                return i;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    i
+}
+
+/// `mbtowc(pwc, s, n)` — convert one multibyte character to wide. Our console
+/// code page is single-byte (Latin-1), so each byte maps straight to a wide
+/// char. Returns the bytes consumed (1), or 0 at the terminating NUL.
+#[no_mangle]
+pub unsafe extern "C" fn mbtowc(pwc: *mut u16, s: *const u8, n: usize) -> i32 {
+    if s.is_null() || n == 0 {
+        return 0;
+    }
+    let c = *s;
+    if !pwc.is_null() {
+        *pwc = c as u16;
+    }
+    if c == 0 {
+        0
+    } else {
+        1
+    }
+}
+
 // ---------------------------------------------------------------------------
 // MSVC CRT startup / teardown helpers.
 // ---------------------------------------------------------------------------
@@ -1325,6 +1392,26 @@ pub unsafe extern "C" fn __stdio_common_vswprintf_s(
     valist: *const u64,
 ) -> i32 {
     __stdio_common_vswprintf(options, buffer, count, format, locale, valist)
+}
+
+/// `_snwprintf_s(buffer, sizeOfBuffer, count, format, ...)` — the secure
+/// bounded wide `sprintf`. A variadic export (ulib calls it directly), so we
+/// take it naked: the named args are in rcx/rdx/r8/r9 and the varargs start at
+/// `[rsp+0x28]`. We forward to `_vsnwprintf(buffer, sizeOfBuffer, format,
+/// va_list)` — using the buffer size as the cap and a pointer to the first
+/// vararg as the `va_list`.
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "C" fn _snwprintf_s() {
+    core::arch::naked_asm!(
+        "sub rsp, 0x28",        // align + reserve callee shadow space
+        "mov r8, r9",           // arg3 format = original r9
+        "lea r9, [rsp + 0x50]", // arg4 va_list = original [rsp+0x28]
+        "call {f}",             // _vsnwprintf(rcx=buffer, rdx=size, r8=format, r9=valist)
+        "add rsp, 0x28",
+        "ret",
+        f = sym _vsnwprintf,
+    );
 }
 
 /// `__stdio_common_vsnwprintf_s(...)` — the `_vsnwprintf_s` backend; identical

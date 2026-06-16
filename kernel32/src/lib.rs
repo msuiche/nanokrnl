@@ -462,6 +462,27 @@ pub unsafe extern "C" fn RtlFreeHeap(heap: u64, flags: u32, mem: *mut u8) -> i32
     HeapFree(heap, flags, mem)
 }
 
+/// `RtlSizeHeap(HeapHandle, Flags, BaseAddress)` — ntdll counterpart of
+/// `HeapSize` (defined below), called directly by ulib. The old return-0 stub
+/// made ulib see every allocation as zero-sized.
+#[no_mangle]
+pub unsafe extern "C" fn RtlSizeHeap(heap: u64, flags: u32, mem: *const u8) -> u64 {
+    HeapSize(heap, flags, mem)
+}
+
+/// `GetConsoleCP()` / `GetConsoleOutputCP()` — the console's code page. We use
+/// 437 (OEM US), the classic single-byte console code page.
+#[no_mangle]
+pub extern "C" fn GetConsoleCP() -> u32 {
+    437
+}
+
+// NOTE: `ApiSetQueryApiSetPresence` is deliberately left as the loader's
+// return-0 stub. Reporting an api-set as *present* leads a caller (cmd.exe) to
+// take a delay-load path through `ResolveDelayLoadedAPI` (which we don't
+// implement), so it calls a NULL thunk and faults. Absent ⇒ the caller binds
+// statically, which our by-name resolver already satisfies.
+
 /// `IsDBCSLeadByte(TestChar)` — whether a byte begins a double-byte character.
 /// Our console code page is single-byte, so never.
 #[no_mangle]
@@ -888,6 +909,71 @@ pub unsafe extern "C" fn GetConsoleMode(handle: u64, mode: *mut u32) -> i32 {
     }
     *mode = if is_input_handle(handle) { INPUT_MODE } else { OUTPUT_MODE };
     1
+}
+
+/// `CONSOLE_SCREEN_BUFFER_INFO` — the x64 layout (22 bytes): two `COORD`s
+/// (each `{i16 X; i16 Y}`), a `WORD` attribute, a `SMALL_RECT` window
+/// (`{i16 Left,Top,Right,Bottom}`), and a max-window `COORD`.
+#[repr(C)]
+pub struct ConsoleScreenBufferInfo {
+    pub size: [i16; 2],
+    pub cursor: [i16; 2],
+    pub attributes: u16,
+    pub window: [i16; 4],
+    pub max_window: [i16; 2],
+}
+
+/// `GetConsoleScreenBufferInfo(hConsoleOutput, lpInfo)` — report a standard
+/// 80x25 console (300-line buffer). A pager like `more` reads the window height
+/// here to decide how many lines fill a screen; without it (the old stub
+/// returned FALSE) it can't page and bails. Returns TRUE.
+#[no_mangle]
+pub unsafe extern "C" fn GetConsoleScreenBufferInfo(
+    _handle: u64,
+    info: *mut ConsoleScreenBufferInfo,
+) -> i32 {
+    if info.is_null() {
+        return 0;
+    }
+    (*info).size = [80, 300];
+    (*info).cursor = [0, 0];
+    (*info).attributes = 0x07; // gray on black
+    (*info).window = [0, 0, 79, 24]; // 80 columns, 25 rows visible
+    (*info).max_window = [80, 25];
+    1
+}
+
+/// `DisableThreadLibraryCalls(hModule)` — we don't deliver per-thread DLL
+/// notifications anyway; accept and return TRUE. Called from ulib's DllMain.
+#[no_mangle]
+pub extern "C" fn DisableThreadLibraryCalls(_module: u64) -> i32 {
+    1
+}
+
+/// `RtlOemToUnicodeN(dst, dst_max_bytes, result_bytes, src, src_bytes)` — widen
+/// an OEM (we treat it as Latin-1/ASCII) byte string to UTF-16. Returns an
+/// NTSTATUS (0 = success). ulib uses this for console/code-page conversion;
+/// the old return-0 stub "succeeded" but produced no output, leaving strings
+/// empty.
+#[no_mangle]
+pub unsafe extern "C" fn RtlOemToUnicodeN(
+    dst: *mut u16,
+    dst_max_bytes: u32,
+    result_bytes: *mut u32,
+    src: *const u8,
+    src_bytes: u32,
+) -> u32 {
+    let max_chars = (dst_max_bytes / 2) as usize;
+    let n = (src_bytes as usize).min(max_chars);
+    if !dst.is_null() && !src.is_null() {
+        for i in 0..n {
+            *dst.add(i) = *src.add(i) as u16;
+        }
+    }
+    if !result_bytes.is_null() {
+        *result_bytes = (n * 2) as u32;
+    }
+    0 // STATUS_SUCCESS
 }
 
 /// `SetConsoleMode(hConsoleHandle, dwMode)` — accepted (no-op). Returns TRUE.

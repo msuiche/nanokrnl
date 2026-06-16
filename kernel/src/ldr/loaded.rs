@@ -19,6 +19,11 @@ static MSVCRT_BASE: AtomicU64 = AtomicU64::new(0);
 static MSVCRT_SIZE: AtomicUsize = AtomicUsize::new(0);
 static ULIB_BASE: AtomicU64 = AtomicU64::new(0);
 static ULIB_SIZE: AtomicUsize = AtomicUsize::new(0);
+/// ulib.dll's entry point (its `DllMain`) VA. A process that imports ulib must
+/// run this with `DLL_PROCESS_ATTACH` before its own entry, so ulib's one-time
+/// init (standard-stream objects, heap) runs — `PROGRAM::Initialize` fails if it
+/// hasn't. 0 until ulib is loaded.
+static ULIB_ENTRY: AtomicU64 = AtomicU64::new(0);
 
 /// Load the `kernel32` shim DLL into user-accessible memory. It has no
 /// imports of its own (its functions issue syscalls inline), so loading is a
@@ -63,6 +68,7 @@ pub fn load_ulib(image: &[u8]) -> Result<(), NtStatus> {
     let loaded = pe::load_user(image)?;
     ULIB_BASE.store(loaded.base as u64, Ordering::Release);
     ULIB_SIZE.store(loaded.size, Ordering::Release);
+    ULIB_ENTRY.store(loaded.entry_va, Ordering::Release);
     crate::kd_println!(
         "LDR: loaded ulib.dll @ {:p} ({} bytes)",
         loaded.base,
@@ -74,6 +80,12 @@ pub fn load_ulib(image: &[u8]) -> Result<(), NtStatus> {
 /// `(base, size)` of the loaded ulib.dll (for the debugger's module map).
 pub fn ulib_range() -> (u64, usize) {
     (ULIB_BASE.load(Ordering::Acquire), ULIB_SIZE.load(Ordering::Acquire))
+}
+
+/// `(base, entry)` of ulib.dll — its load address (the `HINSTANCE` DllMain
+/// expects) and its `DllMain` VA. `(0, 0)` if ulib isn't loaded.
+pub fn ulib_base_and_entry() -> (u64, u64) {
+    (ULIB_BASE.load(Ordering::Acquire), ULIB_ENTRY.load(Ordering::Acquire))
 }
 
 /// `(base, size)` of the loaded kernel32 shim (for the debugger's module map).

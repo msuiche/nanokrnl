@@ -225,6 +225,9 @@ const PARAMS_BASE: u64 = TEB_BASE + 0x3000;
 const LDR_BASE: u64 = TEB_BASE + 0x4000;
 const TLS_BASE: u64 = TEB_BASE + 0x5000;
 const ENV_BASE: u64 = TEB_BASE + 0x6000;
+/// VA of the optional per-process DLL-init trampoline (see
+/// [`build_ulib_dllmain_trampoline`]), one page below the control-block region.
+const ULIB_TRAMPOLINE_VA: u64 = TEB_BASE - 0x10000;
 /// Pages backing the whole TEB…environment region above.
 const USER_BLOCK_PAGES: usize = 8;
 /// `GetProcessHeap` returns this; mirror it in `PEB.ProcessHeap` so a binary
@@ -311,6 +314,7 @@ pub fn load_user_process(data: &[u8]) -> Result<LoadedProcess, NtStatus> {
 
     // Imports bind to the shared high-half stubs (delta == 0, no relocs).
     let img = unsafe { core::slice::from_raw_parts_mut(win, size_of_image) };
+    let uses_ulib = import_rva != 0 && imports_dll_prefix(img, import_rva, "ulib");
     if import_rva != 0 {
         resolve_imports(img, import_rva, super::loaded::resolve)?;
     }
@@ -353,9 +357,19 @@ pub fn load_user_process(data: &[u8]) -> Result<LoadedProcess, NtStatus> {
         tls_rva,
     })?;
 
+    // A ulib-based tool needs ulib's DllMain to run (standard-stream / heap
+    // init) before its own entry; route the entry through a trampoline that
+    // does so. Non-ulib images run their entry directly.
+    let real_entry = preferred_base + entry_rva as u64;
+    let entry_va = if uses_ulib {
+        build_ulib_dllmain_trampoline(cr3, real_entry)
+    } else {
+        real_entry
+    };
+
     Ok(LoadedProcess {
         cr3,
-        entry_va: preferred_base + entry_rva as u64,
+        entry_va,
         user_rsp,
         teb: TEB_BASE,
         image_base: preferred_base,
@@ -798,6 +812,80 @@ fn resolve_imports(
         desc += 20;
     }
     Ok(())
+}
+
+/// Does the image's import table name a DLL whose name starts with `prefix`
+/// (case-insensitive)? Used to decide whether a process needs a dependent
+/// DLL's `DllMain` run before its entry (e.g. `ulib`).
+fn imports_dll_prefix(img: &[u8], import_rva: usize, prefix: &str) -> bool {
+    let mut desc = import_rva;
+    loop {
+        let Some(name_rva) = u32le(img, desc + 12) else {
+            return false;
+        };
+        let Some(iat) = u32le(img, desc + 16) else {
+            return false;
+        };
+        let oft = u32le(img, desc).unwrap_or(0);
+        if name_rva == 0 && iat == 0 && oft == 0 {
+            return false; // null terminator
+        }
+        if let Some(name) = read_cstr(img, name_rva as usize) {
+            let n = name.len().min(prefix.len());
+            if name.len() >= prefix.len() && name[..n].eq_ignore_ascii_case(prefix) {
+                return true;
+            }
+        }
+        desc += 20;
+    }
+}
+
+/// Build a one-page user trampoline that runs `ulib!DllMain(ulib_base,
+/// DLL_PROCESS_ATTACH, NULL)` and then tail-jumps to the image's real entry,
+/// preserving the entry's stack contract (RSP unchanged, `[RSP]` = the
+/// NtTerminateThread return stub). Returns the trampoline VA to use as the
+/// process entry, or the unchanged `real_entry` if anything is unavailable.
+fn build_ulib_dllmain_trampoline(cr3: crate::mm::PhysAddr, real_entry: u64) -> u64 {
+    let (ulib_base, ulib_entry) = super::loaded::ulib_base_and_entry();
+    if ulib_base == 0 || ulib_entry == 0 {
+        return real_entry;
+    }
+    let Some(pa) = crate::mm::phys::mm_allocate_page() else {
+        return real_entry;
+    };
+    // The trampoline (RSP enters ≡ 8 mod 16, the post-call state the entry
+    // wants):
+    //   sub rsp,0x28 ; mov rcx,ulib_base ; mov edx,1 ; xor r8d,r8d
+    //   mov rax,ulib_entry ; call rax ; add rsp,0x28
+    //   mov rax,real_entry ; jmp rax
+    fn put(code: &mut [u8], n: &mut usize, bytes: &[u8]) {
+        code[*n..*n + bytes.len()].copy_from_slice(bytes);
+        *n += bytes.len();
+    }
+    let mut code = [0u8; 64];
+    let mut n = 0usize;
+    put(&mut code, &mut n, &[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    put(&mut code, &mut n, &[0x48, 0xB9]);
+    put(&mut code, &mut n, &ulib_base.to_le_bytes()); // mov rcx, ulib_base
+    put(&mut code, &mut n, &[0xBA, 0x01, 0x00, 0x00, 0x00]); // mov edx, 1
+    put(&mut code, &mut n, &[0x45, 0x31, 0xC0]); // xor r8d, r8d
+    put(&mut code, &mut n, &[0x48, 0xB8]);
+    put(&mut code, &mut n, &ulib_entry.to_le_bytes()); // mov rax, ulib_entry
+    put(&mut code, &mut n, &[0xFF, 0xD0]); // call rax
+    put(&mut code, &mut n, &[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    put(&mut code, &mut n, &[0x48, 0xB8]);
+    put(&mut code, &mut n, &real_entry.to_le_bytes()); // mov rax, real_entry
+    put(&mut code, &mut n, &[0xFF, 0xE0]); // jmp rax
+
+    let va = ULIB_TRAMPOLINE_VA;
+    unsafe {
+        let w = crate::mm::phys_to_virt(pa);
+        core::ptr::copy_nonoverlapping(code.as_ptr(), w, n);
+        // Map user-accessible + executable (read-only — written above via the
+        // physical window, so no user write access is needed).
+        crate::mm::virt::mm_map_user_range(cr3, va, pa, 1, false, true);
+    }
+    va
 }
 
 /// Resolve an exported symbol `name` to its virtual address within an
