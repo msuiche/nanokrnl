@@ -48,3 +48,4 @@ drivers/*.sys
 wasm/target/
 wasm/web/*.wasm
 wasm/programs/*/target/
+wasm/emu/target/

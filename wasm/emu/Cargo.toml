@@ -1,0 +1,14 @@
+# Track B: our own minimal x86-64 interpreter (see WORKLOG.md). Standalone crate
+# so the decoder can be unit-tested on the host (`cargo test`) while staying
+# no_std for eventual inclusion in the WASM kernel. NOT an emulator import / not
+# qemu — a hand-written usermode (later ring-0) interpreter that bridges into the
+# kernel's existing syscall + ntoskrnl-export layer.
+[package]
+name = "x86emu"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+crate-type = ["lib"]

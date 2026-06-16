@@ -86,9 +86,68 @@ Hardware (needs substitution behind a HAL boundary; ~16 files use `asm!`/ports):
   input, open/read kernel objects/files) and more guest programs; route guest
   syscalls *through* the kernel (not just the host) for real mediation.
 
+## Track B — our own x86-64 emulator (run the real binaries & drivers in WASM)
+
+Track A above runs the kernel's *Rust* subsystems in WASM with guest WASM
+"executables". Track B is the harder, flashier goal: run the **actual x86-64 PE
+binaries** (cmd/whoami/more) and **drivers** (null.sys) in the browser by
+writing our own minimal x86-64 interpreter — NOT qemu-wasm, and NOT full-platform
+emulation. The decisive leverage: our kernel already provides the syscall layer,
+the ntoskrnl exports, the PE loader, and the WDM ABI as portable Rust. So the
+emulator only runs the *instruction stream* and bridges calls into code we
+already have — no MMU, no chipset, no device emulation (for software targets).
+
+### Architecture
+
+- One reusable **x86-64 decoder + interpreter** (same ISA for ring 3 and ring 0).
+  Registers + flags + a flat linear-memory address space (the WASM heap is the
+  binary's RAM; no paging).
+- **User mode (ring 3):** execute the PE's code; when it reaches the ntdll
+  `syscall` trampoline, stop interpreting and call our existing kernel syscall
+  handlers (`register_service`/SSDT). Return into the interpreter.
+- **Kernel mode (ring 0, drivers):** no `syscall` — driver `call`s resolve
+  (via the existing driver loader's import binding) straight to our native
+  `ntoskrnl` export functions. Privileged instructions (`cli`/`sti`, memory
+  barriers, `cr8`/IRQL) are modeled or no-op'd; a software driver emits few/none.
+- **Reuse, don't rebuild:** PE loader, kernel32/msvcrt/ntdll shims, ntoskrnl
+  exports, IRQL/DPC/dispatcher, ob/mm/io — all already exist in Rust.
+
+### Method: trace-driven, opcode-by-opcode
+
+Run; on an unimplemented opcode, dump it and implement it; repeat until the
+target runs. Same evidence-driven loop that cracked whoami/more natively. Flags
+(CF/OF/ZF/SF/AF/PF) are where the bugs hide — test them hard.
+
+### Phases
+
+- [~] **B0 — decoder skeleton + harness.** `wasm/emu/` (`x86emu`, no_std but
+  host-testable). Register file + RFLAGS, flat byte-slice memory, REX prefix,
+  a `step`/`run` loop that returns `Unknown{rip,byte}` on an undecoded opcode.
+  Implements the subset for the first tests: REX.W `mov r,imm` (0xB8+r), and
+  reg/reg `ADD`/`SUB`/`MOV` (0x01/0x29/0x89) with CF/OF/ZF/SF/PF. **Verified**:
+  3 host unit tests pass (`cargo test` in `wasm/emu`). Next: ModRM memory
+  operands, control flow (jmp/jcc/call/ret+stack), then grow trace-driven.
+- [ ] **B1 — usermode core.** Implement the ALU/mov/stack/jump/string/SSE2 subset
+  the MSVC CRT + our shims use; wire `syscall` → existing SSDT. Milestone: a
+  tiny own-ABI program, then **`whoami` runs in the browser**.
+- [ ] **B2 — ring-0 / software drivers.** Reuse the driver loader; resolve driver
+  imports to native ntoskrnl exports; model/no-op privileged ops. Milestone:
+  **null.sys DriverEntry → IRP → unload** in the browser (no hardware needed).
+- [ ] **B3 (stretch) — browser-backed virtual devices.** Give an emulated driver
+  a synthetic device the page provides — e.g. a framebuffer driver → `<canvas>`,
+  a NIC → WebSocket. This is the genuinely novel "drivers in the browser" story;
+  it needs a minimal interrupt/DPC delivery path on top of B2.
+
+### Boundary (explicitly out of scope)
+
+Real hardware drivers that drive physical ports/MMIO/IRQs need full PC-platform
++ device emulation (qemu/v86 scale). We do synthetic/browser-backed devices
+only. No real-mode/BIOS, no SMM, no paging.
+
 ### Decisions / constraints
 
-- No qemu-wasm / no x86 emulation (per goal).
+- No qemu-wasm / no x86 emulation **by import** — but our *own* minimal usermode+
+  software-driver interpreter (Track B) is in scope if pursued.
 - Target `wasm32-unknown-unknown` (no WASI dependency; host imports for I/O).
 - Keep the x86 build fully working throughout (the WASM port is additive).
 
@@ -107,6 +166,14 @@ functions, and finally file mapping (`CreateFileMappingW`/`MapViewOfFile`) +
 DllMain + CRT/console surface), 47047aa (file mapping + RtlIsTextUnicode).
 
 ## Log
+
+### 2026-06-16 (cont.) — Track B kicked off
+- Scoped the x86-64 emulator track (run the real binaries + drivers in WASM via
+  our own usermode/ring-0 interpreter, no platform emulation — leverage the
+  existing kernel syscall layer, ntoskrnl exports, PE loader, WDM ABI).
+- B0 started: `wasm/emu` (`x86emu`) — decoder spine + register file + flags +
+  step/run loop that traps unknown opcodes; first opcodes (mov-imm, reg/reg
+  add/sub/mov) with flags; 3 host unit tests pass.
 
 ### 2026-06-16
 - Set the WASM-port goal; wrote this plan. Assessed the hardware surface: ~16
