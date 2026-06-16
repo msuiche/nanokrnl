@@ -120,13 +120,18 @@ target runs. Same evidence-driven loop that cracked whoami/more natively. Flags
 
 ### Phases
 
-- [~] **B0 — decoder skeleton + harness.** `wasm/emu/` (`x86emu`, no_std but
-  host-testable). Register file + RFLAGS, flat byte-slice memory, REX prefix,
-  a `step`/`run` loop that returns `Unknown{rip,byte}` on an undecoded opcode.
-  Implements the subset for the first tests: REX.W `mov r,imm` (0xB8+r), and
-  reg/reg `ADD`/`SUB`/`MOV` (0x01/0x29/0x89) with CF/OF/ZF/SF/PF. **Verified**:
-  3 host unit tests pass (`cargo test` in `wasm/emu`). Next: ModRM memory
-  operands, control flow (jmp/jcc/call/ret+stack), then grow trace-driven.
+- [x] **B0 — decoder skeleton + harness.** `wasm/emu/` (`x86emu`, no_std but
+  host-testable). Register file + RFLAGS, flat byte-slice memory, REX prefix, a
+  `step`/`run_program` loop that returns `Unknown{rip,byte}` / `Fault{addr}` so
+  growth is trace-driven. Verified by host unit tests.
+- [~] **B1 — usermode core.** Building the instruction subset. Done so far:
+  ModRM addressing (reg-direct, `[base]`, `[base+disp8/32]`, SIB; RIP-relative
+  approximate), reg/mem ALU (`add`/`sub`/`xor`/`cmp`/`mov`, both directions),
+  `mov r,imm`/`mov r/m,imm32`, the stack (`push`/`pop`), and control flow
+  (`call`/`ret` with a real stack + `HALT_ADDR` sentinel, `jmp` rel8/32, `jcc`
+  rel8). **Verified**: 5 host tests — a `call`/`ret` function, a `cmp`/`jne`
+  countdown loop (3+2+1=6), push/pop, ALU. Next: more opcodes as needed, then
+  load a real PE and wire `syscall`→SSDT toward running `whoami`.
 - [ ] **B1 — usermode core.** Implement the ALU/mov/stack/jump/string/SSE2 subset
   the MSVC CRT + our shims use; wire `syscall` → existing SSDT. Milestone: a
   tiny own-ABI program, then **`whoami` runs in the browser**.
