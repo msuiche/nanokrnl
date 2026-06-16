@@ -47,9 +47,13 @@ Hardware (needs substitution behind a HAL boundary; ~16 files use `asm!`/ports):
   (pool), `ob` (namespace insert/lookup), and `rtl` (status) miniatures as self
   tests. **Verified**: boots headless under Node, all self tests pass, returns 0.
   Build: `sh wasm/build.sh`; test: `node wasm/web/run-node.mjs`.
-- [ ] **Phase 1 — HAL boundary.** Introduce a `hal` trait/cfg seam so the kernel
-  crate builds for both `x86_64-unknown-none` and `wasm32`. `#[cfg]`-gate the
-  x86 asm; provide wasm stubs (serial→JS, timer→JS, ports→panic/no-op).
+- [~] **Phase 1 — reuse real kernel modules / HAL boundary.** The kernel's real
+  `rtl` module (status, bitmap, list, string) now compiles into the WASM build
+  unchanged via a `#[path]` include — first actual kernel code (not a stand-in)
+  running in the browser; verified (NtStatus + RtlBitmap self tests pass). Next:
+  bring in `ob`/`cm`/`io/ramfs` (they reference more of `crate::`, so this is
+  where the `hal` cfg/trait seam goes — `#[cfg]`-gate the x86 asm, stub
+  serial→JS / timer→JS / ports→no-op so the kernel crate itself builds for wasm32).
 - [ ] **Phase 2 — Memory.** Software phys allocator over a large static/linear
   arena; replace `mm/virt` page-table mapping with a flat software model
   (identity or a translation table) so `mm` APIs work without an MMU.
@@ -91,5 +95,9 @@ DllMain + CRT/console surface).
   subsystems (`rtl`, `ob`, `cm`, `io/ramfs`, `ex`, much of `ps`) are portable.
 - Phase 0 done: `wasm/` crate + browser/Node host + proof-of-life. The kernel's
   mm/ob/rtl miniatures boot and self-test in a WASM host (verified under Node,
-  exit 0). Next: Phase 1 — a `hal` cfg/trait seam so the real kernel crate builds
-  for wasm32, starting by reusing the actual `rtl` and `ob` modules.
+  exit 0).
+- Phase 1 started: replaced the rtl miniature with the kernel's **real** `rtl`
+  module (`#[path]` include of `kernel/src/rtl/mod.rs`) — it's hardware-free, so
+  it builds for wasm32 unchanged. WASM self tests now exercise the real
+  `NtStatus` + `RtlBitmap`. Verified (exit 0). Next: `ob`/`ramfs` need the HAL
+  seam (they pull in more of the kernel).

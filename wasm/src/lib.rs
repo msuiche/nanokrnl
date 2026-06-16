@@ -17,6 +17,15 @@
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+// Phase 1: the kernel's REAL run-time library, compiled into the WASM build
+// unchanged. `rtl` touches no hardware and takes no locks (pure data-structure
+// code), so the same source the x86 kernel uses also builds for wasm32 — this
+// is the first actual kernel module (not a stand-in) running in the browser.
+#[path = "../../kernel/src/rtl/mod.rs"]
+#[allow(dead_code)] // the full module is included; not every item is exercised yet
+mod rtl;
+use rtl::NtStatus;
+
 // --- Host interface (the substituted "hardware") ---------------------------
 // The JS host supplies these; `memory` (WASM linear memory) is exported so the
 // host can read the bytes a pointer/length refers to.
@@ -57,18 +66,6 @@ fn print_usize(mut v: usize) {
         v /= 10;
     }
     print(unsafe { core::str::from_utf8_unchecked(&buf[i..]) });
-}
-
-// --- rtl: NT status codes --------------------------------------------------
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct NtStatus(u32);
-impl NtStatus {
-    const SUCCESS: NtStatus = NtStatus(0x0000_0000);
-    const INSUFFICIENT_RESOURCES: NtStatus = NtStatus(0xC000_009A);
-    const OBJECT_NAME_NOT_FOUND: NtStatus = NtStatus(0xC000_0034);
-    fn is_ok(self) -> bool {
-        self.0 == 0
-    }
 }
 
 // --- mm: a bump pool over a static "physical memory" arena -----------------
@@ -171,8 +168,24 @@ pub extern "C" fn kernel_main() -> i32 {
         ob_lookup("\\Device\\Nope") == Err(NtStatus::OBJECT_NAME_NOT_FOUND),
     );
 
-    // rtl: status predicate.
-    all &= check("rtl: SUCCESS is_ok, error is not", NtStatus::SUCCESS.is_ok() && !NtStatus::OBJECT_NAME_NOT_FOUND.is_ok());
+    // rtl (REAL kernel module): status codes are the documented Windows values
+    // and the severity predicates work.
+    all &= check(
+        "rtl: NtStatus values + severity (ACCESS_VIOLATION=0xC0000005)",
+        NtStatus::SUCCESS.is_success()
+            && NtStatus::ACCESS_VIOLATION.is_error()
+            && NtStatus::ACCESS_VIOLATION.0 == 0xC000_0005,
+    );
+
+    // rtl (REAL kernel module): the RTL_BITMAP allocator Mm/the handle table use.
+    let mut words = [0u64; 2]; // 128 bits
+    let mut bm = rtl::bitmap::RtlBitmap::new(&mut words, 128);
+    let first = bm.find_clear_bits_and_set(8, 0);
+    let second = bm.find_clear_bits_and_set(8, 0);
+    all &= check(
+        "rtl: RtlBitmap find_clear_bits_and_set hands out distinct runs",
+        first == Some(0) && second == Some(8) && bm.count_set() == 16,
+    );
 
     println("");
     if all {
