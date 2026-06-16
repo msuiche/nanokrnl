@@ -18,6 +18,8 @@
 //! hand-assembled functions with calls and loops; grows toward `whoami`.
 #![cfg_attr(not(test), no_std)]
 
+pub mod pe;
+
 pub const RAX: usize = 0;
 pub const RCX: usize = 1;
 pub const RDX: usize = 2;

@@ -131,10 +131,17 @@ target runs. Same evidence-driven loop that cracked whoami/more natively. Flags
   `and`, …), `mov r,imm`/`mov r/m,imm32`, `lea`, `test`, `movzx`/`movsx`, the
   stack (`push`/`pop`), control flow (`call`/`ret`+`HALT_ADDR`, `jmp` rel8/32,
   `jcc` rel8 **and rel32**), and `syscall` (0F 05). A shared `apply_alu` sets
-  CF/OF/ZF/SF/PF. **10 host tests pass.** **Wired into the kernel** via `run86`:
-  real x86-64 machine code runs inside the WASM kernel and calls back through a
-  syscall the kernel services (write). Next: load a real PE, route `syscall`
-  into the actual SSDT, fill remaining opcodes toward `whoami`.
+  CF/OF/ZF/SF/PF. **Wired into the kernel** via `run86`: real x86-64 machine
+  code runs inside the WASM kernel and calls back through a syscall the kernel
+  services (write).
+  - **PE loader** (`wasm/emu/src/pe.rs`): maps a real PE32+ image into the
+    interpreter's flat memory at **VA 0** (so VA==RVA, keeping addressing
+    trivial) and applies base relocations (delta = −preferred_base). **Verified
+    it loads the real `whoami.exe`** — headers/sections mapped, relocs applied,
+    entry valid. 12 host tests pass.
+  - Next: a host harness that runs the loaded `whoami` through the interpreter
+    to surface the next unimplemented opcode (trace-driven), then route ntdll
+    `syscall`/imports into a kernel syscall surface.
 - [ ] **B1 — usermode core.** Implement the ALU/mov/stack/jump/string/SSE2 subset
   the MSVC CRT + our shims use; wire `syscall` → existing SSDT. Milestone: a
   tiny own-ABI program, then **`whoami` runs in the browser**.
