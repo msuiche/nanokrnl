@@ -1,0 +1,20 @@
+# The browser/WASM build of the kernel. Standalone (not in the x86 workspace,
+# whose profiles target x86_64-unknown-none); built for wasm32-unknown-unknown.
+# See WORKLOG.md for the port plan. Phase 0: proof of life — kernel-style
+# subsystem logic (pool, object namespace, status codes) running in the browser
+# with the hardware layer provided by JS host imports.
+[package]
+name = "ntoskrnl-wasm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "s"

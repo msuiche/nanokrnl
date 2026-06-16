@@ -10,7 +10,7 @@ members = ["kernel", "boot", "ntabi"]
 # The test driver is its own workspace (different target + linker flags);
 # excluded here so `cargo build` of the kernel workspace doesn't try to
 # cross-compile it. See driver/ and its build instructions.
-exclude = ["driver", "userapp", "userapp2", "worker", "kernel32", "msvcrt"]
+exclude = ["driver", "userapp", "userapp2", "worker", "kernel32", "msvcrt", "wasm"]
 
 # The kernel is interrupt- and lock-sensitive: panics must abort (no unwinding
 # machinery exists in a freestanding environment), and we keep enough debug

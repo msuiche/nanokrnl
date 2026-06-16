@@ -43,3 +43,7 @@ drivers/*.sys
 
 # OMC tooling state
 .omc/
+
+# WASM build
+wasm/target/
+wasm/web/*.wasm
