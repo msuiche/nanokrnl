@@ -61,6 +61,9 @@ pub struct Cpu {
     /// Transient: the active segment base for the current instruction's memory
     /// operands (0 unless a 0x64/0x65 prefix selected FS/GS). Reset each step.
     seg_base: u64,
+    /// SSE/XMM registers (128-bit). The MSVC CRT uses these to zero/copy stack
+    /// buffers (`xorps`/`movaps`/`movdqa`).
+    pub xmm: [u128; 16],
 }
 
 /// Low-`size`-bytes mask as a u128 (size 8 -> full 64-bit mask).
@@ -110,7 +113,7 @@ enum Rm {
 
 impl Default for Cpu {
     fn default() -> Self {
-        Cpu { regs: [0; 16], rip: 0, rflags: 0, gs_base: 0, fs_base: 0, seg_base: 0 }
+        Cpu { regs: [0; 16], rip: 0, rflags: 0, gs_base: 0, fs_base: 0, seg_base: 0, xmm: [0; 16] }
     }
 }
 
@@ -201,6 +204,38 @@ impl Cpu {
         }
         true
     }
+    fn load128(mem: &[u8], addr: u64) -> Option<u128> {
+        let a = addr as usize;
+        if a + 16 > mem.len() {
+            return None;
+        }
+        Some(u128::from_le_bytes(mem[a..a + 16].try_into().ok()?))
+    }
+    fn store128(mem: &mut [u8], addr: u64, val: u128) -> bool {
+        let a = addr as usize;
+        if a + 16 > mem.len() {
+            return false;
+        }
+        mem[a..a + 16].copy_from_slice(&val.to_le_bytes());
+        true
+    }
+    /// Read a 128-bit SSE operand (an XMM register or a 16-byte memory operand).
+    fn read_xmm_rm(&self, mem: &[u8], rm: Rm) -> Option<u128> {
+        match rm {
+            Rm::Reg(r) => Some(self.xmm[r]),
+            Rm::Mem(a) => Self::load128(mem, a),
+        }
+    }
+    fn write_xmm_rm(&mut self, mem: &mut [u8], rm: Rm, val: u128) -> bool {
+        match rm {
+            Rm::Reg(r) => {
+                self.xmm[r] = val;
+                true
+            }
+            Rm::Mem(a) => Self::store128(mem, a, val),
+        }
+    }
+
     fn read_rm(&self, mem: &[u8], rm: Rm, size: u8) -> Option<u64> {
         match rm {
             Rm::Reg(r) => {
@@ -314,12 +349,17 @@ impl Cpu {
         // rest are consumed — size/rep semantics handled per-opcode as needed).
         self.seg_base = 0;
         let mut opsize16 = false;
+        let mut mp: u8 = 0; // mandatory prefix for SSE (0x66/0xF2/0xF3)
         loop {
             match fetch(pc) {
                 0x65 => self.seg_base = self.gs_base,
                 0x64 => self.seg_base = self.fs_base,
-                0x66 => opsize16 = true,
-                0x67 | 0xf0 | 0xf2 | 0xf3 | 0x2e | 0x36 | 0x3e | 0x26 => {}
+                0x66 => {
+                    opsize16 = true;
+                    mp = 0x66;
+                }
+                0xf2 | 0xf3 => mp = fetch(pc),
+                0x67 | 0xf0 | 0x2e | 0x36 | 0x3e | 0x26 => {}
                 _ => break,
             }
             pc += 1;
@@ -403,6 +443,33 @@ impl Cpu {
                     None => return self.fault(rm),
                 };
                 self.regs[reg] = if rex_w { v } else { v & 0xFFFF_FFFF };
+                self.rip = pc as u64;
+                StepResult::Ok
+            }
+            // 8-bit mov: 0x88 r/m8,r8 ; 0x8A r8,r/m8. Byte writes preserve the
+            // rest of a destination register (no zero-extension).
+            0x88 | 0x8a => {
+                let to_reg = b == 0x8a;
+                pc += 1;
+                let (reg, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                pc = npc;
+                if to_reg {
+                    let v = match self.read_rm(mem, rm, 1) {
+                        Some(v) => v & 0xff,
+                        None => return self.fault(rm),
+                    };
+                    self.regs[reg] = (self.regs[reg] & !0xff) | v;
+                } else {
+                    let v = self.regs[reg] & 0xff;
+                    match rm {
+                        Rm::Reg(r) => self.regs[r] = (self.regs[r] & !0xff) | v,
+                        Rm::Mem(a) => {
+                            if !Self::store(mem, a, v, 1) {
+                                return StepResult::Fault { addr: a };
+                            }
+                        }
+                    }
+                }
                 self.rip = pc as u64;
                 StepResult::Ok
             }
@@ -571,6 +638,76 @@ impl Cpu {
             }
             0x90 => {
                 self.rip = (pc + 1) as u64; // nop
+                StepResult::Ok
+            }
+            // test r/m8, r8 (0x84): 8-bit AND for flags only.
+            0x84 => {
+                pc += 1;
+                let (reg, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                pc = npc;
+                let a = match self.read_rm(mem, rm, 1) {
+                    Some(v) => v & 0xff,
+                    None => return self.fault(rm),
+                };
+                let regv = self.regs[reg] & 0xff;
+                self.apply_alu(4, a, regv, 1);
+                self.rip = pc as u64;
+                StepResult::Ok
+            }
+            // 8-bit unary group (0xF6 /digit): test imm8 / not / neg / mul / div.
+            0xf6 => {
+                pc += 1;
+                let (sub, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                pc = npc;
+                let a = match self.read_rm(mem, rm, 1) {
+                    Some(v) => v & 0xff,
+                    None => return self.fault(rm),
+                };
+                match sub & 7 {
+                    0 | 1 => {
+                        let imm = fetch(pc) as u64;
+                        pc += 1;
+                        self.apply_alu(4, a, imm, 1);
+                    }
+                    2 => {
+                        if !self.write_rm(mem, rm, !a & 0xff, 1) {
+                            return self.fault(rm);
+                        }
+                    }
+                    3 => {
+                        let (r, _) = self.apply_alu(5, 0, a, 1);
+                        if !self.write_rm(mem, rm, r, 1) {
+                            return self.fault(rm);
+                        }
+                    }
+                    4 | 5 => {
+                        // mul/imul: AX = AL * r/m8
+                        let al = self.regs[RAX] & 0xff;
+                        let prod = if sub & 7 == 4 {
+                            (al * a) & 0xffff
+                        } else {
+                            (((al as i8 as i64) * (a as i8 as i64)) as u64) & 0xffff
+                        };
+                        self.regs[RAX] = (self.regs[RAX] & !0xffff) | prod;
+                    }
+                    6 | 7 => {
+                        // div/idiv: AL = AX / r/m8, AH = AX % r/m8
+                        if a == 0 {
+                            return StepResult::Fault { addr: 0 };
+                        }
+                        let ax = self.regs[RAX] & 0xffff;
+                        let (q, r) = if sub & 7 == 6 {
+                            (ax / a, ax % a)
+                        } else {
+                            let n = ax as i16 as i64;
+                            let d = a as i8 as i64;
+                            ((n / d) as u64 & 0xff, (n % d) as u64 & 0xff)
+                        };
+                        self.regs[RAX] = (self.regs[RAX] & !0xffff) | (q & 0xff) | ((r & 0xff) << 8);
+                    }
+                    _ => return StepResult::Unknown { rip: start, byte: 0xf6 },
+                }
+                self.rip = pc as u64;
                 StepResult::Ok
             }
             // unary group 3 (0xF7 /digit): test imm / not / neg / mul / imul /
@@ -850,6 +987,83 @@ impl Cpu {
                             low // zero-extend
                         };
                         self.regs[reg] = if size == 4 { val & 0xFFFF_FFFF } else { val };
+                        self.rip = pc as u64;
+                        StepResult::Ok
+                    }
+                    // bit-test group (0F BA /digit, imm8): /4 bt /5 bts /6 btr
+                    // /7 btc. CF = the tested bit; set/reset/complement write back.
+                    0xba => {
+                        pc += 2;
+                        let (sel, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                        pc = npc;
+                        let imm = fetch(pc) as u32;
+                        pc += 1;
+                        let bit = imm & (size as u32 * 8 - 1);
+                        let v = match self.read_rm(mem, rm, size) {
+                            Some(v) => v,
+                            None => return self.fault(rm),
+                        };
+                        self.set_flag(CF, (v >> bit) & 1 == 1);
+                        let res = match sel & 7 {
+                            5 => Some(v | (1u64 << bit)),  // bts
+                            6 => Some(v & !(1u64 << bit)), // btr
+                            7 => Some(v ^ (1u64 << bit)),  // btc
+                            _ => None,                     // bt (4): no writeback
+                        };
+                        if let Some(r) = res {
+                            if !self.write_rm(mem, rm, r, size) {
+                                return self.fault(rm);
+                            }
+                        }
+                        self.rip = pc as u64;
+                        StepResult::Ok
+                    }
+                    // multi-byte NOP (0F 1F /0) — consume the ModRM operand, do
+                    // nothing. Used by compilers for alignment padding.
+                    0x1f => {
+                        pc += 2;
+                        let (_, _, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                        self.rip = npc as u64;
+                        StepResult::Ok
+                    }
+                    // SSE 128-bit moves: load to xmm (0F 10 movups, 0F 28 movaps,
+                    // 66/F3 0F 6F movdqa/u) and store from xmm (0F 11, 0F 29,
+                    // 66/F3 0F 7F). We move the full 128 bits (enough for the
+                    // CRT's buffer zero/copy).
+                    0x10 | 0x28 | 0x6f => {
+                        pc += 2;
+                        let (reg, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                        pc = npc;
+                        let v = match self.read_xmm_rm(mem, rm) {
+                            Some(v) => v,
+                            None => return self.fault(rm),
+                        };
+                        self.xmm[reg] = v;
+                        self.rip = pc as u64;
+                        StepResult::Ok
+                    }
+                    0x11 | 0x29 | 0x7f => {
+                        pc += 2;
+                        let (reg, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                        pc = npc;
+                        let v = self.xmm[reg];
+                        if !self.write_xmm_rm(mem, rm, v) {
+                            return self.fault(rm);
+                        }
+                        self.rip = pc as u64;
+                        StepResult::Ok
+                    }
+                    // xorps (0F 57) / xorpd (66 0F 57) / pxor (66 0F EF): 128-bit
+                    // bitwise xor — `xorps xmm,xmm` is the idiom for zeroing.
+                    0x57 | 0xef => {
+                        pc += 2;
+                        let (reg, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                        pc = npc;
+                        let v = match self.read_xmm_rm(mem, rm) {
+                            Some(v) => v,
+                            None => return self.fault(rm),
+                        };
+                        self.xmm[reg] ^= v;
                         self.rip = pc as u64;
                         StepResult::Ok
                     }

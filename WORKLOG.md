@@ -148,12 +148,20 @@ target runs. Same evidence-driven loop that cracked whoami/more natively. Flags
     inc/dec/call/jmp/push r/m); `jcc` rel8/32 + `setcc` (full 16 condition
     codes); FS/GS **segment-override prefixes** + `gs_base`/`fs_base` (so
     `gs:[...]` TEB access works); `syscall`.
-  - **Result: the real `whoami.exe` now executes ~311 instructions** in the
-    interpreter — through `__security_init_cookie`, the CRT startup, IAT import
-    calls (GetSystemTimeAsFileTime, QueryPerformanceCounter, _initterm C++
-    ctors, …). 12 emu host tests pass. **Next frontier: SSE/XMM** (`xorps`,
-    `movdqa`, …) — the CRT zero-inits buffers with 128-bit ops — then route
-    imports/`syscall` into the WASM kernel's services.
+  - Added since: SSE/XMM moves (`movups`/`movaps`/`movdqa`/`movdqu`) + `xorps`/
+    `pxor` (XMM regs + mandatory-prefix tracking), multi-byte `nop` (0F 1F),
+    8-bit `mov`/`test`, the bit-test group (0F BA), and the 8-bit unary group
+    (0xF6).
+  - **MILESTONE: the real `whoami.exe` now executes to completion** — **1874
+    instructions** through `__security_init_cookie`, the full CRT startup,
+    `_initterm` C++ ctors, `main`, and `exit`/`_cexit` → clean HALT, with **no
+    unimplemented opcode**. Imports are still faked (return 0), so it doesn't
+    print the user *yet*. 12 emu host tests pass.
+  - **Next: service imports for real** — route the IAT traps (GetStdHandle,
+    WriteFile/WriteConsoleW, OpenProcessToken, GetTokenInformation,
+    LookupAccountSidW, …) to the kernel's implementations so `whoami` actually
+    prints `nanokrnl\user`. Then wire the interpreter into the kernel's `run`
+    path so it's invocable from the `C:\>` shell.
 - [ ] **B1 — usermode core.** Implement the ALU/mov/stack/jump/string/SSE2 subset
   the MSVC CRT + our shims use; wire `syscall` → existing SSDT. Milestone: a
   tiny own-ABI program, then **`whoami` runs in the browser**.
