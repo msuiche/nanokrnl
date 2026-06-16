@@ -614,12 +614,34 @@ pub unsafe extern "C" fn _initterm(first: *const Option<extern "C" fn()>, last: 
     }
 }
 
+/// `_initterm_e(first, last)` — like [`_initterm`] but each initializer returns
+/// an `int`; a non-zero result aborts the sequence and is returned. Used for the
+/// C initializers (`__xi_a`..`__xi_z`) that can fail; the ucrt startup checks
+/// the result, so leaving this a return-0 stub silently skips initialization
+/// (e.g. ulib's global setup, leaving a C++ tool like more.com inert).
+#[no_mangle]
+pub unsafe extern "C" fn _initterm_e(
+    first: *const Option<extern "C" fn() -> i32>,
+    last: *const Option<extern "C" fn() -> i32>,
+) -> i32 {
+    let mut p = first;
+    while p < last {
+        if let Some(f) = *p {
+            let r = f();
+            if r != 0 {
+                return r;
+            }
+        }
+        p = p.add(1);
+    }
+    0
+}
+
 const MAX_ARGS: usize = 32;
 static mut ARGV_BUF: [u8; 256] = [0; 256]; // command line, tokenized in place
 static mut ARGV: [*const u8; MAX_ARGS + 1] = [core::ptr::null(); MAX_ARGS + 1];
 static mut ENVP: [*const u8; 1] = [core::ptr::null()];
 static mut ARGC: i32 = 0;
-static mut ARGV_BUILT: bool = false;
 // ucrt narrow-arg model: `__p___argv()` returns `char***` (a pointer to the
 // variable holding argv), so we keep a variable that holds the argv pointer.
 static mut ARGV_VAR: *const *const u8 = core::ptr::null();
@@ -630,9 +652,13 @@ static mut FMODE: i32 = 0;
 /// in-place NUL-split, no quote handling yet) into [`ARGV`]/[`ARGC`]. Idempotent
 /// — runs once, then later callers reuse the built table.
 unsafe fn build_argv() {
-    if ARGV_BUILT {
-        return;
-    }
+    // No caching: this shim's data segment is shared across every process, so a
+    // cached argv would leak the first process's command line into the next
+    // (e.g. cmd's "cmd.exe" into a child's "more readme.txt"). Re-fetch the
+    // current thread's command line each call — only one user thread runs at a
+    // time (a shell blocks while its child runs), so the syscall always returns
+    // the caller's own command line, and rebuilding into the shared buffers is
+    // idempotent within a single process.
     let got =
         syscall3(NT_GET_COMMAND_LINE, (&raw mut ARGV_BUF) as u64, (ARGV_BUF.len() - 1) as u64, 0) as usize;
     let n = got.min(ARGV_BUF.len() - 1);
@@ -659,7 +685,6 @@ unsafe fn build_argv() {
     ENVP[0] = core::ptr::null();
     ARGC = count as i32;
     ARGV_VAR = (&raw const ARGV) as *const *const u8;
-    ARGV_BUILT = true;
 }
 
 /// `__getmainargs(&argc, &argv, &envp, doWildcard, startInfo)` — the legacy

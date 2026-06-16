@@ -202,6 +202,10 @@ pub struct LoadedProcess {
     pub image_base: u64,
     /// Mapped image size (for the debugger's module map).
     pub image_size: u64,
+    /// Physical base of the TEB/PEB/parameters control block. Lets the kernel
+    /// patch process-parameter fields (e.g. the real command line) after load,
+    /// via the physical window, without switching into the process address space.
+    pub block_phys: crate::mm::PhysAddr,
 }
 
 /// Top of the per-process user stack (low canonical half).
@@ -339,7 +343,7 @@ pub fn load_user_process(data: &[u8]) -> Result<LoadedProcess, NtStatus> {
     // (PEB) chained from it; the CRT and many APIs read standard handles, the
     // current directory, the loaded-module list and thread-local storage from
     // these. Lay them all out below the stack.
-    setup_user_blocks(SetupBlocks {
+    let block_phys = setup_user_blocks(SetupBlocks {
         cr3,
         preferred_base,
         stk_base,
@@ -356,6 +360,7 @@ pub fn load_user_process(data: &[u8]) -> Result<LoadedProcess, NtStatus> {
         teb: TEB_BASE,
         image_base: preferred_base,
         image_size: size_of_image as u64,
+        block_phys,
     })
 }
 
@@ -394,7 +399,7 @@ fn next_client_id() -> (u64, u64) {
 /// static-TLS array, and an environment block for a freshly loaded image.
 /// Offsets follow the x64 NT layout. Best-effort: a field we can't fill yet
 /// (e.g. the real command line, set later per-thread) gets a sane placeholder.
-fn setup_user_blocks(s: SetupBlocks) -> Result<(), NtStatus> {
+fn setup_user_blocks(s: SetupBlocks) -> Result<crate::mm::PhysAddr, NtStatus> {
     let blk = crate::mm::phys::mm_allocate_contiguous_pages(USER_BLOCK_PAGES)
         .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
     unsafe {
@@ -472,7 +477,14 @@ fn setup_user_blocks(s: SetupBlocks) -> Result<(), NtStatus> {
         // CurrentDirectory: CURDIR { UNICODE_STRING DosPath @0x38; HANDLE @0x48 }
         wstr(PARAMS_OFF + 0x38, TEB_BASE + cd_off as u64, cd_n);
         wstr(PARAMS_OFF + 0x60, TEB_BASE + (ip_off) as u64, ip_n); // ImagePathName
-        wstr(PARAMS_OFF + 0x70, TEB_BASE + (ip_off) as u64, ip_n); // CommandLine
+        // CommandLine lives in a dedicated buffer (CMDLINE_BUF_OFF) so the real
+        // invocation can be patched in after load via `set_command_line` — a
+        // binary that reads `PEB.ProcessParameters.CommandLine` directly (e.g.
+        // ulib-based tools like more.com) needs the actual arguments, not the
+        // image path. Seed it with the placeholder for callers that never patch.
+        let cl_off = PARAMS_OFF + CMDLINE_BUF_OFF;
+        let cl_n = wbuf(cl_off, b"C:\\program.exe");
+        wstr(PARAMS_OFF + 0x70, TEB_BASE + cl_off as u64, cl_n); // CommandLine
         w64(PARAMS_OFF + 0x80, ENV_BASE); // Environment
 
         // ---- PEB_LDR_DATA + one LDR_DATA_TABLE_ENTRY for the image ----
@@ -553,7 +565,38 @@ fn setup_user_blocks(s: SetupBlocks) -> Result<(), NtStatus> {
         }
         *(b.add(eo) as *mut u16) = 0; // block terminator (extra NUL)
     }
-    Ok(())
+    Ok(blk)
+}
+
+/// Offset of the command-line buffer within the process-parameters region. It
+/// sits past the current-directory / image-path strings (which end well before
+/// +0x800) and leaves the rest of the page for the command line itself.
+const CMDLINE_BUF_OFF: usize = 0x800;
+/// Largest command line (in UTF-16 chars) the reserved buffer holds: the params
+/// region runs to the next page (LDR_BASE), so 0x800..0x1000 = 0x800 bytes.
+const CMDLINE_MAX_CHARS: usize = 0x800 / 2 - 1;
+
+/// Patch a freshly loaded process's `PEB.ProcessParameters.CommandLine` with its
+/// real invocation (ASCII `cmdline`, widened to UTF-16). Must be called before
+/// the process first runs. Tools that read the command line straight from the
+/// PEB — e.g. ulib-based binaries (more.com) — rely on this; the kernel32
+/// `GetCommandLine` syscall path is fed separately (per-thread `cmdline_ptr`).
+pub fn set_command_line(proc: &LoadedProcess, cmdline: &[u8]) {
+    const PARAMS_OFF: usize = (PARAMS_BASE - TEB_BASE) as usize;
+    let n = cmdline.len().min(CMDLINE_MAX_CHARS);
+    unsafe {
+        let b = crate::mm::phys_to_virt(proc.block_phys);
+        let buf = b.add(PARAMS_OFF + CMDLINE_BUF_OFF);
+        for i in 0..n {
+            *(buf.add(i * 2) as *mut u16) = cmdline[i] as u16;
+        }
+        *(buf.add(n * 2) as *mut u16) = 0;
+        // Update the CommandLine UNICODE_STRING header (ProcessParameters+0x70).
+        let hdr = b.add(PARAMS_OFF + 0x70);
+        *(hdr as *mut u16) = (n * 2) as u16; // Length (excl. NUL)
+        *(hdr.add(2) as *mut u16) = ((n + 1) * 2) as u16; // MaximumLength
+        *(hdr.add(8) as *mut u64) = PARAMS_BASE + CMDLINE_BUF_OFF as u64; // Buffer
+    }
 }
 
 /// Parse, allocate, copy sections, and apply base relocations. Shared by

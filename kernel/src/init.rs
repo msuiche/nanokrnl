@@ -431,6 +431,11 @@ pub(crate) fn create_user_process(image: &[u8], cmdline: &[u8]) -> u64 {
         Ok(p) => p,
         Err(_) => return 0,
     };
+    // Patch the PEB command line with the real invocation so a tool that reads
+    // PEB.ProcessParameters.CommandLine directly (e.g. ulib's more.com) sees its
+    // arguments. The per-thread cmdline (for the GetCommandLine syscall) is set
+    // below; this covers the PEB-reading path.
+    crate::ldr::pe::set_command_line(&proc, cmdline);
     let t = match spawn_process_thread(proc.entry_va, proc.user_rsp, proc.cr3.0, proc.teb) {
         Ok(t) => t,
         Err(_) => return 0,

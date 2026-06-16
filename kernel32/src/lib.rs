@@ -1674,19 +1674,20 @@ pub unsafe extern "C" fn IncrementCounter() -> u64 {
 /// kernel returns the *calling thread's* per-process command line.
 static mut COMMAND_LINE_A: [u8; 260] = [0; 260];
 static mut COMMAND_LINE_W: [u16; 260] = [0; 260];
-static mut COMMAND_LINE_READY: bool = false;
 
 unsafe fn ensure_command_line() {
-    if COMMAND_LINE_READY {
-        return;
-    }
+    // No caching: this shim's data is shared across every process, so a cached
+    // command line would leak the first process's into the next (e.g. cmd's
+    // "cmd.exe" into a child that parses GetCommandLineW for its arguments, like
+    // more.com via ulib). Re-fetch the caller's own command line each call — one
+    // user thread runs at a time, so the syscall returns the right one, and
+    // rewriting the shared buffers is idempotent within a process.
     let n = syscall3(NT_GET_COMMAND_LINE, (&raw mut COMMAND_LINE_A) as u64, 259, 0) as usize;
     let n = n.min(259);
     COMMAND_LINE_A[n] = 0;
     for i in 0..=n {
         COMMAND_LINE_W[i] = COMMAND_LINE_A[i] as u16;
     }
-    COMMAND_LINE_READY = true;
 }
 
 /// `GetCommandLineA()` — the calling process's command line (NUL-terminated).
