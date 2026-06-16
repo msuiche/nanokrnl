@@ -194,6 +194,7 @@ pub extern "C" fn kernel_main() -> i32 {
     // command lines to `kernel_input` (see below). This is what makes it a live
     // kernel in the page rather than a one-shot self test.
     println("");
+    println("Microsoft Windows [Version 10.0] — nanokrnl command interpreter");
     println("Type 'help' for commands.");
     prompt();
     if all {
@@ -211,9 +212,11 @@ pub extern "C" fn kernel_main() -> i32 {
 // "executables" plug in, as guest WASM modules over the syscall surface, since
 // WASM can't execute the x86 PE binaries the native kernel runs.)
 
-/// The shell prompt.
+/// The shell prompt — cmd-style, since the command interpreter is the default
+/// shell here. (Once the emulator can run the real cmd.exe, this built-in shell
+/// is replaced by booting that binary.)
 fn prompt() {
-    print("\nnanokrnl> ");
+    print("\nC:\\> ");
 }
 
 /// A handle the shell opened, for `handles`/`close`.
