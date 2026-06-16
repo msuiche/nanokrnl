@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "ntoskrnl-wasm"
 version = "0.1.0"
+dependencies = [
+ "x86emu",
+]
+
+[[package]]
+name = "x86emu"
+version = "0.1.0"

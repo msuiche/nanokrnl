@@ -285,7 +285,8 @@ fn dispatch(line: &str) {
             println("  ver             kernel version banner");
             println("  whoami          current user");
             println("  echo <text>     print text");
-            println("  run <prog>      load and run a guest program (e.g. 'run hello')");
+            println("  run <prog>      load and run a guest WASM program (e.g. 'run hello')");
+            println("  run86           run a real x86-64 program through our emulator");
             println("  mem             pool bytes in use");
             println("  mkobj           create a kernel object + open a handle (real ob)");
             println("  handles         list open handles");
@@ -304,6 +305,7 @@ fn dispatch(line: &str) {
             println(args);
         }
         "run" => cmd_run(args),
+        "run86" => cmd_run86(),
         "mem" => {
             print("pool in use: ");
             print_usize(mm::pool::pool_used());
@@ -342,6 +344,86 @@ fn cmd_run(name: &str) {
         print_usize(code as usize);
         println("]");
     }
+}
+
+/// Run a real x86-64 program through our own interpreter (Track B). The program
+/// is hand-assembled machine code; it prints via a `syscall` the kernel
+/// services here (service 1 = write `[edi..edi+esi)`), proving x86 code runs
+/// inside the WASM kernel with no emulator import and no x86 hardware.
+fn cmd_run86() {
+    // Emulator "physical memory": code at 0, data at 0x200, stack at the top.
+    static mut EMU_MEM: [u8; 4096] = [0; 4096];
+    let mem = unsafe { &mut *(&raw mut EMU_MEM) };
+    for byte in mem.iter_mut() {
+        *byte = 0;
+    }
+
+    let msg = b"hello from real x86-64 machine code, executed by our interpreter\n";
+    let data_off: u32 = 0x200;
+    mem[data_off as usize..data_off as usize + msg.len()].copy_from_slice(msg);
+
+    // mov eax,1 ; mov edi,data_off ; mov esi,len ; syscall ; ret
+    fn put(code: &mut [u8], n: &mut usize, bytes: &[u8]) {
+        code[*n..*n + bytes.len()].copy_from_slice(bytes);
+        *n += bytes.len();
+    }
+    let mut code = [0u8; 32];
+    let mut n = 0usize;
+    put(&mut code, &mut n, &[0xb8]);
+    put(&mut code, &mut n, &1u32.to_le_bytes()); // mov eax, 1 (service: write)
+    put(&mut code, &mut n, &[0xbf]);
+    put(&mut code, &mut n, &data_off.to_le_bytes()); // mov edi, data ptr
+    put(&mut code, &mut n, &[0xbe]);
+    put(&mut code, &mut n, &(msg.len() as u32).to_le_bytes()); // mov esi, len
+    put(&mut code, &mut n, &[0x0f, 0x05]); // syscall
+    put(&mut code, &mut n, &[0xc3]); // ret
+    mem[..n].copy_from_slice(&code[..n]);
+
+    use x86emu::{Cpu, StepResult, RAX};
+    let mut cpu = Cpu::new();
+    let stack_top = mem.len() as u64;
+    cpu.setup_frame(mem, 0, stack_top);
+    let mut guard = 0;
+    loop {
+        guard += 1;
+        if guard > 100_000 {
+            println("run86: step limit reached");
+            return;
+        }
+        match cpu.step(mem) {
+            StepResult::Ok => {}
+            StepResult::Syscall => {
+                let svc = cpu.regs[RAX] & 0xFFFF_FFFF;
+                if svc == 1 {
+                    // write: edi = ptr, esi = len (regs 7 and 6).
+                    let ptr = (cpu.regs[7] & 0xFFFF_FFFF) as usize;
+                    let len = (cpu.regs[6] & 0xFFFF_FFFF) as usize;
+                    if ptr + len <= mem.len() {
+                        if let Ok(s) = core::str::from_utf8(&mem[ptr..ptr + len]) {
+                            print(s);
+                        }
+                    }
+                }
+                // svc 0 (or any other) would be "exit"; fall through to continue.
+            }
+            StepResult::Halt => break,
+            StepResult::Unknown { rip, byte } => {
+                print("run86: unimplemented opcode 0x");
+                print_hex(byte as u64);
+                print(" at rip 0x");
+                print_hex(rip);
+                println("");
+                return;
+            }
+            StepResult::Fault { addr } => {
+                print("run86: memory fault at 0x");
+                print_hex(addr);
+                println("");
+                return;
+            }
+        }
+    }
+    println("[run86: x86-64 program exited]");
 }
 
 /// Create a real `ob` object and open a handle to it (the handle holds a

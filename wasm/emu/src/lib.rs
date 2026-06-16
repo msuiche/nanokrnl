@@ -46,6 +46,10 @@ pub struct Cpu {
 pub enum StepResult {
     Ok,
     Halt,
+    /// Executed a `syscall` (rip already advanced past it). The caller inspects
+    /// the registers (per our ABI: `eax` = service number, args in the integer
+    /// regs), services it against the kernel, and resumes by calling `step`.
+    Syscall,
     Unknown { rip: u64, byte: u8 },
     /// Out-of-bounds memory access at `addr` — the program faulted.
     Fault { addr: u64 },
@@ -375,6 +379,19 @@ impl Cpu {
                 self.rip = (pc + 1) as u64; // nop
                 StepResult::Ok
             }
+            // two-byte opcodes (0x0F ...)
+            0x0f => {
+                let b2 = fetch(pc + 1);
+                match b2 {
+                    0x05 => {
+                        // syscall — advance past the 2-byte opcode; the caller
+                        // services it from the register state and resumes.
+                        self.rip = (pc + 2) as u64;
+                        StepResult::Syscall
+                    }
+                    _ => StepResult::Unknown { rip: start, byte: 0x0f },
+                }
+            }
             other => StepResult::Unknown { rip: start, byte: other },
         }
     }
@@ -401,12 +418,20 @@ impl Cpu {
         }
     }
 
-    /// Set up an initial frame (entry + stack with a HALT_ADDR return), then run
-    /// until Halt/Unknown/Fault, capped at `max_steps`.
-    pub fn run_program(&mut self, mem: &mut [u8], entry: u64, stack_top: u64, max_steps: usize) -> StepResult {
+    /// Set up an initial call frame: entry point in `rip`, `rsp` at `stack_top`,
+    /// and a `HALT_ADDR` return address pushed so a final `ret` stops the
+    /// interpreter (mirrors the native loader's NtTerminateThread return stub).
+    pub fn setup_frame(&mut self, mem: &mut [u8], entry: u64, stack_top: u64) {
         self.rip = entry;
         self.regs[RSP] = stack_top;
         self.push64(mem, HALT_ADDR);
+    }
+
+    /// Set up a frame and run until Halt/Syscall/Unknown/Fault, capped at
+    /// `max_steps`. (A caller that needs to service syscalls should drive
+    /// [`Cpu::step`] directly after [`Cpu::setup_frame`].)
+    pub fn run_program(&mut self, mem: &mut [u8], entry: u64, stack_top: u64, max_steps: usize) -> StepResult {
+        self.setup_frame(mem, entry, stack_top);
         for _ in 0..max_steps {
             match self.step(mem) {
                 StepResult::Ok => continue,
@@ -496,6 +521,20 @@ mod tests {
         let mut cpu = Cpu::new();
         assert_eq!(cpu.run_program(&mut mem, 0, 240, 1000), StepResult::Halt);
         assert_eq!(cpu.regs[RCX], 0x1234);
+    }
+
+    #[test]
+    fn syscall_traps_with_service_in_eax() {
+        // mov eax,7 ; syscall ; ret
+        let mut mem = vec![0u8; 256];
+        let code = [0xb8, 7, 0, 0, 0, 0x0f, 0x05, 0xc3];
+        mem[..code.len()].copy_from_slice(&code);
+        let mut cpu = Cpu::new();
+        // run_program stops at the syscall (first non-Ok result).
+        assert_eq!(cpu.run_program(&mut mem, 0, 240, 1000), StepResult::Syscall);
+        assert_eq!(cpu.regs[RAX], 7);
+        // resuming continues to the ret -> Halt.
+        assert_eq!(cpu.step(&mut mem), StepResult::Halt);
     }
 
     #[test]

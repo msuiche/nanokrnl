@@ -12,6 +12,11 @@ edition = "2021"
 name = "nanokrnl"
 crate-type = ["cdylib"]
 
+[dependencies]
+# Our x86-64 interpreter (Track B). Drives the `run86` command: the kernel runs
+# real x86 machine code and services its `syscall`s.
+x86emu = { path = "emu" }
+
 [profile.dev]
 panic = "abort"
 
