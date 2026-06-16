@@ -68,9 +68,20 @@ Hardware (needs substitution behind a HAL boundary; ~16 files use `asm!`/ports):
 - [ ] **Phase 4 — Boot path & self-tests.** Run the hardware-independent self
   tests (pool stress, ob, cm, ramfs) from `kernel_main()` in the browser and
   report pass/fail to the page.
-- [ ] **Phase 5 (stretch) — user code.** Without x86 execution, "user programs"
-  can't be the real PE binaries. Option: run WASM-compiled task modules against
-  the NT syscall surface, or a tiny bytecode interpreter. Scoped later.
+- [x] **Interactive console.** The WASM kernel is now interactive: event-driven
+  input (`kernel_input_ptr` exposes a fixed buffer; the host writes a line and
+  calls `kernel_input(len)`), a shell prompt, and a built-in command set
+  (`help`, `ver`, `echo`, `mem`, `mkobj`, `handles`, `close`, `cls`) driving the
+  real subsystems — e.g. `mkobj`/`close` create and tear down real `ob` objects,
+  delete procedure and all. Both hosts updated: browser (input field) and Node
+  (readline; also scriptable via a pipe). Verified.
+- [ ] **Phase 5 — running "executables".** WASM cannot execute the x86-64 PE
+  binaries the native kernel runs (no emulation, per the goal). So in the WASM
+  world an "executable" must be a **guest WASM module** that calls the kernel's
+  NT-style syscalls (the host bridges guest↔kernel), or a built-in command.
+  Plan: define a minimal syscall ABI export surface, load a guest `.wasm` as a
+  second instance sharing the kernel's services, and add a `run <prog>` command.
+  This is the path to "give an executable for running" within WASM's limits.
 
 ### Decisions / constraints
 
@@ -109,4 +120,9 @@ DllMain + CRT/console surface), 47047aa (file mapping + RtlIsTextUnicode).
   too, with the first HAL shims — `mm::pool` (arena) and `ke::spinlock`
   (single-threaded). The browser kernel now does real reference-counted object
   lifetimes (create → handle → close → delete procedure). Verified (exit 0).
-  Next: `cm`/`ramfs`.
+- **Interactive console**: the WASM kernel now takes typed commands and runs them
+  against the real subsystems (`mkobj`/`handles`/`close` drive real `ob` objects;
+  `mem` reports pool use; `ver`/`echo`/`help`/`cls`). Event-driven input via
+  `kernel_input`. Browser (input field) + Node (readline / scriptable) hosts.
+  Verified a full scripted session. Next decision for "run executables": guest
+  WASM modules over a syscall ABI (x86 PE binaries can't run without emulation).

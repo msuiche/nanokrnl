@@ -6,73 +6,83 @@
 <title>ntoskrnl-rs — WebAssembly</title>
 <style>
   :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
   body {
     margin: 0; background: #0b0e14; color: #c0caf5;
     font: 14px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-    display: flex; flex-direction: column; min-height: 100vh;
+    display: flex; flex-direction: column; height: 100vh;
   }
-  header { padding: 12px 16px; border-bottom: 1px solid #1f2335; background: #11141c; }
+  header { padding: 10px 16px; border-bottom: 1px solid #1f2335; background: #11141c; }
   header b { color: #7aa2f7; }
   header span { color: #565f89; }
-  #console {
-    flex: 1; margin: 0; padding: 16px; white-space: pre-wrap; word-break: break-word;
-    overflow-y: auto;
-  }
+  #console { flex: 1; margin: 0; padding: 16px; white-space: pre-wrap; word-break: break-word; overflow-y: auto; }
   .ok   { color: #9ece6a; }
   .fail { color: #f7768e; }
   .dim  { color: #565f89; }
-  button {
-    font: inherit; background: #283457; color: #c0caf5; border: 1px solid #3b4261;
-    border-radius: 6px; padding: 6px 12px; cursor: pointer; margin: 8px 16px;
-  }
-  button:hover { background: #364a82; }
+  #inputRow { display: flex; border-top: 1px solid #1f2335; background: #11141c; padding: 8px 16px; }
+  #inputRow label { color: #7aa2f7; padding-right: 8px; white-space: pre; }
+  #cmd { flex: 1; background: transparent; border: 0; color: #c0caf5; font: inherit; outline: none; }
 </style>
 </head>
 <body>
   <header>
-    <b>ntoskrnl-rs</b> <span>· NT-compatible kernel running as a WebAssembly module (hardware layer = this page)</span>
+    <b>ntoskrnl-rs</b> <span>· interactive NT kernel as a WebAssembly module (hardware = this page; type 'help')</span>
   </header>
   <pre id="console"></pre>
-  <button id="reboot">Reboot</button>
+  <div id="inputRow"><label>nanokrnl&gt;</label><input id="cmd" autofocus autocomplete="off" spellcheck="false"></div>
 
 <script type="module">
 const consoleEl = document.getElementById("console");
+const cmdEl = document.getElementById("cmd");
 
-// Render kernel console output, lightly colorizing the self-test markers.
+// Render kernel output, lightly colorizing self-test / prompt lines.
 function emit(text) {
   for (const line of text.split(/(?<=\n)/)) {
     const span = document.createElement("span");
     if (line.includes("[ OK ]") || line.startsWith("ALL SELF TESTS PASSED")) span.className = "ok";
-    else if (line.includes("[FAIL]") || line.includes("FAILED")) span.className = "fail";
-    else if (line.startsWith("KiSystemStartup") || line.includes("wasm32")) span.className = "dim";
+    else if (line.includes("[FAIL]") || line.includes("FAILED") || line.includes("not recognized")) span.className = "fail";
+    else if (line.startsWith("KiSystemStartup") || line.includes("wasm32") || line.startsWith("nanokrnl>")) span.className = "dim";
     span.textContent = line;
     consoleEl.appendChild(span);
   }
   consoleEl.scrollTop = consoleEl.scrollHeight;
 }
 
+let instance, memory;
+const enc = new TextEncoder();
+
+function send(line) {
+  const buf = enc.encode(line);
+  const ptr = instance.exports.kernel_input_ptr();
+  new Uint8Array(memory.buffer, ptr, buf.length).set(buf);
+  instance.exports.kernel_input(buf.length);
+}
+
 async function boot() {
   consoleEl.textContent = "";
-  // The kernel's only "hardware" dependency in Phase 0 is console output, which
-  // the host (this page) provides as the `env.host_write` import. WASM linear
-  // memory stands in for physical RAM; we read the kernel's strings out of it.
-  let memory;
+  // The kernel's "hardware" is this page: console out (host_write), clear
+  // (host_clear). WASM linear memory is its RAM.
   const imports = {
     env: {
-      host_write(ptr, len) {
-        const bytes = new Uint8Array(memory.buffer, ptr, len);
-        emit(new TextDecoder("utf-8").decode(bytes));
-      },
+      host_write(ptr, len) { emit(new TextDecoder("utf-8").decode(new Uint8Array(memory.buffer, ptr, len))); },
+      host_clear() { consoleEl.textContent = ""; },
     },
   };
   const resp = await fetch("ntoskrnl_wasm.wasm");
-  const { instance } = await WebAssembly.instantiateStreaming(resp, imports);
+  ({ instance } = await WebAssembly.instantiateStreaming(resp, imports));
   memory = instance.exports.memory;
-  const code = instance.exports.kernel_main();
-  emit(`\n[host] kernel_main() returned ${code}\n`);
+  instance.exports.kernel_main(); // boot + first prompt
+  cmdEl.focus();
 }
 
-document.getElementById("reboot").addEventListener("click", boot);
+cmdEl.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    const line = cmdEl.value;
+    cmdEl.value = "";
+    send(line);
+  }
+});
+document.addEventListener("click", () => cmdEl.focus());
 boot();
 </script>
 </body>

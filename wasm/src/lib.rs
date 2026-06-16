@@ -15,7 +15,7 @@
 #![no_std]
 
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // Phase 1: the kernel's REAL run-time library, compiled into the WASM build
 // unchanged. `rtl` touches no hardware and takes no locks (pure data-structure
@@ -45,6 +45,8 @@ mod ob;
 extern "C" {
     /// Write `len` bytes of UTF-8 at `ptr` to the host console (the page).
     fn host_write(ptr: *const u8, len: usize);
+    /// Clear the host console (the `cls` command).
+    fn host_clear();
 }
 
 #[panic_handler]
@@ -179,10 +181,244 @@ pub extern "C" fn kernel_main() -> i32 {
     if all {
         print("ALL SELF TESTS PASSED — ");
         print_usize(mm::pool::pool_used());
-        println(" bytes of pool in use; system idle");
-        0
+        println(" bytes of pool in use");
     } else {
         println("*** SELF TESTS FAILED ***");
+    }
+    // Drop to the interactive console: boot is done, the host now feeds typed
+    // command lines to `kernel_input` (see below). This is what makes it a live
+    // kernel in the page rather than a one-shot self test.
+    println("");
+    println("Type 'help' for commands.");
+    prompt();
+    if all {
+        0
+    } else {
         1
     }
+}
+
+// === Interactive console ===================================================
+// WASM can't block waiting for a keypress, so input is event-driven: the host
+// reads a line and calls `kernel_input(ptr, len)`. We run the command, print
+// output, and print the next prompt. (On x86 the shell is cmd.exe in ring 3;
+// here it's a built-in shell over the same subsystems — and the place future
+// "executables" plug in, as guest WASM modules over the syscall surface, since
+// WASM can't execute the x86 PE binaries the native kernel runs.)
+
+/// The shell prompt.
+fn prompt() {
+    print("\nnanokrnl> ");
+}
+
+/// A handle the shell opened, for `handles`/`close`.
+#[derive(Clone, Copy)]
+struct ShellObj {
+    handle: u64,
+    body: *mut u8,
+}
+const SHELL_OBJ_MAX: usize = 16;
+static mut SHELL_OBJS: [ShellObj; SHELL_OBJ_MAX] =
+    [ShellObj { handle: 0, body: core::ptr::null_mut() }; SHELL_OBJ_MAX];
+static SHELL_OBJ_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Object type for shell-created objects; its delete procedure reports the
+/// teardown so `close` visibly drives a real object lifetime.
+static SHELL_TYPE_NAME: [u16; 7] = [
+    b'S' as u16, b'h' as u16, b'e' as u16, b'l' as u16, b'l' as u16, b'O' as u16, b'b' as u16,
+];
+static SHELL_TYPE: ob::ObjectType = ob::ObjectType {
+    name: UnicodeString::from_units(&SHELL_TYPE_NAME),
+    delete: Some(shell_obj_delete),
+};
+fn shell_obj_delete(_body: *mut u8) {
+    println("[ob] object's delete procedure ran; pool freed");
+}
+
+// The host writes a command line's UTF-8 bytes into this fixed buffer (whose
+// address it gets from `kernel_input_ptr`), then calls `kernel_input(len)`.
+// A fixed buffer avoids exposing an allocator across the boundary.
+const INPUT_MAX: usize = 256;
+static mut INPUT_BUF: [u8; INPUT_MAX] = [0; INPUT_MAX];
+
+/// Address of the shared input buffer (a WASM linear-memory offset to the host).
+#[no_mangle]
+pub extern "C" fn kernel_input_ptr() -> *mut u8 {
+    &raw mut INPUT_BUF as *mut u8
+}
+
+/// Run one command line of `len` bytes (already written into `INPUT_BUF`).
+/// Called by the host for each entered line.
+#[no_mangle]
+pub extern "C" fn kernel_input(len: usize) {
+    let n = len.min(INPUT_MAX);
+    let bytes = unsafe { core::slice::from_raw_parts((&raw const INPUT_BUF) as *const u8, n) };
+    let line = core::str::from_utf8(bytes).unwrap_or("").trim();
+    // Echo the line so the page transcript reads like a real console session.
+    print(line);
+    print("\n");
+    dispatch(line);
+    prompt();
+}
+
+/// Split `s` into (first word, rest), both trimmed.
+fn split_word(s: &str) -> (&str, &str) {
+    let s = s.trim_start();
+    match s.find(' ') {
+        Some(i) => (&s[..i], s[i + 1..].trim_start()),
+        None => (s, ""),
+    }
+}
+
+fn dispatch(line: &str) {
+    let (cmd, args) = split_word(line);
+    match cmd {
+        "" => {}
+        "help" => {
+            println("commands:");
+            println("  help            this list");
+            println("  ver             kernel version banner");
+            println("  echo <text>     print text");
+            println("  mem             pool bytes in use");
+            println("  mkobj           create a kernel object + open a handle (real ob)");
+            println("  handles         list open handles");
+            println("  close <handle>  close a handle (drops its object reference)");
+            println("  cls             clear the screen");
+        }
+        "ver" => {
+            println("ntoskrnl-rs 0.1.0 (wasm32) — NT-compatible kernel in Rust");
+        }
+        "echo" => {
+            println(args);
+        }
+        "mem" => {
+            print("pool in use: ");
+            print_usize(mm::pool::pool_used());
+            println(" bytes");
+        }
+        "mkobj" => cmd_mkobj(),
+        "handles" => cmd_handles(),
+        "close" => cmd_close(args),
+        "cls" => unsafe { host_clear() },
+        _ => {
+            print("'");
+            print(cmd);
+            println("' is not recognized as a command. Try 'help'.");
+        }
+    }
+}
+
+/// Create a real `ob` object and open a handle to it (the handle holds a
+/// reference), recording it for `handles`/`close`.
+fn cmd_mkobj() {
+    let n = SHELL_OBJ_COUNT.load(Ordering::Relaxed);
+    if n >= SHELL_OBJ_MAX {
+        println("object table full");
+        return;
+    }
+    let body = match ob::ob_create_object(&SHELL_TYPE, 0u32) {
+        Ok(p) => p as *mut u8,
+        Err(_) => {
+            println("ob_create_object failed (out of pool)");
+            return;
+        }
+    };
+    let handle = ob::handle::ob_create_handle(body, 0);
+    unsafe {
+        let table = &raw mut SHELL_OBJS;
+        (*table)[n] = ShellObj { handle, body };
+    }
+    SHELL_OBJ_COUNT.store(n + 1, Ordering::Relaxed);
+    print("created ShellOb object, handle 0x");
+    print_hex(handle);
+    print(" (refcount ");
+    print_usize(unsafe { ob::ob_ref_count(body) } as usize);
+    println(")");
+}
+
+fn cmd_handles() {
+    let n = SHELL_OBJ_COUNT.load(Ordering::Relaxed);
+    let mut shown = 0;
+    for i in 0..n {
+        let o = unsafe { (*(&raw const SHELL_OBJS))[i] };
+        if o.handle == 0 {
+            continue;
+        }
+        print("  handle 0x");
+        print_hex(o.handle);
+        print("  refcount ");
+        print_usize(unsafe { ob::ob_ref_count(o.body) } as usize);
+        println("");
+        shown += 1;
+    }
+    if shown == 0 {
+        println("no open handles (use 'mkobj')");
+    }
+}
+
+fn cmd_close(args: &str) {
+    // `handles` prints handles in hex, so parse hex (with optional 0x).
+    let s = args.trim().trim_start_matches("0x").trim_start_matches("0X");
+    match parse_hex(s) {
+        Some(h) => close_handle(h),
+        None => println("usage: close <handle>   (e.g. close 0x4)"),
+    }
+}
+
+fn close_handle(handle: u64) {
+    let n = SHELL_OBJ_COUNT.load(Ordering::Relaxed);
+    for i in 0..n {
+        let o = unsafe { (*(&raw const SHELL_OBJS))[i] };
+        if o.handle == handle && o.handle != 0 {
+            let st = ob::handle::ob_close_handle(handle);
+            if st == NtStatus::SUCCESS {
+                // Drop the shell's own creator reference too, so the object
+                // actually dies (and we see its delete procedure run).
+                unsafe { ob::ob_dereference_object(o.body) };
+                unsafe {
+                    (*(&raw mut SHELL_OBJS))[i].handle = 0;
+                }
+                println("handle closed");
+            } else {
+                println("close failed: invalid handle");
+            }
+            return;
+        }
+    }
+    println("no such handle");
+}
+
+/// Print a u64 as lowercase hex (no leading zeros).
+fn print_hex(mut v: u64) {
+    if v == 0 {
+        print("0");
+        return;
+    }
+    let mut buf = [0u8; 16];
+    let mut i = buf.len();
+    while v > 0 {
+        i -= 1;
+        let d = (v & 0xf) as u8;
+        buf[i] = if d < 10 { b'0' + d } else { b'a' + (d - 10) };
+        v >>= 4;
+    }
+    print(unsafe { core::str::from_utf8_unchecked(&buf[i..]) });
+}
+
+/// Parse lowercase/uppercase hex; None if empty/invalid.
+fn parse_hex(s: &str) -> Option<u64> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut v: u64 = 0;
+    for b in s.bytes() {
+        let d = match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            b'A'..=b'F' => b - b'A' + 10,
+            _ => return None,
+        };
+        v = (v << 4) | d as u64;
+    }
+    Some(v)
 }
