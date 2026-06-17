@@ -29,7 +29,7 @@
     <b>ntoskrnl-rs</b> <span>· interactive NT kernel as a WebAssembly module (hardware = this page; type 'help')</span>
   </header>
   <pre id="console"></pre>
-  <div id="inputRow"><label>C:\&gt;</label><input id="cmd" autofocus autocomplete="off" spellcheck="false"></div>
+  <div id="inputRow"><label>nanokrnl&gt;</label><input id="cmd" autofocus autocomplete="off" spellcheck="false"></div>
 
 <script type="module">
 const consoleEl = document.getElementById("console");
@@ -41,7 +41,7 @@ function emit(text) {
     const span = document.createElement("span");
     if (line.includes("[ OK ]") || line.startsWith("ALL SELF TESTS PASSED")) span.className = "ok";
     else if (line.includes("[FAIL]") || line.includes("FAILED") || line.includes("not recognized")) span.className = "fail";
-    else if (line.startsWith("KiSystemStartup") || line.includes("wasm32") || line.startsWith("C:\\>")) span.className = "dim";
+    else if (line.startsWith("KiSystemStartup") || line.includes("wasm32") || line.startsWith("nanokrnl>")) span.className = "dim";
     span.textContent = line;
     consoleEl.appendChild(span);
   }
