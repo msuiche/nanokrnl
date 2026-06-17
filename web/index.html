@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ntoskrnl-rs in the browser (v86)</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; background: #0b0e14; color: #c0caf5;
+    font: 14px/1.45 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    display: flex; flex-direction: column; height: 100vh;
+  }
+  header { padding: 10px 16px; border-bottom: 1px solid #1f2335; background: #11141c; }
+  header b { color: #7aa2f7; } header span { color: #565f89; }
+  #screen { flex: 1; margin: 0; padding: 14px; white-space: pre-wrap; overflow-y: auto; outline: none; }
+  #status { color: #565f89; padding: 6px 16px; border-top: 1px solid #1f2335; }
+</style>
+</head>
+<body>
+  <header><b>ntoskrnl-rs</b> <span>· the real x86-64 kernel booting in a browser via v86 (full-PC emulation). Click the console and type.</span></header>
+  <pre id="screen" tabindex="0">booting…\n</pre>
+  <div id="status">loading v86…</div>
+
+<!-- v86: a complete x86 PC emulator in the browser. Boots the same BIOS disk
+     image QEMU does — this is the "emulate the whole machine" route. -->
+<script src="https://cdn.jsdelivr.net/npm/v86@latest/build/libv86.js"></script>
+<script>
+const screen = document.getElementById("screen");
+const status = document.getElementById("status");
+
+const emulator = new V86({
+  wasm_path: "https://cdn.jsdelivr.net/npm/v86@latest/build/v86.wasm",
+  bios:     { url: "https://cdn.jsdelivr.net/npm/v86@latest/bios/seabios.bin" },
+  vga_bios: { url: "https://cdn.jsdelivr.net/npm/v86@latest/bios/vgabios.bin" },
+  // Our kernel's BIOS disk image (build it with web/run.sh).
+  hda: { url: "disk-bios.img", async: false },
+  memory_size: 128 * 1024 * 1024,
+  autostart: true,
+});
+
+// The kernel talks over COM1 (like `qemu -serial stdio`); v86's serial0 is COM1.
+emulator.add_listener("emulator-ready", () => { status.textContent = "running — kernel on COM1"; screen.textContent = ""; });
+emulator.add_listener("serial0-output-byte", (byte) => {
+  screen.textContent += String.fromCharCode(byte);
+  screen.scrollTop = screen.scrollHeight;
+});
+
+// Keystrokes -> COM1 input (so you can drive the interactive cmd shell).
+screen.addEventListener("keydown", (e) => {
+  let s = null;
+  if (e.key === "Enter") s = "\r";
+  else if (e.key === "Backspace") s = "\x7f";
+  else if (e.key.length === 1) s = e.key;
+  if (s !== null) { emulator.serial0_send(s); e.preventDefault(); }
+});
+screen.focus();
+</script>
+</body>
+</html>
