@@ -166,11 +166,17 @@ target runs. Same evidence-driven loop that cracked whoami/more natively. Flags
     `CharLowerW`/`CharUpperW`. whoami now runs end to end **and reaches
     `WriteConsoleW`** — but with serviced imports it currently takes a path that
     writes an empty buffer (no username API called).
-  - **Next:** fix the username path — whoami isn't calling the token APIs; the
-    likely cause is argv/`__getmainargs` not being set up (so it mis-parses
-    invocation). Service `__getmainargs`/`__wgetmainargs` (argc=1, argv=["whoami"])
-    and re-trace until it prints `nanokrnl\user`. Then move the dispatch into the
-    kernel and wire it to the `C:\>` `run` path; then cmd/more; then drivers.
+  - Serviced `__getmainargs`/`__wgetmainargs` (argc=1, argv=["whoami"]) — but the
+    full import trace shows whoami **never calls them, nor any token/username
+    API**: after `_initterm` it goes straight to HeapAlloc → `lstrlenW`(empty)→0
+    → console setup → `WriteConsoleW`(empty). So a branch in its `wmain` takes an
+    empty-output path instead of gather-and-print. That's a subtle emulation
+    divergence (a wrong flag/result silently steering a branch) or an environment
+    gap — the kind that needs disassembling whoami's `wmain` and comparing the
+    interpreter's register/flag state at the deciding branch against expected.
+  - **Next:** disassemble whoami `wmain`, find the branch that skips username
+    gathering, and pin the wrong flag/value (reference-compare the interpreter).
+    Then move the dispatch into the kernel + the `run` path; then cmd/more/drivers.
 - [ ] **B1 — usermode core.** Implement the ALU/mov/stack/jump/string/SSE2 subset
   the MSVC CRT + our shims use; wire `syscall` → existing SSDT. Milestone: a
   tiny own-ABI program, then **`whoami` runs in the browser**.

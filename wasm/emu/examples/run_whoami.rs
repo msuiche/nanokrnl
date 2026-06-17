@@ -34,6 +34,11 @@ fn wr32(mem: &mut [u8], a: u64, v: u32) {
 fn stack_arg(cpu: &Cpu, mem: &[u8], n: usize) -> u64 {
     rd64(mem, cpu.regs[RSP] + 0x20 + (n as u64) * 8)
 }
+fn write_ascii(mem: &mut [u8], at: u64, s: &str) {
+    let o = at as usize;
+    mem[o..o + s.len()].copy_from_slice(s.as_bytes());
+    mem[o + s.len()] = 0;
+}
 fn write_utf16(mem: &mut [u8], at: u64, s: &str) -> usize {
     let mut o = at as usize;
     let mut n = 0;
@@ -182,6 +187,39 @@ fn service(host: &mut Host, cpu: &mut Cpu, mem: &mut [u8], dll: &str, name: &str
             1
         }
         "GetUserNameExW" => 1,
+        "__getmainargs" | "__wgetmainargs" => {
+            // (int* argc, char*** argv, char*** env, int doWildcard, startinfo).
+            // Provide argc=1, argv=["whoami"], empty env, so whoami parses no
+            // switches and takes the default "print current user" path.
+            let argc_p = a1;
+            let argv_p = a2;
+            let env_p = a3;
+            let wide = name == "__wgetmainargs";
+            let strp = host.heap;
+            if wide {
+                write_utf16(mem, strp, "whoami");
+            } else {
+                write_ascii(mem, strp, "whoami");
+            }
+            host.heap += 32;
+            let arr = host.heap;
+            wr64(mem, arr, strp);
+            wr64(mem, arr + 8, 0);
+            host.heap += 32;
+            let env = host.heap;
+            wr64(mem, env, 0);
+            host.heap += 16;
+            if argc_p != 0 {
+                wr32(mem, argc_p, 1);
+            }
+            if argv_p != 0 {
+                wr64(mem, argv_p, arr);
+            }
+            if env_p != 0 {
+                wr64(mem, env_p, env);
+            }
+            0
+        }
         "lstrlenW" => {
             // count UTF-16 units until the NUL at a1
             let mut n = 0u64;
