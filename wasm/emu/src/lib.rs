@@ -255,15 +255,32 @@ impl Cpu {
         }
     }
 
-    /// Decode a ModRM byte at `pc`. Returns (reg field index, r/m operand, pc
-    /// after any SIB/displacement bytes).
+    /// Decode a ModRM byte at `pc` for an instruction with no trailing immediate.
     fn decode_modrm(
+        &self,
+        mem: &[u8],
+        pc: usize,
+        rex_r: bool,
+        rex_x: bool,
+        rex_b: bool,
+    ) -> (usize, Rm, usize) {
+        self.decode_modrm_imm(mem, pc, rex_r, rex_x, rex_b, 0)
+    }
+
+    /// Decode a ModRM byte. `imm_len` is the number of immediate bytes that
+    /// follow the ModRM/SIB/displacement — needed so RIP-relative addressing
+    /// (`[rip+disp32]`) resolves against the address of the *next instruction*
+    /// (end of the whole instruction, immediate included), not just the end of
+    /// the displacement. Returns (reg field index, r/m operand, pc after the
+    /// ModRM/SIB/disp).
+    fn decode_modrm_imm(
         &self,
         mem: &[u8],
         mut pc: usize,
         rex_r: bool,
         rex_x: bool,
         rex_b: bool,
+        imm_len: usize,
     ) -> (usize, Rm, usize) {
         let modrm = *mem.get(pc).unwrap_or(&0);
         pc += 1;
@@ -297,10 +314,11 @@ impl Cpu {
                     .wrapping_add(idx_val.wrapping_mul(scale));
             }
         } else if md == 0 && rm == 5 {
-            // RIP-relative (approximate: relative to pc after the disp32).
+            // RIP-relative: base is the address of the *next* instruction, i.e.
+            // end of the displacement plus any trailing immediate bytes.
             let d = rd32(pc);
             pc += 4;
-            addr = (pc as u64).wrapping_add(d as u64);
+            addr = (pc as u64 + imm_len as u64).wrapping_add(d as u64);
         } else {
             addr = self.regs[rm + if rex_b { 8 } else { 0 }];
         }
@@ -541,7 +559,8 @@ impl Cpu {
             // ModRM.reg is the op selector (add/or/adc/sbb/and/sub/xor/cmp).
             0x81 | 0x83 => {
                 pc += 1;
-                let (sel, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                let il = if b == 0x83 { 1 } else { 4 };
+                let (sel, rm, npc) = self.decode_modrm_imm(mem, pc, rex_r, rex_x, rex_b, il);
                 pc = npc;
                 let imm = if b == 0x83 {
                     let v = fetch(pc) as i8 as i64 as u64;
@@ -610,10 +629,28 @@ impl Cpu {
                 self.rip = pc as u64;
                 StepResult::Ok
             }
+            // mov r/m8, imm8  (0xC6 /0)
+            0xc6 => {
+                pc += 1;
+                let (_, rm, npc) = self.decode_modrm_imm(mem, pc, rex_r, rex_x, rex_b, 1);
+                pc = npc;
+                let imm = fetch(pc) as u64 & 0xff;
+                pc += 1;
+                match rm {
+                    Rm::Reg(r) => self.regs[r] = (self.regs[r] & !0xff) | imm,
+                    Rm::Mem(a) => {
+                        if !Self::store(mem, a, imm, 1) {
+                            return StepResult::Fault { addr: a };
+                        }
+                    }
+                }
+                self.rip = pc as u64;
+                StepResult::Ok
+            }
             // mov r/m, imm32  (0xC7 /0)
             0xc7 => {
                 pc += 1;
-                let (_, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                let (_, rm, npc) = self.decode_modrm_imm(mem, pc, rex_r, rex_x, rex_b, 4);
                 pc = npc;
                 let imm = imm32(pc) as u64 & if size == 4 { 0xFFFF_FFFF } else { u64::MAX };
                 pc += 4;
@@ -681,6 +718,43 @@ impl Cpu {
             }
             0x90 => {
                 self.rip = (pc + 1) as u64; // nop
+                StepResult::Ok
+            }
+            // cbw/cwde/cdqe (0x98): sign-extend AL/AX/EAX into AX/EAX/RAX.
+            0x98 => {
+                self.regs[RAX] = match size {
+                    8 => self.regs[RAX] as u32 as i32 as i64 as u64,
+                    2 => (self.regs[RAX] & !0xffff) | (self.regs[RAX] as u8 as i8 as i16 as u16 as u64),
+                    _ => (self.regs[RAX] as u16 as i16 as i32 as u32) as u64,
+                };
+                self.rip = (pc + 1) as u64;
+                StepResult::Ok
+            }
+            // cwd/cdq/cqo (0x99): sign-extend the accumulator into DX/EDX/RDX.
+            0x99 => {
+                let neg = match size {
+                    8 => self.regs[RAX] >> 63 & 1 == 1,
+                    2 => self.regs[RAX] >> 15 & 1 == 1,
+                    _ => self.regs[RAX] >> 31 & 1 == 1,
+                };
+                self.regs[RDX] = match size {
+                    8 => {
+                        if neg {
+                            u64::MAX
+                        } else {
+                            0
+                        }
+                    }
+                    2 => (self.regs[RDX] & !0xffff) | if neg { 0xffff } else { 0 },
+                    _ => {
+                        if neg {
+                            0xFFFF_FFFF
+                        } else {
+                            0
+                        }
+                    }
+                };
+                self.rip = (pc + 1) as u64;
                 StepResult::Ok
             }
             // test r/m8, r8 (0x84): 8-bit AND for flags only.
@@ -840,7 +914,8 @@ impl Cpu {
             // ModRM.reg selects: /0 rol /1 ror /4 shl /5 shr /7 sar.
             0xc1 | 0xd1 | 0xd3 => {
                 pc += 1;
-                let (sel, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                let il = if b == 0xc1 { 1 } else { 0 };
+                let (sel, rm, npc) = self.decode_modrm_imm(mem, pc, rex_r, rex_x, rex_b, il);
                 pc = npc;
                 let raw_count = match b {
                     0xc1 => {
@@ -1052,7 +1127,7 @@ impl Cpu {
                     // /7 btc. CF = the tested bit; set/reset/complement write back.
                     0xba => {
                         pc += 2;
-                        let (sel, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                        let (sel, rm, npc) = self.decode_modrm_imm(mem, pc, rex_r, rex_x, rex_b, 1);
                         pc = npc;
                         let imm = fetch(pc) as u32;
                         pc += 1;

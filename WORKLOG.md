@@ -174,9 +174,19 @@ target runs. Same evidence-driven loop that cracked whoami/more natively. Flags
     divergence (a wrong flag/result silently steering a branch) or an environment
     gap — the kind that needs disassembling whoami's `wmain` and comparing the
     interpreter's register/flag state at the deciding branch against expected.
-  - **Next:** disassemble whoami `wmain`, find the branch that skips username
-    gathering, and pin the wrong flag/value (reference-compare the interpreter).
-    Then move the dispatch into the kernel + the `run` path; then cmd/more/drivers.
+  - **Found & fixed the divergence: RIP-relative addressing was approximate.**
+    `[rip+disp32]` resolved against the end of the displacement instead of the
+    end of the whole instruction, so any RIP-relative instruction with a trailing
+    immediate (`cmp [rip+d], imm`, `mov [rip+d], imm`, the once-init guards)
+    read/wrote the *wrong* global → wrong branch. Fixed by threading `imm_len`
+    into ModRM decode (`decode_modrm_imm`) for the immediate-bearing opcodes.
+    Also added `0xC6` (mov r/m8,imm8), `0x98`/`0x99` (cbw/cwde/cdqe, cwd/cdq/cqo).
+  - With the fix, whoami takes a real path and now calls `LoadStringW` +
+    `_vsnwprintf` + `WriteConsoleW` (loads a resource string template and formats
+    it). Output is still empty because both are stubbed to 0.
+  - **Next:** implement `LoadStringW` (parse the PE `.rsrc` string tables) and
+    `_vsnwprintf` (the wide printf engine — reuse the kernel's logic), and check
+    why the token APIs still aren't reached. Then kernel `run` path; cmd/more/drivers.
 - [ ] **B1 — usermode core.** Implement the ALU/mov/stack/jump/string/SSE2 subset
   the MSVC CRT + our shims use; wire `syscall` → existing SSDT. Milestone: a
   tiny own-ABI program, then **`whoami` runs in the browser**.
