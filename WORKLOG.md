@@ -13,27 +13,25 @@ through our own interpreter is a multi-week "reimplement enough of Win32" grind
 actual goal — *see cmd.exe running in a browser* — that's the wrong cost curve.
 
 So that port was reverted (it remains in git history) in favor of running the
-**unmodified x86 kernel image** under a browser x86 emulator. v86 is a complete
-PC emulator that runs client-side and boots the exact same BIOS disk image QEMU
-does; our kernel's console is COM1, wired to the page.
+**unmodified x86 kernel image** under a browser x86 emulator.
+
+**v86 does NOT work for our kernel** — verified headless (Node): it panics
+immediately with `Unimplemented: #GP handler` (cpu.rs:846), before any serial
+output. v86's CPU emulation is incomplete for a 64-bit long-mode kernel — it
+can't deliver a general-protection fault through the IDT. So v86 is out.
+
+The faithful browser route is **real qemu-wasm** (QEMU compiled to wasm via
+emscripten), which fully emulates what native QEMU does and would boot our image
+unchanged. It's a heavy artifact to build/host and hasn't been wired up here.
+Native QEMU works today (`sh scripts/run-interactive.sh`).
 
 ### How to run
 
-```sh
-sh web/run.sh                          # builds the interactive kernel + disk image, stages web/disk-bios.img
-(cd web && python3 -m http.server 8000)
-# open http://localhost:8000 , click the console, type
-```
-
-`web/index.html` loads v86 (from a CDN), boots `disk-bios.img`, and bridges COM1
-to the page — so you get the real `C:\>` prompt with `cmd`, `whoami`, `more`,
-`dir`, `where`, `sort`, `choice`, and the `null.sys` driver, all running as
-actual x86-64 code in the browser. (Browser boot needs to be opened manually;
-the staged image is verified to boot cmd under native QEMU.)
-
-Note: this is v86, a browser-native full-PC emulator (the practical "qemu in the
-browser"). Literal qemu-compiled-to-wasm is an alternative but heavier to host;
-the disk image is the same either way.
+- **Native QEMU (works today):** `sh scripts/run-interactive.sh` — the real
+  `C:\>` shell on the serial console.
+- **Browser:** not working yet. `web/run.sh` builds + stages `web/disk-bios.img`
+  and `web/index.html` is a v86 harness, but v86 can't boot this kernel (see
+  above). A real qemu-wasm harness is the remaining work.
 
 ## Status — kernel (x86)
 
@@ -50,4 +48,10 @@ f1038d9 (whoami), 4657bab (per-process command line), 7cc5960 + 47047aa (more.co
   a multi-week faithful-Win32 effort. Kept in git history.
 - Switched to booting the real x86 kernel image in the browser via v86
   (`web/index.html` + `web/run.sh`). Disk image verified to boot cmd/whoami
-  under native QEMU — the same image v86 runs.
+  under native QEMU.
+
+### 2026-06-17
+- Tested v86 headless (Node + the npm package + SeaBIOS): it **cannot boot our
+  kernel** — panics `Unimplemented: #GP handler` (cpu.rs:846) before any output.
+  v86's CPU is incomplete for a 64-bit long-mode kernel. Browser route now needs
+  real qemu-wasm (heavy; not wired up). Native QEMU remains the way to run it.

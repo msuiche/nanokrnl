@@ -18,7 +18,11 @@
 </style>
 </head>
 <body>
-  <header><b>ntoskrnl-rs</b> <span>· the real x86-64 kernel booting in a browser via v86 (full-PC emulation). Click the console and type.</span></header>
+  <!-- NOTE: v86 cannot boot this kernel — it panics with "Unimplemented: #GP
+       handler" because its CPU emulation is incomplete for a 64-bit long-mode
+       kernel. Kept as a starting point; the working browser route is real
+       qemu-wasm. Use native QEMU (scripts/run-interactive.sh) meanwhile. -->
+  <header><b>ntoskrnl-rs</b> <span>· (v86 harness — does not boot this 64-bit kernel; needs qemu-wasm)</span></header>
   <pre id="screen" tabindex="0">booting…\n</pre>
   <div id="status">loading v86…</div>
 
