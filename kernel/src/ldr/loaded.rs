@@ -25,6 +25,19 @@ static ULIB_SIZE: AtomicUsize = AtomicUsize::new(0);
 /// hasn't. 0 until ulib is loaded.
 static ULIB_ENTRY: AtomicU64 = AtomicU64::new(0);
 
+/// Pristine post-load snapshot of ulib.dll's image. ulib lives once in the
+/// shared high half, so its writable `.data`/`.bss` (the C-runtime's per-process
+/// state: the `/GS` security cookie, the CRT startup-state machine, the on-exit
+/// tables, standard-stream/heap pointers) is shared across every process that
+/// runs it. On real Windows each process gets a private, copy-on-write copy of a
+/// DLL's data; here we emulate that by restoring this snapshot before each
+/// process spawn so ulib's `DllMain` re-initializes cleanly. Without it the
+/// *second* ulib-based program (e.g. `more.com` run twice) sees "already
+/// initialized" CRT guards and aborts during startup. See [`reset_ulib_data`].
+const ULIB_SNAPSHOT_MAX: usize = 256 * 1024;
+static mut ULIB_SNAPSHOT: [u8; ULIB_SNAPSHOT_MAX] = [0u8; ULIB_SNAPSHOT_MAX];
+static ULIB_SNAPSHOT_LEN: AtomicUsize = AtomicUsize::new(0);
+
 /// Load the `kernel32` shim DLL into user-accessible memory. It has no
 /// imports of its own (its functions issue syscalls inline), so loading is a
 /// plain `load_user`. Phase-1, before any console app is loaded.
@@ -69,12 +82,44 @@ pub fn load_ulib(image: &[u8]) -> Result<(), NtStatus> {
     ULIB_BASE.store(loaded.base as u64, Ordering::Release);
     ULIB_SIZE.store(loaded.size, Ordering::Release);
     ULIB_ENTRY.store(loaded.entry_va, Ordering::Release);
+    // Snapshot the pristine post-load image (relocations applied, imports bound,
+    // CRT data at its initial values) so every process can start from it.
+    let snap_len = loaded.size.min(ULIB_SNAPSHOT_MAX);
+    // `load_user` already marked the image user-accessible, so reading it from
+    // the kernel traps under SMAP — bracket the copy.
+    crate::mm::virt::user_access_begin();
+    unsafe {
+        core::ptr::copy_nonoverlapping(loaded.base, (&raw mut ULIB_SNAPSHOT) as *mut u8, snap_len);
+    }
+    crate::mm::virt::user_access_end();
+    ULIB_SNAPSHOT_LEN.store(snap_len, Ordering::Release);
     crate::kd_println!(
         "LDR: loaded ulib.dll @ {:p} ({} bytes)",
         loaded.base,
         loaded.size
     );
     Ok(())
+}
+
+/// Restore ulib.dll's image to its pristine post-load state. Called before
+/// spawning each user process so the shared ulib's C-runtime re-initializes for
+/// the new process instead of seeing a previous process's "already initialized"
+/// guards. No-op if ulib isn't loaded. Safe because user processes run serially
+/// (the creator blocks in `NtWaitForSingleObject`), so no ulib code is executing
+/// when this runs.
+pub fn reset_ulib_data() {
+    let base = ULIB_BASE.load(Ordering::Acquire);
+    let len = ULIB_SNAPSHOT_LEN.load(Ordering::Acquire);
+    if base == 0 || len == 0 {
+        return;
+    }
+    // ulib's image is mapped user-accessible (it executes in ring 3), so a
+    // supervisor write to it traps under SMAP — bracket it like any user access.
+    crate::mm::virt::user_access_begin();
+    unsafe {
+        core::ptr::copy_nonoverlapping((&raw const ULIB_SNAPSHOT) as *const u8, base as *mut u8, len);
+    }
+    crate::mm::virt::user_access_end();
 }
 
 /// `(base, size)` of the loaded ulib.dll (for the debugger's module map).

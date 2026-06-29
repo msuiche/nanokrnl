@@ -427,6 +427,12 @@ fn mui_for_image(image: &[u8]) -> &'static [u8] {
 }
 
 pub(crate) fn create_user_process(image: &[u8], cmdline: &[u8]) -> u64 {
+    // ulib.dll lives once in the shared high half, so its C-runtime data is
+    // shared across processes. Reset it to its pristine post-load state so this
+    // process's ulib init runs fresh — otherwise a second ulib-based program
+    // (e.g. `more.com` run twice) sees stale "already initialized" CRT guards and
+    // aborts at startup. Safe: user processes run serially, none is executing now.
+    crate::ldr::loaded::reset_ulib_data();
     let proc = match crate::ldr::pe::load_user_process(image) {
         Ok(p) => p,
         Err(_) => return 0,
