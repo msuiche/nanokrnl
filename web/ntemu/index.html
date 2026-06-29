@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ntemu — ntoskrnl-rs in the browser (bespoke x86-64)</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #0b0e14; color: #c0caf5;
+    font: 14px/1.45 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    display: flex; flex-direction: column; height: 100vh; }
+  header { padding: 10px 16px; border-bottom: 1px solid #1f2335; background: #11141c; }
+  header b { color: #7aa2f7; } header span { color: #565f89; }
+  #bar { padding: 8px 16px; border-bottom: 1px solid #1f2335; display: flex; gap: 12px; align-items: center; }
+  button { background: #1f2335; color: #c0caf5; border: 1px solid #2a2f45; border-radius: 5px; padding: 5px 12px; cursor: pointer; }
+  button:hover { background: #2a2f45; }
+  #screen { flex: 1; margin: 0; padding: 14px; white-space: pre-wrap; overflow-y: auto; }
+  #status { color: #565f89; padding: 6px 16px; border-top: 1px solid #1f2335; }
+</style>
+</head>
+<body>
+  <header><b>ntemu</b> <span>· a bespoke x86-64 long-mode emulator (~40 KB wasm; no threads/COOP/COEP, unlike qemu-wasm)</span></header>
+  <div id="bar">
+    <button id="demo">Run long-mode demo</button>
+    <label style="cursor:pointer">Load ELF… <input id="file" type="file" hidden></label>
+  </div>
+  <pre id="screen"></pre>
+  <div id="status">loading ntemu.wasm…</div>
+
+<script type="module">
+const screen = document.getElementById("screen");
+const status = document.getElementById("status");
+const print = (s) => { screen.textContent += s; screen.scrollTop = screen.scrollHeight; };
+
+// Instantiate the freestanding wasm (no JS imports needed).
+const { instance } = await WebAssembly.instantiateStreaming(fetch("ntemu.wasm"), {});
+const e = instance.exports;
+status.textContent = "ntemu ready — " + Object.keys(e).filter(k => k.startsWith("ntemu_")).length + " exports";
+
+function drainUart() {
+  let b, out = "";
+  while ((b = e.ntemu_uart_read()) >= 0) out += String.fromCharCode(b);
+  if (out) print(out);
+}
+const RUNSTOP = ["halted", "max-steps", "unknown-opcode", "unhandled-fault", "syscall-trap"];
+
+// A hand-assembled long-mode program: print a banner over the UART, arm the
+// APIC one-shot timer (vector 0xD1), sti/hlt → take the interrupt (handler
+// prints a tick), then print done. Mirrors the Rust integration test.
+function runDemo() {
+  screen.textContent = "";
+  e.ntemu_new(16);                 // 16 MiB RAM
+  const ENTRY = 0x400000, HANDLER = 0x410000, STACK = 0x3F0000;
+  // We stage raw code via the image buffer at physical 0 is awkward; instead use
+  // boot at ENTRY and poke code through a tiny ELF-free path: reuse ntemu_boot
+  // after writing code with ntemu_image_alloc is ELF-only, so the demo uses the
+  // built-in test program compiled into the banner below.
+  const enc = (s) => [...s].map(c => c.charCodeAt(0));
+  const uartDx = [0xBA,0xF8,0x03,0x00,0x00], out = [0xEE];
+  const prog = [
+    ...uartDx, 0xB0,0x6E, ...out, 0xB0,0x74, ...out, 0xB0,0x65, ...out,  // "nte"
+    0xB0,0x6D, ...out, 0xB0,0x75, ...out, 0xB0,0x20, ...out,             // "mu "
+    0x48,0xBB,0x00,0x00,0xE0,0xFE,0x00,0x00,0x00,0x00,                   // rbx=APIC
+    0xC7,0x83,0xE0,0x03,0x00,0x00,0x0B,0x00,0x00,0x00,                   // div=1
+    0xC7,0x83,0x20,0x03,0x00,0x00,0xD1,0x00,0x00,0x00,                   // LVT vec 0xD1
+    0xC7,0x83,0x80,0x03,0x00,0x00,0x14,0x00,0x00,0x00,                   // count=20
+    0xFB,0xF4,                                                            // sti; hlt
+    ...uartDx, 0xB0,0x6F, ...out, 0xB0,0x6B, ...out, 0xB0,0x0A, ...out,  // "ok\n"
+    0xF4,                                                                 // hlt
+  ];
+  const handler = [
+    ...uartDx, 0xB0,0x2A, ...out,                                        // '*'
+    0x48,0xBB,0x00,0x00,0xE0,0xFE,0x00,0x00,0x00,0x00,
+    0xC7,0x83,0xB0,0x00,0x00,0x00,0x00,0x00,0x00,0x00,                   // EOI
+    0x48,0xCF,                                                            // iretq
+  ];
+  // Stage code by loading a synthetic ELF with two PT_LOAD segments.
+  const img = buildElf(ENTRY, [[ENTRY, prog], [HANDLER, handler]]);
+  const ptr = e.ntemu_image_alloc(img.length);
+  new Uint8Array(e.memory.buffer, ptr, img.length).set(img);
+  // IDT gate for 0xD1 isn't set by ELF boot; the demo program installs nothing,
+  // so we rely on ntemu's boot + a host-set gate via a dedicated raw path:
+  e.ntemu_boot_elf(BigInt(STACK));
+  setIdtGate(0xD1, HANDLER);
+  const code = e.ntemu_run(100000);
+  drainUart();
+  status.textContent = "demo stopped: " + (RUNSTOP[code] || code);
+}
+
+// The IDT lives at physical 0x10000 (see machine.rs). Write a 64-bit interrupt
+// gate directly into guest RAM through wasm linear memory is not exposed; the
+// demo therefore installs the gate by re-using the kernel's own convention.
+// For simplicity the shim writes the gate via a small exported helper if present.
+function setIdtGate(vector, handler) {
+  e.ntemu_set_idt_gate(vector, BigInt(handler));
+}
+
+// Minimal ELF64 builder (one header + N PT_LOAD segments).
+function buildElf(entry, segs) {
+  const eh = 64, phe = 56, phoff = eh, dataStart = eh + phe * segs.length;
+  let total = dataStart;
+  const placed = segs.map(([addr, bytes]) => { const o = total; total += bytes.length; return { addr, bytes, o }; });
+  const b = new Uint8Array(total);
+  const dv = new DataView(b.buffer);
+  b.set([0x7f,0x45,0x4c,0x46,2,1,1]);            // \x7fELF, 64-bit, LE, v1
+  dv.setUint16(16, 2, true); dv.setUint16(18, 0x3E, true);
+  dv.setBigUint64(24, BigInt(entry), true);       // e_entry
+  dv.setBigUint64(32, BigInt(phoff), true);       // e_phoff
+  dv.setUint16(54, phe, true); dv.setUint16(56, segs.length, true);
+  placed.forEach((s, i) => {
+    const ph = phoff + i * phe;
+    dv.setUint32(ph, 1, true); dv.setUint32(ph + 4, 5, true);
+    dv.setBigUint64(ph + 8, BigInt(s.o), true);
+    dv.setBigUint64(ph + 16, BigInt(s.addr), true);
+    dv.setBigUint64(ph + 24, BigInt(s.addr), true);
+    dv.setBigUint64(ph + 32, BigInt(s.bytes.length), true);
+    dv.setBigUint64(ph + 40, BigInt(s.bytes.length), true);
+    b.set(s.bytes, s.o);
+  });
+  return b;
+}
+
+document.getElementById("demo").onclick = runDemo;
+document.getElementById("file").onchange = async (ev) => {
+  const f = ev.target.files[0]; if (!f) return;
+  screen.textContent = ""; status.textContent = "loading " + f.name + "…";
+  const bytes = new Uint8Array(await f.arrayBuffer());
+  e.ntemu_new(64);
+  const ptr = e.ntemu_image_alloc(bytes.length);
+  new Uint8Array(e.memory.buffer, ptr, bytes.length).set(bytes);
+  const entry = e.ntemu_boot_elf(0x300000n);
+  if (entry === 0n) { status.textContent = "not a loadable ELF"; return; }
+  const code = e.ntemu_run(2000000);
+  drainUart();
+  status.textContent = `${f.name}: entry=0x${entry.toString(16)} → ${RUNSTOP[code] || code}`;
+};
+</script>
+</body>
+</html>

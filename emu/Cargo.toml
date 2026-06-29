@@ -1,0 +1,21 @@
+# ntemu — a bespoke x86-64 *full-machine* emulator for booting ntoskrnl-rs in
+# the browser, as a lighter alternative to qemu-wasm.
+#
+# Seed: the proven usermode x86-64 interpreter (REX/ModRM/SIB, RIP-relative,
+# ALU/stack/control-flow) restored from git (commit c32cc31). It grows outward
+# into a full machine — long-mode paging (PML4), rings + syscall/sysret/swapgs,
+# and the minimal device set our kernel touches (16550 UART, APIC timer, PS/2).
+#
+# Standalone workspace so the decoder unit-tests run on the host (`cargo test`)
+# while the crate stays no_std for the eventual wasm32 build.
+[package]
+name = "ntemu"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+# `lib` for host unit tests + tooling; `cdylib` for the wasm32 browser build
+# (the no_std panic handler + allocator live in src/wasm.rs, gated on wasm32).
+[lib]
+crate-type = ["lib", "cdylib"]
