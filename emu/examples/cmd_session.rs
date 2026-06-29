@@ -41,9 +41,7 @@ fn main() {
 
     // Trace syscalls while a single `type` runs.
     m.cpu.trace_sys = true;
-    for &byte in b"type hello.txt\r" {
-        m.cpu.dev.uart.push_rx(byte);
-    }
+    for &byte in b"more hello.txt\r" { m.cpu.dev.uart.push_rx(byte); }
     pump(&mut m, &mut out, 8);
     m.cpu.trace_sys = false;
 

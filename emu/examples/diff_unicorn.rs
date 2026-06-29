@@ -74,26 +74,57 @@ fn run_ntemu(code: &[u8], regs: &[u64; 16], rflags: u64) -> Option<([u64; 16], u
     }
 }
 
+/// Extract the executable code bytes + their base VA from an ELF (R-X PT_LOAD)
+/// or a PE/PE32+ (the executable section). The diff places each instruction at a
+/// fixed address in both engines, so the VA only affects RIP-relative reporting.
+fn extract_code(image: &[u8]) -> (Vec<u8>, u64) {
+    let u16le = |o: usize| u16::from_le_bytes(image[o..o + 2].try_into().unwrap());
+    let u32le = |o: usize| u32::from_le_bytes(image[o..o + 4].try_into().unwrap());
+    let u64le = |o: usize| u64::from_le_bytes(image[o..o + 8].try_into().unwrap());
+    if &image[0..2] == b"MZ" {
+        // PE: DOS -> e_lfanew@0x3C -> COFF -> optional header -> sections.
+        let pe = u32le(0x3C) as usize;
+        let nsec = u16le(pe + 6) as usize;
+        let opt = u16le(pe + 20) as usize; // SizeOfOptionalHeader
+        let image_base = u64le(pe + 24 + 24); // PE32+ ImageBase
+        let sec0 = pe + 24 + opt;
+        for i in 0..nsec {
+            let s = sec0 + i * 40;
+            let chars = u32le(s + 36);
+            if chars & 0x2000_0000 != 0 {
+                // IMAGE_SCN_MEM_EXECUTE
+                let va = image_base + u32le(s + 12) as u64;
+                let off = u32le(s + 20) as usize;
+                let size = u32le(s + 16) as usize;
+                return (image[off..off + size].to_vec(), va);
+            }
+        }
+        return (Vec::new(), 0);
+    }
+    // ELF64: R-X PT_LOAD.
+    let phoff = u64le(32) as usize;
+    let phentsize = u16le(54) as usize;
+    let phnum = u16le(56) as usize;
+    for i in 0..phnum {
+        let ph = phoff + i * phentsize;
+        if u32le(ph) == 1 && u32le(ph + 4) & 1 != 0 {
+            let off = u64le(ph + 8) as usize;
+            let va = u64le(ph + 16);
+            let size = u64le(ph + 32) as usize;
+            return (image[off..off + size].to_vec(), va);
+        }
+    }
+    (Vec::new(), 0)
+}
+
 fn main() {
     let path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "../target/x86_64-unknown-none/debug/kernel".to_string());
-    let image = std::fs::read(&path).expect("read kernel ELF");
-    let phoff = u64::from_le_bytes(image[32..40].try_into().unwrap()) as usize;
-    let phentsize = u16::from_le_bytes(image[54..56].try_into().unwrap()) as usize;
-    let phnum = u16::from_le_bytes(image[56..58].try_into().unwrap()) as usize;
-    let (mut text_off, mut text_va, mut text_size) = (0usize, 0u64, 0usize);
-    for i in 0..phnum {
-        let ph = phoff + i * phentsize;
-        let typ = u32::from_le_bytes(image[ph..ph + 4].try_into().unwrap());
-        let flags = u32::from_le_bytes(image[ph + 4..ph + 8].try_into().unwrap());
-        if typ == 1 && flags & 1 != 0 {
-            text_off = u64::from_le_bytes(image[ph + 8..ph + 16].try_into().unwrap()) as usize;
-            text_va = u64::from_le_bytes(image[ph + 16..ph + 24].try_into().unwrap());
-            text_size = u64::from_le_bytes(image[ph + 32..ph + 40].try_into().unwrap()) as usize;
-        }
-    }
-    let code = &image[text_off..text_off + text_size];
+    let image = std::fs::read(&path).expect("read image");
+    let (code_vec, text_va) = extract_code(&image);
+    let code = &code_vec[..];
+    eprintln!("{}: code {} bytes @ {:#x}", path, code.len(), text_va);
 
     let seeds = [1u64, 2, 3];
     let rflag_seeds = [0u64, 1 /*CF*/];
@@ -114,6 +145,14 @@ fn main() {
         }
         let bytes = &code[off..off + instr.len()];
         let mn = format!("{:?}", instr.mnemonic());
+        // REP string ops can't be compared 1:1: Unicorn's count=1 runs a single
+        // iteration while ntemu runs the whole rep in one step. Same final state,
+        // different per-step — skip to avoid false positives.
+        if matches!(mn.as_str(), "Movsb" | "Movsw" | "Movsd" | "Movsq" | "Stosb" | "Stosw"
+            | "Stosd" | "Stosq" | "Lodsb" | "Lodsw" | "Lodsd" | "Lodsq"
+            | "Scasb" | "Scasw" | "Scasd" | "Scasq" | "Cmpsb" | "Cmpsw" | "Cmpsd" | "Cmpsq") {
+            continue;
+        }
         for &s in &seeds {
             for &fs in &rflag_seeds {
                 let regs = init_regs(s);

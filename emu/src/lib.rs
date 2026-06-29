@@ -565,8 +565,10 @@ impl Cpu {
         // REX prefix (must immediately precede the opcode).
         let mut rex_w = false;
         let (mut rex_r, mut rex_x, mut rex_b) = (false, false, false);
+        let mut rex_present = false;
         let mut b = fetch(pc);
         if (0x40..=0x4f).contains(&b) {
+            rex_present = true; // even a bare 0x40 (no bits) changes 8-bit reg encoding
             rex_w = b & 8 != 0;
             rex_r = b & 4 != 0;
             rex_x = b & 2 != 0;
@@ -867,9 +869,9 @@ impl Cpu {
                 pc += 1;
                 let imm = fetch(pc) as u64 & 0xff;
                 pc += 1;
-                let has_rex = rex_w || rex_r || rex_x || rex_b;
-                if !has_rex && sel >= 4 {
-                    // AH/CH/DH/BH: bits 8..15 of RAX/RCX/RDX/RBX.
+                if !rex_present && sel >= 4 {
+                    // AH/CH/DH/BH: bits 8..15 of RAX/RCX/RDX/RBX. Only when NO
+                    // REX byte is present — a bare 0x40 selects SPL..DIL instead.
                     let r = sel - 4;
                     self.regs[r] = (self.regs[r] & !0xff00) | (imm << 8);
                 } else {
@@ -1167,33 +1169,37 @@ impl Cpu {
                         }
                     }
                     6 | 7 => {
-                        // div/idiv: (rdx:rax) / r/m
+                        // div/idiv: dividend is (RDX:RAX) at the operand width
+                        // (DX:AX for 16-bit, EDX:EAX for 32-bit, RDX:RAX for 64).
                         if a == 0 {
                             return StepResult::Fault { addr: 0 }; // #DE
                         }
+                        // Writeback rule: 16-bit preserves upper bits, 32-bit
+                        // zero-extends, 64-bit is full-width.
+                        let wr = |cur: u64, v: u64| match size {
+                            2 => (cur & !0xFFFF) | (v & 0xFFFF),
+                            4 => v & 0xFFFF_FFFF,
+                            _ => v,
+                        };
+                        let (dlo, alo) = (self.regs[RDX], self.regs[RAX]);
                         if sub & 7 == 6 {
-                            let num: u128 = if size == 4 {
-                                ((self.regs[RDX] & 0xFFFF_FFFF) << 32 | (self.regs[RAX] & 0xFFFF_FFFF))
-                                    as u128
-                            } else {
-                                ((self.regs[RDX] as u128) << 64) | self.regs[RAX] as u128
+                            let num: u128 = match size {
+                                2 => ((dlo & 0xFFFF) << 16 | (alo & 0xFFFF)) as u128,
+                                4 => ((dlo & 0xFFFF_FFFF) << 32 | (alo & 0xFFFF_FFFF)) as u128,
+                                _ => ((dlo as u128) << 64) | alo as u128,
                             };
-                            let d = (a & if size == 4 { 0xFFFF_FFFF } else { u64::MAX }) as u128;
-                            let q = num / d;
-                            let r = num % d;
-                            self.regs[RAX] = q as u64 & if size == 4 { 0xFFFF_FFFF } else { u64::MAX };
-                            self.regs[RDX] = r as u64 & if size == 4 { 0xFFFF_FFFF } else { u64::MAX };
+                            let d = (a & mask128(size) as u64) as u128;
+                            self.regs[RAX] = wr(alo, (num / d) as u64);
+                            self.regs[RDX] = wr(dlo, (num % d) as u64);
                         } else {
-                            let num: i128 = if size == 4 {
-                                (((self.regs[RDX] & 0xFFFF_FFFF) << 32
-                                    | (self.regs[RAX] & 0xFFFF_FFFF)) as i64)
-                                    as i128
-                            } else {
-                                (((self.regs[RDX] as i128) << 64) | self.regs[RAX] as i128) as i128
+                            let num: i128 = match size {
+                                2 => (((dlo & 0xFFFF) << 16 | (alo & 0xFFFF)) as i32) as i128,
+                                4 => (((dlo & 0xFFFF_FFFF) << 32 | (alo & 0xFFFF_FFFF)) as i64) as i128,
+                                _ => ((dlo as i128) << 64) | alo as i128,
                             };
                             let d = sign_ext(a, size) as i128;
-                            self.regs[RAX] = (num / d) as u64 & if size == 4 { 0xFFFF_FFFF } else { u64::MAX };
-                            self.regs[RDX] = (num % d) as u64 & if size == 4 { 0xFFFF_FFFF } else { u64::MAX };
+                            self.regs[RAX] = wr(alo, (num / d) as u64);
+                            self.regs[RDX] = wr(dlo, (num % d) as u64);
                         }
                     }
                     _ => return StepResult::Unknown { rip: start, byte: 0xf7 },
@@ -1403,7 +1409,19 @@ impl Cpu {
                         let next = (pc + 2) as u64;
                         if self.machine_mode && self.lstar != 0 {
                             if self.trace_sys {
-                                self.sys_log.push((self.regs[RAX] as u32, self.regs[10]));
+                                let svc = self.regs[RAX] as u32;
+                                self.sys_log.push((svc, self.regs[10]));
+                                #[cfg(not(target_arch = "wasm32"))]
+                                if svc == 3 {
+                                    let (ptr, len) = (self.regs[10], (self.regs[RDX] as usize).min(64));
+                                    let mut s = alloc::string::String::new();
+                                    for i in 0..len {
+                                        if let Ok(p) = mmu::translate(mem, &self.paging, ptr + i as u64, mmu::Access::Read, false) {
+                                            s.push(*mem.get(p as usize).unwrap_or(&b'?') as char);
+                                        }
+                                    }
+                                    eprintln!("[svc3 NtCreateFile ptr={:#x} len={} name={:?}]", ptr, self.regs[RDX], s);
+                                }
                             }
                             self.regs[RCX] = next;
                             self.regs[11] = self.rflags;
@@ -1426,7 +1444,9 @@ impl Cpu {
                             None => return self.fault(rm),
                         };
                         if self.cond(b2 & 0x0f) {
-                            self.regs[reg] = if size == 4 { v & 0xFFFF_FFFF } else { v };
+                            // write_rm applies the right width rule: 16-bit preserves
+                            // the upper 48 bits, 32-bit zero-extends, 64-bit full.
+                            self.write_rm(mem, Rm::Reg(reg), v, size);
                         }
                         self.rip = pc as u64;
                         StepResult::Ok
