@@ -12,14 +12,15 @@
     --red: #f77a8f; --amber: #e0af68;
   }
   * { box-sizing: border-box; }
+  html { background: #030712; }   /* base behind the animated ASCII-dither layer */
   body {
-    margin: 0; min-height: 100vh; background:
-      radial-gradient(1200px 600px at 80% -10%, #161b2e 0%, transparent 60%),
-      radial-gradient(900px 500px at -10% 110%, #15212a 0%, transparent 55%), var(--bg);
+    margin: 0; min-height: 100vh; background: transparent;
     color: var(--fg); font: 14px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
     display: flex; flex-direction: column; align-items: center; padding: 24px 16px 40px;
   }
-  .wrap { width: 100%; max-width: 920px; }
+  /* The dither canvas mounts here, fixed behind everything (z-index 0). */
+  #bg { position: fixed; inset: 0; z-index: 0; pointer-events: none; overflow: hidden; }
+  .wrap { width: 100%; max-width: 920px; position: relative; z-index: 1; }
   header.top { margin-bottom: 18px; }
   header.top h1 { margin: 0; font-size: 20px; letter-spacing: .2px; }
   header.top h1 b { color: var(--accent); }
@@ -67,6 +68,9 @@
 </style>
 </head>
 <body>
+<!-- Animated ASCII-dither backdrop (self-mounting; renders behind the UI). -->
+<div id="bg" data-ascii-dither-bg aria-hidden="true"></div>
+<script src="./background.js"></script>
 <div class="wrap">
   <header class="top">
     <h1><b>ntoskrnl-rs</b> in the browser · <span style="color:var(--dim)">ntemu</span></h1>
