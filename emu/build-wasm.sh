@@ -15,4 +15,13 @@ OUT=../web/ntemu
 mkdir -p "$OUT"
 cp target/wasm32-unknown-unknown/release/ntemu.wasm "$OUT/ntemu.wasm"
 ls -lh "$OUT/ntemu.wasm"
-echo "staged $OUT/ntemu.wasm — serve web/ntemu/ and open it"
+
+# Stage the kernel ELF so the page can boot it directly (no BIOS image needed).
+KERNEL=../target/x86_64-unknown-none/debug/kernel
+if [ -f "$KERNEL" ]; then
+  cp "$KERNEL" "$OUT/kernel"
+  ls -lh "$OUT/kernel"
+else
+  echo "note: kernel ELF not found ($KERNEL); build it to enable in-browser boot"
+fi
+echo "staged $OUT — serve web/ntemu/ and open it"

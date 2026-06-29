@@ -43,9 +43,20 @@ pub enum RunStop {
     Syscall,
 }
 
+/// Physical-frame address mask (bits 51:12).
+const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
 pub struct Machine {
     pub cpu: Cpu,
     pub ram: Vec<u8>,
+    /// Bump pointer for page-table frame allocation (used by `boot_kernel`).
+    pt_next: u64,
+    /// Optional ring buffer of the most recent instruction pointers (debug).
+    pub trace_on: bool,
+    pub trace_log: Vec<u64>,
+    /// Counters (debug): timer/IRQ deliveries and `hlt` idles serviced.
+    pub irqs_delivered: u64,
+    pub hlts: u64,
 }
 
 impl Machine {
@@ -53,7 +64,15 @@ impl Machine {
     pub fn new(ram_bytes: usize) -> Self {
         let mut cpu = Cpu::new();
         cpu.machine_mode = true;
-        Machine { cpu, ram: vec![0u8; ram_bytes] }
+        Machine {
+            cpu,
+            ram: vec![0u8; ram_bytes],
+            pt_next: 0,
+            trace_on: false,
+            trace_log: Vec::new(),
+            irqs_delivered: 0,
+            hlts: 0,
+        }
     }
 
     /// Write bytes into physical memory (e.g. a kernel image or test program).
@@ -109,6 +128,147 @@ impl Machine {
         self.put64(desc + 8, hi);
     }
 
+    fn get64(&self, phys: u64) -> u64 {
+        let a = phys as usize;
+        let mut v = [0u8; 8];
+        v.copy_from_slice(&self.ram[a..a + 8]);
+        u64::from_le_bytes(v)
+    }
+
+    /// Allocate (and zero) a 4 KiB page-table frame from the bump area.
+    fn alloc_frame(&mut self) -> u64 {
+        let f = self.pt_next;
+        self.pt_next += 0x1000;
+        for b in &mut self.ram[f as usize..f as usize + 0x1000] {
+            *b = 0;
+        }
+        f
+    }
+
+    /// Return the next-level table's physical base for `idx` in `table`,
+    /// creating it (present + writable) if absent.
+    fn ensure_table(&mut self, table: u64, idx: u64) -> u64 {
+        let e = self.get64(table + idx * 8);
+        if e & 1 != 0 {
+            return e & ADDR_MASK;
+        }
+        let f = self.alloc_frame();
+        self.put64(table + idx * 8, f | P | RW);
+        f
+    }
+
+    /// Map one page (4 KiB, or 2 MiB if `large`) `virt → phys` in the tree
+    /// rooted at `pml4`. Supervisor, writable, executable (no NX).
+    fn map_page(&mut self, pml4: u64, virt: u64, phys: u64, large: bool) {
+        let pml4i = (virt >> 39) & 0x1FF;
+        let pdpti = (virt >> 30) & 0x1FF;
+        let pdi = (virt >> 21) & 0x1FF;
+        let pti = (virt >> 12) & 0x1FF;
+        let pdpt = self.ensure_table(pml4, pml4i);
+        let pd = self.ensure_table(pdpt, pdpti);
+        if large {
+            self.put64(pd + pdi * 8, (phys & !0x1F_FFFF) | P | RW | PS);
+            return;
+        }
+        let pt = self.ensure_table(pd, pdi);
+        self.put64(pt + pti * 8, (phys & ADDR_MASK) | P | RW);
+    }
+
+    fn map_range(&mut self, pml4: u64, virt: u64, phys: u64, len: u64, large: bool) {
+        let step = if large { 0x20_0000 } else { 0x1000 };
+        let mut o = 0;
+        while o < len {
+            self.map_page(pml4, virt + o, phys + o, large);
+            o += step;
+        }
+    }
+
+    /// Boot the real kernel: load + relocate it high-half, build the page
+    /// tables and the `bootloader_api` `BootInfo`, and enter `_start` (BootInfo
+    /// pointer in RDI) exactly as the `bootloader` crate would. This replaces
+    /// the BIOS/real-mode bring-up entirely — we hand the kernel the paged,
+    /// long-mode environment it expects directly.
+    pub fn boot_kernel(&mut self, image: &[u8]) -> Result<(), crate::elf::ElfError> {
+        use crate::bootinfo::{self, HandoffParams, Region};
+        let elf = crate::elf::Elf::parse(image)?;
+
+        const KIMG_PHYS: u64 = 0x80_0000; // 8 MiB
+        const KERNEL_VIRT: u64 = 0xFFFF_8000_0000_0000;
+        const PHYS_OFFSET: u64 = 0xFFFF_FF00_0000_0000;
+        const STACK_VIRT: u64 = 0xFFFF_8000_4000_0000;
+        const STACK_LEN: u64 = 256 * 1024;
+        const BOOTINFO_VIRT: u64 = 0xFFFF_8000_5000_0000;
+        const REGIONS_VIRT: u64 = 0xFFFF_8000_5001_0000;
+
+        let mut span_end = 0u64;
+        for s in elf.segments.iter() {
+            span_end = span_end.max(s.vaddr + s.mem_size as u64);
+        }
+        let img_span = (span_end + 0xFFF) & !0xFFF;
+        let stack_phys = (KIMG_PHYS + img_span + 0xFFF) & !0xFFF;
+        let bootinfo_phys = stack_phys + STACK_LEN;
+        let regions_phys = bootinfo_phys + 0x1000;
+        let high_water = (regions_phys + 0x1000 + 0x1F_FFFF) & !0x1F_FFFF;
+        let ramsize = self.ram.len() as u64;
+
+        // 1. Load segments at their physical home, then apply PIE relocations.
+        for s in elf.segments.iter() {
+            let bytes = elf.segment_bytes(s);
+            self.write_phys(KIMG_PHYS + s.vaddr, bytes);
+        }
+        elf.apply_relative_relocs(KERNEL_VIRT, |off, val| {
+            self.put64(KIMG_PHYS + off, val);
+        });
+
+        // 2. Page tables: PT frames live at 1 MiB (below the kernel image).
+        self.pt_next = 0x10_0000;
+        let pml4 = self.alloc_frame();
+        self.map_range(pml4, KERNEL_VIRT, KIMG_PHYS, img_span, false);
+        self.map_range(pml4, STACK_VIRT, stack_phys, STACK_LEN, false);
+        self.map_page(pml4, BOOTINFO_VIRT, bootinfo_phys, false);
+        self.map_page(pml4, REGIONS_VIRT, regions_phys, false);
+        // Physical-memory window: the bootloader maps the whole physical address
+        // space (RAM *and* MMIO holes such as the Local APIC at 0xFEE00000), so
+        // map the low 4 GiB. Accesses to the APIC page are intercepted as MMIO;
+        // other non-RAM frames simply fault if the kernel ever touches them.
+        let window = core::cmp::max(ramsize, 0x1_0000_0000);
+        self.map_range(pml4, PHYS_OFFSET, 0, window, true);
+
+        // 3. Control registers for an active long mode.
+        self.cpu.paging.cr3 = pml4;
+        self.cpu.paging.cr4 = mmu::CR4_PAE;
+        self.cpu.paging.efer = mmu::EFER_LME | mmu::EFER_LMA | mmu::EFER_NXE;
+        self.cpu.paging.cr0 = mmu::CR0_PG | 1; // PG | PE
+        self.cpu.cpl = 0;
+
+        // 4. BootInfo: reserve everything we built; the rest is usable RAM.
+        let regions = [
+            Region { start: 0x1000, end: high_water, usable: false },
+            Region { start: high_water, end: ramsize, usable: true },
+        ];
+        let params = HandoffParams {
+            physical_memory_offset: PHYS_OFFSET,
+            kernel_image_offset: KERNEL_VIRT,
+            kernel_addr: KIMG_PHYS,
+            kernel_len: image.len() as u64,
+            kernel_stack_bottom: STACK_VIRT,
+            kernel_stack_len: STACK_LEN,
+            rsdp_addr: None,
+            regions_vaddr: REGIONS_VIRT,
+        };
+        let (bi_bytes, reg_bytes) = bootinfo::build(&params, &regions);
+        self.write_phys(bootinfo_phys, &bi_bytes);
+        self.write_phys(regions_phys, &reg_bytes);
+
+        // 5. Enter _start(boot_info): pointer in RDI, a 16-byte-aligned stack.
+        self.cpu.regs[crate::RDI] = BOOTINFO_VIRT;
+        let top = (STACK_VIRT + STACK_LEN) & !0xF;
+        self.cpu.regs[crate::RSP] = top - 8;
+        self.cpu.tss_rsp0 = top;
+        self.cpu.rip = KERNEL_VIRT + elf.entry;
+        Ok(())
+    }
+
     /// Load an ELF64 image's `PT_LOAD` segments into physical memory (by their
     /// physical address) and return the entry point. Segments that fall outside
     /// physical RAM are skipped (the caller sizes RAM for the image).
@@ -140,9 +300,17 @@ impl Machine {
             self.cpu.dev.apic.tick(1);
             self.service_pending_irq();
 
+            if self.trace_on {
+                if self.trace_log.len() >= 64 {
+                    self.trace_log.remove(0);
+                }
+                self.trace_log.push(self.cpu.rip);
+            }
+
             match self.cpu.step(&mut self.ram) {
                 StepResult::Ok => continue,
                 StepResult::Hlt => {
+                    self.hlts += 1;
                     // Idle. If a vector is already pending and enabled, take it.
                     if self.cpu.flag(IF) {
                         if self.cpu.dev.apic.pending_vector.is_some() {
@@ -179,6 +347,7 @@ impl Machine {
         if self.cpu.flag(IF) {
             if let Some(vec) = self.cpu.dev.apic.pending_vector.take() {
                 self.cpu.deliver_interrupt(&mut self.ram, vec, None);
+                self.irqs_delivered += 1;
             }
         }
     }

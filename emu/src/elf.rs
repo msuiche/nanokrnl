@@ -24,10 +24,21 @@ pub struct Segment {
 pub struct Elf<'a> {
     pub entry: u64,
     pub segments: heapless_vec::Vec,
+    /// `PT_DYNAMIC` segment (file offset, size) if present — holds the dynamic
+    /// relocation tables for a PIE.
+    dynamic: Option<(usize, usize)>,
     image: &'a [u8],
 }
 
 const PT_LOAD: u32 = 1;
+const PT_DYNAMIC: u32 = 2;
+
+// Dynamic-section tags.
+const DT_RELA: u64 = 7;
+const DT_RELASZ: u64 = 8;
+const DT_RELAENT: u64 = 9;
+// Relocation type in the low 32 bits of r_info.
+const R_X86_64_RELATIVE: u64 = 8;
 
 fn rd16(b: &[u8], o: usize) -> u16 {
     u16::from_le_bytes([b[o], b[o + 1]])
@@ -74,24 +85,82 @@ impl<'a> Elf<'a> {
             return Err(ElfError::Truncated);
         }
         let mut segments = heapless_vec::Vec::new();
+        let mut dynamic = None;
         for i in 0..phnum {
             let ph = phoff + i * phentsize;
-            if rd32(image, ph) != PT_LOAD {
-                continue;
-            }
-            let seg = Segment {
-                flags: rd32(image, ph + 4),
-                file_off: rd64(image, ph + 8) as usize,
-                vaddr: rd64(image, ph + 16),
-                paddr: rd64(image, ph + 24),
-                file_size: rd64(image, ph + 32) as usize,
-                mem_size: rd64(image, ph + 40) as usize,
-            };
-            if segments.push(seg).is_err() {
-                return Err(ElfError::TooManySegments);
+            match rd32(image, ph) {
+                PT_LOAD => {
+                    let seg = Segment {
+                        flags: rd32(image, ph + 4),
+                        file_off: rd64(image, ph + 8) as usize,
+                        vaddr: rd64(image, ph + 16),
+                        paddr: rd64(image, ph + 24),
+                        file_size: rd64(image, ph + 32) as usize,
+                        mem_size: rd64(image, ph + 40) as usize,
+                    };
+                    if segments.push(seg).is_err() {
+                        return Err(ElfError::TooManySegments);
+                    }
+                }
+                PT_DYNAMIC => {
+                    dynamic = Some((rd64(image, ph + 8) as usize, rd64(image, ph + 32) as usize));
+                }
+                _ => {}
             }
         }
-        Ok(Elf { entry, segments, image })
+        Ok(Elf { entry, segments, dynamic, image })
+    }
+
+    /// Translate a link-time virtual address (PIE base 0) to its offset in the
+    /// file via the `PT_LOAD` segments.
+    fn vaddr_to_file(&self, vaddr: u64) -> Option<usize> {
+        for s in self.segments.iter() {
+            if vaddr >= s.vaddr && vaddr < s.vaddr + s.file_size as u64 {
+                return Some(s.file_off + (vaddr - s.vaddr) as usize);
+            }
+        }
+        None
+    }
+
+    /// Apply `R_X86_64_RELATIVE` relocations for a PIE loaded at `base`: for each
+    /// entry, the 8 bytes at link-vaddr `r_offset` become `base + r_addend`. The
+    /// callback receives `(link_vaddr, value)` so the caller can write it into
+    /// the loaded image at its real location. Returns the number applied.
+    pub fn apply_relative_relocs(&self, base: u64, mut write: impl FnMut(u64, u64)) -> usize {
+        let Some((dyn_off, dyn_size)) = self.dynamic else { return 0 };
+        // Walk the dynamic array (Elf64_Dyn: tag u64, val u64).
+        let (mut rela, mut relasz, mut relaent) = (0u64, 0u64, 24u64);
+        let mut o = dyn_off;
+        while o + 16 <= dyn_off + dyn_size && o + 16 <= self.image.len() {
+            let tag = rd64(self.image, o);
+            let val = rd64(self.image, o + 8);
+            match tag {
+                DT_RELA => rela = val,
+                DT_RELASZ => relasz = val,
+                DT_RELAENT => relaent = val,
+                0 => break, // DT_NULL terminates
+                _ => {}
+            }
+            o += 16;
+        }
+        if rela == 0 || relasz == 0 {
+            return 0;
+        }
+        let Some(table) = self.vaddr_to_file(rela) else { return 0 };
+        let mut count = 0;
+        let mut p = table;
+        let end = table + relasz as usize;
+        while p + 24 <= end && p + 24 <= self.image.len() {
+            let r_offset = rd64(self.image, p);
+            let r_info = rd64(self.image, p + 8);
+            let r_addend = rd64(self.image, p + 16);
+            if r_info & 0xFFFF_FFFF == R_X86_64_RELATIVE {
+                write(r_offset, base.wrapping_add(r_addend));
+                count += 1;
+            }
+            p += relaent as usize;
+        }
+        count
     }
 
     /// Bytes of a segment as they appear in the file (length `file_size`).

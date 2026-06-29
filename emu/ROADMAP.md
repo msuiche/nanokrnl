@@ -48,17 +48,27 @@ emulates **only what our kernel needs**, starting the CPU already in long mode.
   0xD1), PS/2 keyboard — all unit-tested.
 - [x] **M5 — ELF loader.** `elf.rs` parses ELF64 and `Machine::load_elf` places
   `PT_LOAD` segments. The real kernel ELF loads (entry `0x1ba260`, ~2.3 MiB).
-- [ ] **M5b — bootloader handoff.** Apply `R_X86_64_RELATIVE` relocations and
-  synthesize the `bootloader_api` `BootInfo` (+ memory map / physical-memory
-  offset) so `kernel_main` runs. *This is the gate to a real kernel boot.*
+- [x] **M5b — bootloader handoff.** `Machine::boot_kernel`: high-half load +
+  `R_X86_64_RELATIVE` relocations, page tables (kernel + stack + 4 GiB physical
+  window), and a byte-exact `bootloader_api` 0.11.15 `BootInfo` (hand-encoded for
+  the x86-64 layout, in `bootinfo.rs`), entered at `_start` with the pointer in
+  RDI. **The real kernel boots.**
 - [x] **M6 — wasm32 packaging.** `cdylib` + `no_std` runtime (panic handler +
-  bump allocator) in `wasm.rs`; a pointer-free C ABI; JS shim in `web/ntemu/`.
-  38 KB wasm, verified to boot+print+take-an-interrupt in a real WASM runtime.
-- [ ] **M7 — close opcode gaps.** Trace-driven via `StepResult::Unknown`: the
-  full kernel + CRT will surface string ops, FPU, more SSE, `bsf/bsr`, etc.
+  bump allocator) in `wasm.rs`; a pointer-free C ABI; JS shim in `web/ntemu/`
+  that fetches + boots the staged kernel ELF. 51 KB wasm, verified booting the
+  real kernel in a WASM runtime.
+- [x] **M7 — opcode tail (boot-complete).** Trace-driven via
+  `StepResult::Unknown`: added 8-bit ALU forms, `grp1`-8bit, REP string ops,
+  `cpuid`, `imul`, `bsf/bsr`, `bt*`, `cmpxchg`, `xadd`, segment-register moves,
+  `ltr`/`lgdt`/`lidt`, far-return/`iretq`, x2APIC+xAPIC. Enough for a full boot
+  to the idle loop; a richer guest (shell, user processes) will surface more.
 
 ## Status
-M0–M6 complete and tested (`cargo test` → **32 passing**; wasm verified in
-Node). The path to a real in-browser kernel boot is **M5b** (relocations +
-`BootInfo` handoff) then **M7** (opcode tail). See `SPEC.md` at the repo root for
-the full specification and evidence.
+M0–M7 complete and tested. The **real ntoskrnl-rs kernel boots** under ntemu —
+native and in the 51 KB wasm — through both init phases to a live,
+APIC-timer-driven scheduler idle loop. `cargo test` → **33 passing**. See
+`SPEC.md` at the repo root for the full specification and boot evidence.
+
+Key correctness fixes found by booting: RIP-relative immediate length (seed),
+`mov r16,imm16` operand-size, and `pc`/addresses must be `u64` not `usize`
+(wasm32 truncation).

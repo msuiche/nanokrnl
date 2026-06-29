@@ -29,7 +29,7 @@ fn panic(_info: &PanicInfo) -> ! {
 
 /// Bump allocator over a fixed static arena. Single-threaded (wasm has no
 /// threads here), so the `Sync` impl is sound.
-const ARENA_SIZE: usize = 96 * 1024 * 1024; // 96 MiB: RAM buffer + overhead
+const ARENA_SIZE: usize = 160 * 1024 * 1024; // RAM buffer (128 MiB) + image + overhead
 
 #[repr(C, align(16))]
 struct Arena(UnsafeCell<[u8; ARENA_SIZE]>);
@@ -100,6 +100,22 @@ pub extern "C" fn ntemu_boot_elf(rsp: u64) -> u64 {
         }
         m.boot_long_mode(entry, rsp);
         entry
+    }
+}
+
+/// Boot the staged image as the real ntoskrnl-rs kernel: load + relocate it
+/// high-half, build the page tables + BootInfo handoff, and enter `_start`.
+/// Returns 1 on success, 0 on failure.
+#[no_mangle]
+pub extern "C" fn ntemu_boot_kernel() -> u32 {
+    unsafe {
+        let (Some(m), Some(img)) = (MACHINE.as_mut(), IMAGE.as_ref()) else {
+            return 0;
+        };
+        match m.boot_kernel(img) {
+            Ok(()) => 1,
+            Err(_) => 0,
+        }
     }
 }
 

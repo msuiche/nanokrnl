@@ -135,7 +135,11 @@ cd emu && cargo run --example inspect_kernel -- ../target/x86_64-unknown-none/de
 
 ## 6. Testing & evidence
 
-`cargo test` in `emu/` runs **32 tests, all passing**:
+**The real ntoskrnl-rs kernel boots** under ntemu (see §7) — natively
+(`cargo run --example inspect_kernel`) and through the 51 KB wasm in a real
+WebAssembly runtime.
+
+`cargo test` in `emu/` runs **33 tests, all passing**:
 - decoder/ALU/control-flow (the seed's 12),
 - MMU: identity, 4 KiB, 2 MiB pages, not-present / RO-write / user-vs-supervisor
   / non-canonical faults (7),
@@ -155,23 +159,50 @@ handler; `ok` is post-return). No threads / SharedArrayBuffer / COOP-COEP.
 
 ---
 
-## 7. Booting the real kernel — status & remaining work
+## 7. Booting the real kernel — WORKING
 
-`cargo run --example inspect_kernel` shows the real kernel ELF **loads cleanly**:
-PIE with low load addresses (entry `0x1ba260`, segments R / R-X / RW / RW, top
-`0x232e28` — ~2.3 MiB, well within RAM). It does **not** yet reach its shell when
-booted directly, for reasons outside the CPU core:
+`Machine::boot_kernel` boots the **unmodified** ntoskrnl-rs ELF, on both the
+native host and the wasm/browser build. It reproduces the `bootloader` crate's
+handoff:
 
-1. **Static-PIE relocations.** The image expects `R_X86_64_RELATIVE` relocations
-   applied at its load base; we currently load segments verbatim.
-2. **`bootloader_api` handoff.** `kernel_main(boot_info: &'static mut BootInfo)`
-   expects the `bootloader` crate's environment: a constructed `BootInfo`
-   (memory map + `physical_memory_offset`), the bootloader's page tables, and
-   the entry ABI that passes the `BootInfo` pointer. ntemu builds its own
-   identity tables and does not yet synthesize a `BootInfo`.
-3. **Opcode tail.** The full kernel will surface unimplemented opcodes
-   (§3); each is added trace-driven via the `Unknown { rip, byte }` signal.
+1. **High-half load + relocations.** Segments are loaded at
+   `0xFFFF_8000_0000_0000 + vaddr`; the PIE's `R_X86_64_RELATIVE` relocations
+   (from `PT_DYNAMIC` → `DT_RELA`) are applied for that base.
+2. **Page tables.** A fresh PML4 maps the kernel image, a 256 KiB stack, the
+   `BootInfo` page, and the **whole low-4 GiB physical window** at
+   `0xFFFF_FF00_0000_0000` (so the kernel reaches the Local APIC via the
+   physical-memory offset). The Local APIC page is intercepted as MMIO.
+3. **`BootInfo`.** A byte-exact `bootloader_api` 0.11.15 `BootInfo` (hand-encoded
+   for the x86-64 layout — see `src/bootinfo.rs`) with the memory map,
+   `physical_memory_offset`, and kernel/stack fields. The pointer is placed in
+   RDI and control transfers to `_start`.
 
-These are the next milestones (M5b handoff, M7 opcode tail in `emu/ROADMAP.md`).
-The CPU, MMU, device, interrupt, syscall, and ELF-loading machinery they depend
-on are complete and tested.
+With this, the kernel runs its full init and reaches its idle loop:
+
+```
+ntoskrnl-rs 0.1.0 (x86_64) — NT-compatible kernel in Rust
+KiSystemStartup: phase 0
+KE: GDT/TSS/IDT loaded (NT selector layout), KPCR online, syscall enabled, SMEP=off SMAP=off
+MM: PFN bitmap @ 0xC00000 (4 KiB) — 115 MiB usable RAM
+HAL: PIC masked, APIC enabled, clock on vector 0xD1 (CLOCK_LEVEL)
+KiSystemStartup: phase 1
+KE: scheduler online, interrupts enabled
+```
+
+After this it enters a healthy APIC-timer-driven idle loop: in a 50M-instruction
+run, **134,936 `hlt` idles each woken by exactly one vector-0xD1 timer
+interrupt** — i.e. the scheduler tick is live. No crashes, unknown opcodes, or
+unhandled faults.
+
+Opcodes are added **trace-driven** via the `Unknown { rip, byte }` signal; the
+boot above exercises the 8-bit ALU forms, `grp1`-8bit, REP string ops, `cpuid`,
+`imul`, `bsf/bsr`, `bt*`, `cmpxchg`, segment-register/`ltr`/far-return/`iret`,
+x2APIC and xAPIC paths, and the full long-mode system instruction set. Booting a
+guest that does more (a shell, user processes) will surface further opcodes the
+same way.
+
+### Cross-architecture note
+The interpreter's program counter and all guest addresses are `u64`, never
+`usize` — `usize` is 32-bit on `wasm32` and would truncate high-half kernel
+addresses. The `BootInfo` is hand-encoded with explicit 64-bit fields for the
+same reason (the wasm host is 32-bit; the guest is 64-bit).
