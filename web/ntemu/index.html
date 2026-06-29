@@ -137,9 +137,11 @@ const dec = new TextDecoder();
 
 // Fetch the wasm + kernel image once; re-instantiate the module on each boot so
 // the (bump-allocated, never-freed) machine starts from clean linear memory.
-const wasmBytes = await fetch("ntemu.wasm").then(r => r.arrayBuffer());
+// `no-store` defeats the browser cache so a reload always gets fresh artifacts
+// after a rebuild.
+const wasmBytes = await fetch("ntemu.wasm", { cache: "no-store" }).then(r => r.arrayBuffer());
 let kernelBytes = null;
-try { kernelBytes = new Uint8Array(await fetch("kernel").then(r => r.arrayBuffer())); } catch {}
+try { kernelBytes = new Uint8Array(await fetch("kernel", { cache: "no-store" }).then(r => r.arrayBuffer())); } catch {}
 
 let e = null, running = false, raf = 0;
 let term = "";          // the console text buffer
@@ -178,15 +180,12 @@ function loop() {
     }
   } else {
     running = false; refreshButtons();
+    const hex = (n) => "0x" + n.toString(16);
     let detail = RUNSTOP[code] || ("stop " + code);
-    if (code === 2 || code === 3) {   // unknown opcode / unhandled fault: show specifics
-      const hex = (n) => "0x" + n.toString(16);
-      const rip = hex(e.ntemu_fault_rip());
-      detail += code === 2
-        ? ` ${hex(e.ntemu_fault_byte())} @ rip ${rip}`
-        : ` @ rip ${rip}, addr ${hex(e.ntemu_fault_addr())}`;
-      term += `\n*** ntemu stopped: ${detail} ***\n`; render();
-    }
+    if (code === 2) detail += ` ${hex(e.ntemu_fault_byte())} @ rip ${hex(e.ntemu_fault_rip())}`;
+    else if (code === 3) detail += ` @ rip ${hex(e.ntemu_fault_rip())}, addr ${hex(e.ntemu_fault_addr())}`;
+    // Always surface the stop in the console + status (not just faults).
+    term += `\n*** ntemu stopped: ${detail} ***\n`; render();
     setStatus("stop", detail);
   }
 }
