@@ -40,11 +40,11 @@
   .status.stop .led { background: var(--red); }
   @keyframes pulse { 50% { opacity: .35; } }
 
-  #screen { margin: 0; padding: 16px 18px; height: 64vh; min-height: 360px; overflow-y: auto;
-    white-space: pre-wrap; word-break: break-word; outline: none; background:
-    repeating-linear-gradient(transparent 0 27px, rgba(255,255,255,.012) 27px 28px); }
+  #screen { margin: 0; padding: 14px 16px; height: 64vh; min-height: 360px; overflow-y: auto;
+    white-space: pre-wrap; word-break: break-word; outline: none;
+    font-size: 11.5px; line-height: 1.45; }
   #screen:focus { box-shadow: inset 0 0 0 1px rgba(122,162,247,.35); }
-  #screen .cursor { display: inline-block; width: 8px; height: 15px; background: var(--accent);
+  #screen .cursor { display: inline-block; width: 7px; height: 13px; background: var(--accent);
     vertical-align: text-bottom; animation: blink 1.05s steps(1) infinite; }
   @keyframes blink { 50% { opacity: 0; } }
 
@@ -70,9 +70,8 @@
 <div class="wrap">
   <header class="top">
     <h1><b>ntoskrnl-rs</b> in the browser · <span style="color:var(--dim)">ntemu</span></h1>
-    <p>A bespoke x86-64 emulator (~60&nbsp;KB WebAssembly, no threads or COOP/COEP) booting the real
-       NT-architecture kernel: it runs both init phases, passes its self-test suite, then drops into an
-       interactive <b style="color:var(--fg)">cmd.exe</b>. Click <b style="color:var(--fg)">Boot</b>, wait for the
+    <p>A bespoke x86-64 emulator (~60 KB WebAssembly — no threads, no COOP/COEP) booting the real
+       NT-architecture kernel to an interactive cmd.exe. Click Boot, wait for the
        <span style="color:var(--green)">C:\&gt;</span> prompt, then type.</p>
   </header>
 
@@ -110,29 +109,39 @@ const wasmBytes = await fetch("ntemu.wasm").then(r => r.arrayBuffer());
 let kernelBytes = null;
 try { kernelBytes = new Uint8Array(await fetch("kernel").then(r => r.arrayBuffer())); } catch {}
 
-let e = null, running = false, raf = 0, cursor = null;
+let e = null, running = false, raf = 0;
+let term = "";          // the console text buffer
+let perFrame = 24_000_000;   // big chunks while booting; dropped once interactive
 const RUNSTOP = { 0: "halted", 1: "running", 2: "unknown opcode", 3: "unhandled fault", 4: "syscall trap" };
 
 function setStatus(cls, text) { statusEl.className = "status " + cls; statusText.textContent = text; }
-function appendText(t) {
-  if (cursor) cursor.remove();
-  screen.appendChild(document.createTextNode(t));
-  cursor = document.createElement("span"); cursor.className = "cursor"; screen.appendChild(cursor);
+function render() {
+  screen.textContent = term;
+  const c = document.createElement("span"); c.className = "cursor"; screen.appendChild(c);
   screen.scrollTop = screen.scrollHeight;
 }
 function drainUart() {
-  let out = "", b;
-  while ((b = e.ntemu_uart_read()) >= 0) out += String.fromCharCode(b);
-  if (out) appendText(dec.decode(new Uint8Array([...out].map(c => c.charCodeAt(0))), { stream: true }));
+  let b, changed = false;
+  while ((b = e.ntemu_uart_read()) >= 0) {
+    changed = true;
+    if (b === 0x08) term = term.slice(0, -1);     // backspace: erase last char
+    else if (b === 0x0d || b === 0x07) { }         // ignore CR and bell
+    else term += String.fromCharCode(b);
+  }
+  if (changed) {
+    if (term.length > 200000) term = term.slice(-150000); // cap scrollback
+    render();
+  }
 }
 
 function loop() {
   if (!running) return;
-  const code = e.ntemu_run(16_000_000);
+  const code = e.ntemu_run(perFrame);
   drainUart();
   if (code === 1 || code === 0) {
     raf = requestAnimationFrame(loop);
-    if (statusEl.classList.contains("boot") && screen.textContent.includes("C:\\>")) {
+    if (statusEl.classList.contains("boot") && term.includes("C:\\>")) {
+      perFrame = 2_000_000;   // interactive: small chunks → low input latency
       setStatus("run", "running · interactive");
     }
   } else { running = false; setStatus("stop", RUNSTOP[code] || ("stop " + code)); refreshButtons(); }
@@ -140,7 +149,7 @@ function loop() {
 
 async function boot(image) {
   stop();
-  screen.textContent = ""; cursor = null;
+  term = ""; screen.textContent = ""; perFrame = 24_000_000;
   setStatus("boot", "booting…");
   const inst = (await WebAssembly.instantiate(wasmBytes, {})).instance;
   e = inst.exports;
@@ -163,7 +172,7 @@ btnBoot.onclick = () => {
   boot(kernelBytes);
 };
 btnRestart.onclick = () => kernelBytes && boot(kernelBytes);
-btnShutdown.onclick = () => { stop(); setStatus("stop", "halted by user"); refreshButtons(); appendText("\n[machine powered off]\n"); };
+btnShutdown.onclick = () => { stop(); setStatus("stop", "halted by user"); refreshButtons(); term += "\n[machine powered off]\n"; render(); };
 document.getElementById("file").onchange = async (ev) => {
   const f = ev.target.files[0]; if (f) boot(new Uint8Array(await f.arrayBuffer()));
 };
