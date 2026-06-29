@@ -4,7 +4,7 @@
 //!
 //!   cargo run --release --example cmd_session -- ../target/x86_64-unknown-none/debug/kernel
 
-use ntemu::machine::{Machine, RunStop};
+use nanox::machine::{Machine, RunStop};
 
 fn main() {
     let path = std::env::args()

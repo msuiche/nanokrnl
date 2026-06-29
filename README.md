@@ -1,9 +1,26 @@
-# ntoskrnl-rs
+# nanokrnl
 
-An **NT-compatible kernel written in Rust** — the architecture, abstractions,
-and (where it matters) the exact constants and layouts of the Windows NT
-kernel, rebuilt as a modern, memory-safe, freestanding Rust codebase that
-boots on x86_64 and proves itself with self tests on every boot.
+### *The end of an era.*
+
+> Many of us started 20 or 30 years ago with low-level programming, emulation,
+> reverse engineering, and disassembly. A nano Windows kernel booting through a
+> hand-built emulator in the browser is full circle: it closes that era as a new
+> one begins.
+
+An **NT-compatible kernel written in Rust**: the architecture, abstractions,
+and (where it matters) the exact constants and layouts of the Windows NT kernel,
+rebuilt as a modern, memory-safe, freestanding Rust codebase. It boots on
+x86-64, runs **real, unmodified Microsoft user binaries** (`cmd.exe`,
+`more.com`, …) on its own NT syscalls, loads a genuine `null.sys` PE driver, and
+proves itself with a self-test suite on every boot.
+
+It runs natively under QEMU **and in your browser**, via **nanox**, a bespoke
+~60 KB x86-64 WebAssembly emulator that boots the unmodified kernel image
+directly in long mode, with no threads, no `SharedArrayBuffer`, and no
+COOP/COEP headers.
+
+> The project is **nanokrnl**; internally the kernel still identifies as
+> `ntoskrnl-rs`, so the boot banner prints `ntoskrnl-rs 0.1.0`.
 
 ```
 ntoskrnl-rs 0.1.0 (x86_64) — NT-compatible kernel in Rust
@@ -21,390 +38,156 @@ KiSystemStartup: running self tests
 ALL SELF TESTS PASSED — system idle
 ```
 
+## Run it in your browser
+
+**Live demo:** the unmodified kernel boots in a web page, reaches a `C:\>`
+prompt, and runs **real Microsoft binaries** typed at the keyboard: `ver`,
+`echo`, `dir`, `whoami`, `more <file>`, `exit`. The page is served from
+[`web/nanox/`](web/nanox/) on GitHub Pages: click **Boot**, wait for the
+banner and self-tests to scroll past, and you get a working command prompt.
+
+What makes this possible is **nanox** ([`emu/`](emu/)), a from-scratch
+x86-64 emulator in Rust that compiles to a single ~60 KB `wasm32` module.
+Unlike v86 (32-bit only) or qemu-wasm (multi-megabyte, needs
+threads/`SharedArrayBuffer`/COOP-COEP), nanox doesn't emulate a PC from the
+reset vector: because we control the bootloader, it **boots directly in long
+mode** and emulates only the handful of devices the kernel actually touches
+(16550 UART, Local APIC + timer, PS/2). The result serves from any plain
+static file host, with no special headers.
+
+Build and serve it yourself:
+
+```sh
+sh emu/build-wasm.sh                       # build nanox.wasm + stage the kernel
+cd web/nanox && python3 -m http.server 8000   # http://localhost:8000
+```
+
+(Serve over HTTP, not `file://`; the demo's AudioWorklet backdrop needs a real
+origin.)
+
 ## What "NT-compatible" means here
 
-The point is fidelity to NT's *kernel architecture*, not binary
-compatibility with Windows drivers (yet). Concretely:
+The point is fidelity to NT's *kernel architecture*, not binary compatibility
+with Windows drivers (yet). Concretely:
 
 **Bit-exact where it's ABI.**
 - `NTSTATUS` values (`STATUS_ACCESS_VIOLATION == 0xC0000005`, …) and the
-  `NT_SUCCESS` severity rules — `kernel/src/rtl/status.rs`
-- `LIST_ENTRY` two-pointer layout and `CONTAINING_RECORD` recovery —
-  `kernel/src/rtl/list.rs`
-- `UNICODE_STRING` (byte counts, UTF-16 buffer, 16-byte x64 layout) —
-  `kernel/src/rtl/string.rs`
-- The x64 GDT **selector layout** (`KGDT64_R0_CODE = 0x10` … `KGDT64_SYS_TSS
-  = 0x40`), chosen by NT so `syscall`/`sysret` work — `kernel/src/ke/gdt.rs`
-- The IRQL model and its hardware mapping: IRQL **is** CR8/TPR, an interrupt
-  is delivered iff `vector >> 4 > IRQL`, and the clock runs on **vector
-  0xD1** (`CLOCK_LEVEL` 13), same as NT x64 — `kernel/src/ke/irql.rs`
+  `NT_SUCCESS` severity rules (`kernel/src/rtl/status.rs`)
+- `LIST_ENTRY` two-pointer layout and `CONTAINING_RECORD` recovery
+  (`kernel/src/rtl/list.rs`)
+- `UNICODE_STRING` (byte counts, UTF-16 buffer, 16-byte x64 layout)
+  (`kernel/src/rtl/string.rs`)
+- The x64 GDT **selector layout** (`KGDT64_R0_CODE = 0x10` … `KGDT64_SYS_TSS =
+  0x40`), chosen by NT so `syscall`/`sysret` work (`kernel/src/ke/gdt.rs`)
+- The IRQL model and its hardware mapping: IRQL **is** CR8/TPR, an interrupt is
+  delivered iff `vector >> 4 > IRQL`, and the clock runs on **vector 0xD1**
+  (`CLOCK_LEVEL` 13), same as NT x64 (`kernel/src/ke/irql.rs`)
 - Pool tags, `IRP_MJ_*` codes, stop codes (`IRQL_NOT_LESS_OR_EQUAL`, …)
 
 **Faithful in shape where bit-compat doesn't matter.**
-Dispatcher objects with a common header and one wait API; DPCs queued from
-ISRs and retired at `DISPATCH_LEVEL`; the dispatcher lock handed off across
-context switches; driver/device/IRP triangle with dispatch tables; tagged
-pool with a 16-byte header; bugchecks that freeze the world. Divergences are
-documented at the definition site (e.g. our `KTRAP_FRAME` saves all GP
-registers; NT splits volatile/non-volatile across two structures).
+Dispatcher objects with a common header and one wait API; DPCs queued from ISRs
+and retired at `DISPATCH_LEVEL`; the dispatcher lock handed off across context
+switches; driver/device/IRP triangle with dispatch tables; tagged pool with a
+16-byte header; bugchecks that freeze the world.
 
 **Modern & safe by construction.**
-Rust everywhere; `unsafe` is concentrated at the hardware boundary and in
-the intrusive data structures, each block with an explicit safety contract.
-`SpinLock<T>` *owns* its data and raises IRQL by construction — the classic
-"touched shared state below DISPATCH_LEVEL" driver bug doesn't compile.
-`Box`/`Vec`/`String` work in-kernel and draw from NonPagedPool with the
-`'Rust'` tag.
+`unsafe` is concentrated at the hardware boundary and in the intrusive data
+structures, each block with an explicit safety contract. `SpinLock<T>` *owns*
+its data and raises IRQL by construction, so the classic "touched shared state
+below `DISPATCH_LEVEL`" driver bug doesn't compile. `Box`/`Vec`/`String` work
+in-kernel and draw from NonPagedPool with the `'Rust'` tag.
 
 ## Subsystem map
 
 | Directory | NT analog | Contents |
 |---|---|---|
 | `kernel/src/rtl/` | `Rtl*` | NTSTATUS, intrusive lists, UNICODE_STRING, run-finding bitmap |
-| `kernel/src/ke/` | `Ke*`/`Ki*` | IRQL, spinlocks, GDT/IDT/TSS, traps, KPCR/KPRCB, dispatcher objects, DPCs, threads, scheduler, bugcheck |
-| `kernel/src/mm/` | `Mm*` | PFN allocator (bitmap edition), NonPagedPool + global allocator, page-table walker |
+| `kernel/src/ke/` | `Ke*`/`Ki*` | IRQL, spinlocks, GDT/IDT/TSS, traps, KPCR/KPRCB, dispatcher objects, DPCs, threads, scheduler, syscalls, bugcheck |
+| `kernel/src/mm/` | `Mm*` | PFN allocator, NonPagedPool + global allocator, page-table walker, per-process address spaces |
 | `kernel/src/ex/` | `Ex*` | `ExAllocatePoolWithTag` API surface |
-| `kernel/src/ob/` | `Ob*` | Object headers, types, reference counting |
-| `kernel/src/ps/` | `Ps*` | ETHREAD, `PsCreateSystemThread` |
-| `kernel/src/io/` | `Io*` | DRIVER_OBJECT/DEVICE_OBJECT/IRP, `IoCallDriver`, null.sys |
-| `kernel/src/ldr/` | `MiLoadSystemImage`/`Iop*` | PE/COFF loader + kernel export table (`ntoskrnl.exe` exports) |
-| `kernel/src/hal/` | HAL | 16550 serial (KdPrint transport), 8259 PIC masking, local APIC + clock |
+| `kernel/src/ob/` | `Ob*` | Object headers, types, reference counting, handle table |
+| `kernel/src/ps/` | `Ps*` | ETHREAD, `PsCreateSystemThread`, process creation |
+| `kernel/src/io/` | `Io*` | DRIVER/DEVICE/IRP, `IoCallDriver`, console device, RAM filesystem, `null.sys` |
+| `kernel/src/ldr/` | `MiLoadSystemImage`/`Iop*` | PE/COFF loader, kernel export table, user-mode loader, ntdll/MUI |
+| `kernel/src/hal/` | HAL | 16550 serial, 8259 PIC masking, local APIC + clock |
 | `kernel/src/init.rs` | `KiSystemStartup` | Phase 0/1 init + boot self tests |
-| `ntabi/` | ntdef/wdm headers | Shared `#[repr(C)]` kernel⇄driver ABI (types + win64 signatures) |
+| `ntabi/` | ntdef/wdm headers | Shared `#[repr(C)]` kernel⇄driver ABI |
 | `driver/` | a WDK driver | Real PE test driver, built for `x86_64-pc-windows-msvc` |
+| `kernel32/`, `msvcrt/` | Win32 / CRT | DLL shims that forward to the `Nt*` syscalls |
+| `userapp/`, `userapp2/` | console apps | Bundled ring-3 PE programs |
 | `boot/` | bootmgr/winload | Disk-image builder + QEMU runner (`bootloader` crate) |
+| `emu/` | (none) | **nanox**, the browser x86-64 emulator |
+| `web/nanox/` | (none) | the browser demo (GitHub Pages root) |
 
-## Building & running
+## Real binaries, real drivers, real ring 3
 
-Prereqs: Rust via rustup (`rust-toolchain.toml` pins stable + the
-`x86_64-unknown-none` target for the kernel; the *boot-image builder* needs
-a nightly with `rust-src`/`llvm-tools` because the upstream `bootloader`
-crate compiles its real-mode stages with `-Zbuild-std`) and
-`qemu-system-x86_64`:
+The user/kernel boundary is the genuine x64 Windows mechanism: `syscall`/`sysret`
+with `STAR`/`LSTAR`/`FMASK` against the NT selector layout, `swapgs`, an SSDT
+dispatch, and `iretq` to ring 3. On top of it:
 
-```sh
-rustup toolchain install nightly --profile minimal -c rust-src -c llvm-tools
-```
+- **Unmodified Microsoft binaries.** An off-the-shelf `cmd.exe` loads via the
+  user-mode PE loader, binds its `KERNEL32`/`msvcrt`/`ntdll` imports to in-tree
+  shim DLLs (real cross-module dynamic linking against parsed PE export tables),
+  runs the real MSVC CRT startup with a per-thread TEB reached via `gs:`, and
+  reaches an interactive `C:\>` prompt. From it: `echo`, `dir`, `where`, `sort`,
+  `choice`, `whoami` (`nanokrnl\user`), `more <file>`, `exit`.
+- **Genuine PE/COFF drivers.** The loader maps a real `.sys` image built by the
+  Windows toolchain, applies base relocations, binds its imports against the
+  kernel's `ntoskrnl.exe` export table, and runs `DriverEntry` — `null.sys`
+  services IRPs end to end.
+- **Supporting subsystems.** A RAM filesystem reached through the normal
+  `NtCreateFile`/`NtReadFile` path, MUI string resolution (`<exe>.mui`
+  side-by-side resources), per-process command lines, per-process address spaces
+  with CR3 switching, SMEP + SMAP, and `ProbeForRead`/`ProbeForWrite` on every
+  user buffer.
 
-```sh
-# Host unit tests (rtl, IRQL rules, spinlocks — the arch-independent core)
-cargo test -p kernel
+Every boot runs a self-test suite end to end (67 checks → `ALL SELF TESTS
+PASSED`), exercising pool, the dispatcher, IRPs, the loaded driver, and ring-3
+processes.
 
-# Build the kernel ELF (stable Rust)
-cargo build -p kernel --target x86_64-unknown-none
+## Build & run
 
-# Wrap it in a bootable image and run under QEMU (serial -> stdio)
-cargo +nightly run -p boot -- target/x86_64-unknown-none/debug/kernel --run
-```
+Prereqs: Rust via rustup (`rust-toolchain.toml` pins the toolchain and the
+`x86_64-unknown-none` target; the boot-image builder needs a nightly with
+`rust-src`/`llvm-tools`) and `qemu-system-x86_64`.
 
-`--run` exits with QEMU's status: **33** means every boot self test passed
-(the kernel reports through the `isa-debug-exit` device), **3** means a test
-failed or the kernel bugchecked. `./scripts/qemu-test.sh` wraps this into a
-single pass/fail command.
-
-## Driver loading
-
-ntoskrnl-rs loads genuine **PE/COFF kernel drivers** — `.sys` images built by
-a different toolchain for the real Windows kernel target — resolves their
-imports against the kernel's export table, and runs their `DriverEntry`.
-
-The pieces:
-
-- **`ntabi/`** — a tiny shared crate holding the `#[repr(C)]` boundary types
-  (`DRIVER_OBJECT`, `DEVICE_OBJECT`, `IRP`, `UNICODE_STRING`, `NTSTATUS`) and
-  the `extern "win64"` callback signatures. Both the kernel and the driver
-  depend on it, so layouts and calling convention agree by construction.
-- **`kernel/src/ldr/exports.rs`** — the kernel's export table, the
-  `ntoskrnl.exe` export directory's stand-in: named, Microsoft-x64 shims
-  (`DbgPrint`, `ExAllocatePoolWithTag`, `IoCreateDevice`, …) over the in-tree
-  Rust APIs.
-- **`kernel/src/ldr/pe.rs`** — the loader: maps sections by RVA, applies
-  `IMAGE_REL_BASED_DIR64` base relocations, binds the import table to the
-  export table, marks the image executable, and returns the `DriverEntry`
-  pointer.
-- **`driver/`** — a real freestanding driver compiled for
-  `x86_64-pc-windows-msvc` with `lld-link` (no CRT, `/subsystem:native`,
-  `/entry:DriverEntry`), linking an `ntoskrnl.lib` import library generated
-  from the kernel's own export names.
-
-### Exported `ntoskrnl.exe` API surface
-
-The loader binds driver imports against the kernel export table
-(`kernel/src/ldr/exports.rs`). Currently exported, by area:
-
-- **Debug**: `DbgPrint`, `KeBugCheckEx`
-- **Pool**: `ExAllocatePoolWithTag`, `ExFreePoolWithTag`, `ExAllocatePool2`,
-  `ExFreePool`
-- **Events/sema/mutex**: `KeInitializeEvent`, `KeSetEvent`, `KeClearEvent`,
-  `KeResetEvent`, `KeInitializeSemaphore`, `KeReleaseSemaphore`,
-  `KeInitializeMutex`, `KeReleaseMutex`
-- **Waits**: `KeWaitForSingleObject` (with timeout), `KeDelayExecutionThread`
-- **Spinlocks/IRQL**: `KeInitializeSpinLock`, `KeAcquireSpinLock`,
-  `KeReleaseSpinLock`, `KeGetCurrentIrql`, `KeRaiseIrql`, `KeLowerIrql`
-- **DPCs/timers**: `KeInitializeDpc`, `KeInsertQueueDpc`, `KeInitializeTimer`,
-  `KeSetTimer`, `KeCancelTimer`
-- **Time**: `KeQueryTickCount`, `KeStallExecutionProcessor`
-- **Strings/memory**: `RtlInitUnicodeString`, `RtlZeroMemory`,
-  `RtlCopyMemory`, `RtlFillMemory`
-- **I/O — devices**: `IoCreateDevice`, `IoDeleteDevice`,
-  `IoCreateSymbolicLink`, `IoDeleteSymbolicLink`, `IoGetDeviceObjectPointer`
-- **I/O — IRPs (stack-location model)**: `IoGetCurrentIrpStackLocation`,
-  `IoGetNextIrpStackLocation`, `IoCallDriver`, `IofCompleteRequest`,
-  `IoSetCompletionRoutine`, `IoSkipCurrentIrpStackLocation`
-- **Mm**: `MmGetPhysicalAddress`, `MmMapIoSpace`, `MmUnmapIoSpace`
-
-Plus `DriverObject->DriverUnload` support in the loader. The bundled
-`testdriver` exercises the lot: a timer→DPC→event handshake in
-`DriverEntry`, a spinlock-guarded request counter surfaced through a custom
-IOCTL, IRP read/write via stack locations, a named device with a
-`\DosDevices` symbolic link, and an unload routine.
-
-Build the driver and run the end-to-end demo (driver build + kernel build +
-boot + assert):
+**Native (QEMU) — the interactive shell on the serial console:**
 
 ```sh
-./scripts/driver-test.sh
+sh scripts/run-interactive.sh
 ```
 
-At boot the loader maps the embedded `.sys`, runs its `DriverEntry` (which
-prints over the debug port via the *imported* `DbgPrint` and creates a
-device), then the self test sends it an IRP and checks the buffer the
-driver's own code filled — end-to-end proof a foreign-compiled PE loaded,
-linked, and executed inside the kernel:
+`scripts/qemu-test.sh` runs the headless boot self-tests instead (exit **33** =
+all passed, **3** = a test failed or the kernel bugchecked).
 
-```text
-LDR: mapped driver image @ 0x... (28672 bytes), entry @ 0x...
-RustDemo: DriverEntry running from loaded PE
-RustDemo: waiting on timer event...
-RustDemo: timer DPC fired, signaling event
-RustDemo: timer event satisfied
-RustDemo: \Device\RustDemo created, dispatch + unload registered
-  [ OK ] Ldr: load PE driver + run DriverEntry (timer/DPC/event)
-  [ OK ] Ldr: loaded driver created its device
-  [ OK ] Ldr: IoGetDeviceObjectPointer resolves name + symlink
-RustDemo: dispatch IRP major=3 (request #1)
-  [ OK ] Ldr: loaded driver services IRP via stack location
-RustDemo: dispatch IRP major=14 (request #2)
-  [ OK ] Ldr: loaded driver handles IOCTL (spinlock-guarded count)
-RustDemo: DriverUnload — cleaning up
-  [ OK ] Ldr: DriverUnload removed the symbolic link
-```
-
-Building the driver needs the Windows target and LLVM's PE tools:
+**Browser (nanox):**
 
 ```sh
-rustup target add x86_64-pc-windows-msvc   # + nightly for build-std
-brew install llvm                          # provides lld-link, llvm-dlltool
+sh emu/build-wasm.sh
+cd web/nanox && python3 -m http.server 8000   # open http://localhost:8000
 ```
 
-## Boot flow
+To work on the emulator itself, see [`emu/README.md`](emu/README.md):
+`cargo test` for the decoder/MMU/devices, `cargo run --release --example
+inspect_kernel` to boot the kernel natively, and the differential-testing
+oracles (`conformance` against iced-x86, `diff_unicorn` against Unicorn).
 
-1. `bootloader` (BIOS or UEFI) loads the kernel ELF, builds initial page
-   tables with **all physical memory mapped at an offset** (NT's equivalent
-   window is what Mm calls the physical map), and calls `kernel_main` with a
-   `BootInfo` — our `LOADER_PARAMETER_BLOCK`.
-2. **Phase 0**: serial up → GDT/TSS + IDT with NT selectors → KPCR via
-   `IA32_GS_BASE` → PFN bitmap carved from the largest free region → PICs
-   masked, APIC enabled, periodic clock on vector 0xD1.
-3. **Phase 1**: the boot context is adopted as the idle thread, the
-   scheduler comes online, interrupts open, and the self-test system thread
-   exercises every subsystem end-to-end.
+## Write-ups & specs
 
-## User mode & console applications
+- **Fable 5 — building a Windows kernel in Rust, Part I**:
+  https://www.msuiche.com/posts/fable-5-windows-kernel/
+- **Part II**:
+  https://www.msuiche.com/posts/fable-5-windows-kernel-part-2/
+- **nanox design & verification**: [`emu/SPEC.md`](emu/SPEC.md) and
+  [`emu/README.md`](emu/README.md)
+- **The browser journey** (v86 → qemu-wasm → nanox, plus the shared-ulib CRT
+  bug): [`WORKLOG.md`](WORKLOG.md)
 
-ntoskrnl-rs runs **ring-3 programs**. The user/kernel boundary is the real
-x64 Windows mechanism:
+## Credits
 
-- **`syscall`/`sysret`** (`kernel/src/ke/syscall.rs`): `STAR`/`LSTAR`/`FMASK`
-  programmed against the NT selector layout, `KiSystemCall64` doing the
-  `swapgs` + stack switch + SSDT dispatch.
-- **Ring-3 entry** (`kernel/src/ke/usermode.rs`): `iretq` to user mode with
-  GS parked in `KERNEL_GS_BASE`.
-- **Handle table** (`kernel/src/ob/handle.rs`) and **`Nt*` services**
-  (`kernel/src/syscalls.rs`): `NtCreateFile` (open a device by name),
-  `NtWriteFile`, `NtClose`, `NtTerminateThread`.
-- **Console device** (`kernel/src/io/console.rs`): `\Device\Console`
-  (`\DosDevices\CON`) routing writes to the serial port.
-- **User-mode PE loader** (`ldr::pe::load_user`): maps a PE into
-  user-accessible pages and runs it in ring 3.
+By Matt Suiche ([@msuiche](https://twitter.com/msuiche)), Fable 5, and Opus 4.8.
 
-The bundled **`userapp/`** is a genuine PE console executable, compiled for
-`x86_64-pc-windows-msvc` with no CRT and no imports — it issues this kernel's
-syscalls directly. At boot the loader maps it and runs it:
-
-```text
-UM: mapped console app @ 0x... (12288 bytes), entry @ 0x...
-APP: hello from a loaded PE console app in ring 3!
-  [ OK ] Um: loaded PE console app ran and wrote via syscalls
-```
-
-The app issues **no inline syscalls** — it imports `Nt*` functions from
-`ntdll.dll` like a normal Windows program. The kernel builds a ring-3
-syscall-stub trampoline (`ldr::ntdll`) and the loader binds the app's imports
-to it, so the app links against an `ntdll` import library and runs unmodified.
-It also reads a line of console input and exercises a heap
-(`NtAllocateVirtualMemory`):
-
-```text
-APP: hello from a loaded PE console app in ring 3!
-APP: you typed: ntoskrnl-rs
-APP: virtual memory alloc/free ok
-```
-
-The app imports the classic Win32 console functions — `GetStdHandle`,
-`WriteFile`, `WriteConsoleA`/`WriteConsoleW`, `ReadFile`, `GetFileType`,
-`MultiByteToWideChar`/`WideCharToMultiByte`, `SetLastError`/`GetLastError`
-(a real per-thread last-error slot), the timing APIs
-`QueryPerformanceCounter`/`QueryPerformanceFrequency`/`GetSystemTimeAsFileTime`,
-`OutputDebugStringA`, the `lstr*` string helpers
-(`lstrlenA`/`lstrcmpA`/`lstrcmpiA`/`lstrcpyA`/`lstrcatA`), `GetCommandLineW`,
-the `Interlocked*` atomics
-(`InterlockedIncrement`/`Decrement`/`Exchange`/`CompareExchange`),
-`GetSystemInfo`, `GetCurrentProcess`/`GetCurrentThread` pseudo-handles,
-`GetVersion`/`GetVersionExA`/`IsDebuggerPresent`, `VirtualAlloc`/`VirtualFree`,
-`GetModuleHandleW`/`GetModuleHandleExA`, `GetConsoleMode`/`SetConsoleMode`,
-`GetCPInfo`, `GlobalMemoryStatusEx`, `FormatMessageA`, `TerminateProcess`,
-`ExitProcess`, plus the runtime-linking trio
-`LoadLibraryA`/`GetModuleHandleA`/`GetProcAddress`/`FreeLibrary` — from
-`kernel32.dll`, exactly as a no-CRT Win32 console program does. The kernel loads a `kernel32` shim DLL
-(`kernel32/`) and resolves the app's imports against its **parsed PE export
-table** — real cross-module dynamic linking. `kernel32` forwards to the
-`Nt*` syscalls.
-
-A second shim, `msvcrt/`, provides the classic C-runtime surface (`atoi`,
-`qsort`, `strchr`, `strcpy_s`, the locale-compare family, `_initterm`,
-`__getmainargs`, the wide string/`_vsnwprintf` set, …) so a real classic-CRT
-console binary can bind its `msvcrt` imports to our implementation rather than
-dragging in the modern API-set/`KERNELBASE`/`ucrtbase` chain.
-
-Two kernel subsystems back the real-binary work:
-
-* **A RAM filesystem** (`kernel/src/io/ramfs.rs`): files held in kernel memory
-  reached through the normal `NtCreateFile`/`NtReadFile` path. A path that
-  isn't a device name resolves to a `FileObject` (a typed object-manager
-  object with a read cursor); `GetFileSize`/`CreateFileA`/`ReadFile` work on
-  it. (A console app reads `C:\hello.txt` end to end in the self tests.)
-* **MUI string resolution** (`kernel/src/ldr/mui.rs`): modern Windows tools
-  keep their UI text in a side-by-side `<exe>.mui` resource file, not the
-  image. A `.mui` is registered against a module's base at load time;
-  `LoadStringW` parses the image's `RT_STRING` first and falls back (via
-  `NtLoadMuiString`) to the kernel's `.mui` resolver. (Verified: `choice.exe`
-  loads its real strings from `choice.exe.mui`.)
-* **Per-process command line** (`KTHREAD` + `NtGetCommandLine`): each process
-  sees its own `argv`/`GetCommandLine`, not a shared static.
-
-### A user-mode debugger
-
-`kernel/src/ke/debug.rs` is a single-step tracer for ring-3 code. It sets the
-x86 **Trap Flag** when entering a traced thread, so the CPU raises `#DB` after
-every user instruction; the handler walks a module map (the program image plus
-the `kernel32`/`msvcrt`/`ntdll` shims) and logs an **API call/return trace** —
-each call into a library (with the Microsoft x64 argument registers) and each
-return (with the result), bounded to the number of calls. Stepping is confined
-to user mode because the syscall flag-mask already clears `TF`. This was built
-to debug `where.exe`: the trace shows its CRT startup, then its descent into
-the shared Microsoft command-line-parser's error path (`LoadStringW(5001)` =
-`"ERROR:"` after a 7-byte `_memicmp`), which is why `where`/`choice` print only
-an `ERROR:` prefix — exactly the kind of third-party-binary troubleshooting the
-debugger is for.
-
-**This works end to end:** an unmodified Microsoft Windows `sort.exe` loads
-via `load_user_process`, binds all its `KERNEL32`/`msvcrt`/`ntdll`/`ADVAPI32`
-imports to our shims, runs the real MSVC CRT startup (with a real per-thread
-TEB reached via `gs:`), reads stdin, sorts, and writes the sorted output to
-the console before exiting — `cherry/banana/apple/date` in, `apple/banana/
-cherry/date` out. Output of our own console app:
-
-```text
-APP: hello from a Win32 console app (kernel32 imports)
-APP: you typed: ntoskrnl-rs
-```
-
-The app is structured like a real Win32 console program: its entry is a CRT
-shim (`mainCRTStartup`) that calls `main()` and passes the result to
-`ExitProcess`, and `main` uses `GetStdHandle`/`WriteFile`/`ReadFile` plus a
-`GetProcessHeap`/`HeapAlloc`/`HeapFree` heap (spinlock-guarded, so threads
-sharing a process heap don't corrupt the free list) — all imported from the
-`kernel32` shim:
-
-```text
-APP: console app with CRT-style entry
-APP: you typed: ntoskrnl-rs
-APP: built this line in a HeapAlloc buffer
-```
-
-Two independent console programs are bundled — `userapp/` (argv + heap) and
-`userapp2/` (a compute program: `sum(1..=100)`, `fib(20)`) — both built by the
-generic `scripts/build-app.sh` and run through the same loader/`kernel32`/CRT
-path, demonstrating that the system runs *arbitrary* console programs, not one
-bespoke app.
-
-Build with `./scripts/build-kernel32.sh && ./scripts/build-userapp.sh &&
-./scripts/build-userapp2.sh` (then rebuild the kernel, which embeds them). The
-user-mode surface now covers syscalls, handles, bidirectional console I/O, a
-pooled heap, DLL export/import resolution, a CRT-style entry, and `argv`.
-Running *off-the-shelf* `cl.exe`/`libcmt` binaries would need the full MSVC CRT
-plus TEB/PEB and many more `kernel32` APIs — out of scope; the model and stack
-are demonstrated end to end.
-
-## Memory layout
-
-The kernel lives in the **high canonical half** (NT-style): the kernel image,
-stack, and boot info map into `0xFFFF_8000_..`, and the all-physical-memory
-window sits at `0xFFFF_FF00_0000_0000`. The entire **low half**
-(`< 0x8000_0000_0000`) is therefore free for per-process user mappings — the
-groundwork for real per-process address spaces (and SMAP). `mm` reads the
-physical-memory offset from `BootInfo` at runtime, so the layout is set purely
-by the bootloader config in `kernel/src/main.rs`.
-
-**Per-process isolation works**: `ldr::pe::load_user_process` loads a console
-app into its *own* address space — a fresh PML4 that clones the kernel high
-half and maps the image + user stack in the low half (`mm_create_address_space`
-/ `mm_map_user_range`). A thread switches CR3 into it before entering ring 3;
-the app reaches the shared high-half `kernel32`/`ntdll` stubs so it runs
-normally, but its image is mapped *only* in its address space (verified
-unmapped in the kernel AS).
-
-**Multiple concurrent processes** run too: each thread carries its address
-space (CR3), and the scheduler switches CR3 on context switch. Two worker
-processes in two distinct address spaces interleave and both make progress —
-real multiprocessing with per-process isolation. Wrapping this in
-`NtCreateProcess` and a per-process heap are the next steps.
-
-## Honest limitations (current phase)
-
-- **Single processor** (boot CPU only; structures are per-PRCB-shaped for
-  the MP step).
-- **No user mode yet** — the GDT/STAR-compatible selector layout and TSS
-  are in place precisely so syscalls/user mode bolt on next.
-- **No paging-out**: NonPagedPool only; pool frees don't fully coalesce.
-- Terminated thread stacks await a reaper thread (documented leak).
-- APIC timer uses a fixed divider (~1 kHz on QEMU), not PIT-calibrated.
-- **Concurrency**: multiple ring-3 threads run with preemptive multitasking
-  (two worker threads interleave via `Sleep` and both make progress through
-  the syscall path). User RSP is saved per-thread across blocking syscalls.
-- **Protection**: SMEP **and SMAP** are enabled (the kernel can neither
-  execute nor read/write user pages by accident); page-table protection
-  changes split large pages to 4 KiB so they're per-page-precise. The
-  kernel's deliberate user-buffer accesses (console I/O, the `Nt*` string
-  arguments, kernel32 export reads) are bracketed with `stac`/`clac`.
-  Every `Nt*` service that takes a user buffer first runs it through a
-  `ProbeForRead`/`ProbeForWrite` check (`mm::virt::probe_user_buffer`): a
-  page-table walk requiring each spanned page to be present and user-accessible
-  (U/S), so a bogus, unmapped, or kernel pointer returns
-  `STATUS_ACCESS_VIOLATION` instead of faulting the kernel. (The walk inspects
-  the U/S bit rather than NT's fixed `MM_USER_PROBE_ADDRESS` boundary because
-  this kernel still maps some user memory in the high half.)
-- **Driver loading**: the export surface covers synchronization, timers,
-  DPCs, pool, the stack-location IRP path, a device namespace, and basic Mm
-  mapping — a broad, useful subset, but not all of `ntoskrnl.exe` (no
-  registry/`Zw*`, no PnP IRPs, no file systems — these need whole
-  subsystems). Ordinal imports are unsupported (names only). Completion
-  routines are stored but not yet invoked. `MmMapIoSpace` is RAM/window-
-  backed (true device MMIO outside the mapped window is future work).
-  Making an image executable clears NX at large-page granularity (a
-  coarsening — finer per-page protection is future work). Drivers are
-  trusted: the PE loader validates structure but is not hardened against
-  hostile images.
-
-Each limitation is also documented at its definition site.
+A tip of the hat to **[Fabrice Bellard](https://bellard.org/)** — QEMU and
+TinyEMU were the inspiration for `nanox`, and QEMU's CPU core (via
+[Unicorn](https://www.unicorn-engine.org/)) is the differential-testing oracle
+that keeps the emulator honest.

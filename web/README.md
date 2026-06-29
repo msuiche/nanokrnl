@@ -1,51 +1,57 @@
-# ntoskrnl-rs in the browser
+# nanokrnl in the browser
 
-This directory holds the in-browser story for the kernel. We tried three engines
-to run a 64-bit NT-architecture kernel in a web page; only the last is kept.
+This directory holds the project's browser demo. The live site is served from
+the **`nanox/`** subfolder (point GitHub Pages at `web/nanox/`): the unmodified
+**nanokrnl** kernel booting in a web page via **nanox**, our ~60 KB x86-64
+WebAssembly emulator (`../emu`), reaching a `C:\>` prompt and running real
+Microsoft binaries (`cmd.exe`, `more.com`, …) typed at the keyboard.
 
-## The journey
-
-**1. v86** — a complete, open-source x86 PC emulator with an x86→WASM JIT.
-Boots a BIOS disk image straight from the page. But its CPU and JIT are 32-bit
-to the core (registers are `8 × i32`, paging tops out at PAE, no REX), and it
-panics with "Unimplemented #GP" the moment our kernel enters long mode. v86's own
-README says "64-bit kernels are not supported." Dead end for us.
-
-**2. qemu-wasm** — real QEMU (its TCG dynamic translator) compiled to
-WebAssembly. It genuinely boots 64-bit guests and is open source, so it *works*.
-The cost: it emulates an entire generic PC (reset vector → SeaBIOS → bootloader →
-long mode), ships a **~39 MB** `.wasm` plus a multi-MB disk/ROM pack, and requires
-**pthreads + SharedArrayBuffer + COOP/COEP** cross-origin-isolation headers. A lot
-of weight and deployment friction to boot one kernel. (Also of note: Bellard's
-JSLinux has a 64-bit x86 core that runs Windows NT in a browser — but it's closed
-source; only the RISC-V half of TinyEMU is released.)
-
-**3. ntemu** — our own bespoke x86-64 emulator (`../emu`, crate `ntemu`).
-Because we control the bootloader, it skips real mode and BIOS entirely and boots
-**directly in long mode**, emulating only the devices the kernel touches (16550
-UART, Local APIC + timer, PS/2). The result is a **~60 KB** `.wasm` with **no
-threads, no SharedArrayBuffer, no COOP/COEP** — it serves from any static file
-host. It boots the real kernel through both init phases, passes the full self-test
-suite, and runs an interactive **cmd.exe**.
-
-| Engine | 64-bit? | Payload | Threads / COOP-COEP | Status |
-|---|---|---|---|---|
-| v86 | no (32-bit core) | ~MB | no | doesn't boot our kernel |
-| qemu-wasm | yes | ~46 MB | **yes** | works, heavy |
-| **ntemu** | yes | **~60 KB** + kernel | **no** | **works — interactive cmd.exe** |
+Because we control the bootloader, nanox boots **directly in long mode** and
+emulates only the devices the kernel touches (16550 UART, Local APIC + timer,
+PS/2). The result is a single ~60 KB `.wasm` with **no threads, no
+`SharedArrayBuffer`, and no COOP/COEP headers** — it serves from any plain
+static file host. See [`../emu/README.md`](../emu/README.md) and
+[`../emu/SPEC.md`](../emu/SPEC.md) for the emulator design and how it's verified
+(differential testing against iced-x86 and Unicorn).
 
 ## What's here
 
-- **`ntemu/`** — the live demo. `index.html` (terminal UI + Boot/Restart/Shutdown
-  + keyboard → COM1), `ntemu.wasm`, the staged `kernel` ELF, and `background.js`
-  (an animated ASCII-dither backdrop). Build/stage with `sh ../emu/build-wasm.sh`,
-  then serve this directory and open `ntemu/`:
+- **`nanox/`** — the live demo:
+  - `index.html` — terminal UI with Boot / Restart / Shutdown controls and a
+    keyboard bridge (keystrokes → COM1).
+  - `nanox.wasm` — the emulator module.
+  - `kernel` — the staged kernel ELF that nanox boots.
+  - `background.js`, `chiptune/`, `tracks/` — an animated ASCII backdrop and a
+    chiptune soundtrack played through an AudioWorklet.
 
-  ```sh
-  sh ../emu/build-wasm.sh
-  (cd ntemu && python3 -m http.server 8000)   # http://localhost:8000
-  ```
+## Build, stage & serve
 
-The v86 page and the qemu-wasm build have been retired; see `../emu/README.md`
-and `../SPEC.md` for the emulator design and how it's verified (differential
-testing against iced-x86 and Unicorn).
+The build script compiles nanox to WebAssembly and stages the current kernel
+image into `nanox/`:
+
+```sh
+sh ../emu/build-wasm.sh
+(cd nanox && python3 -m http.server 8000)   # http://localhost:8000
+```
+
+Click **Boot**, wait for the banner and self-tests to scroll past, then type at
+the `C:\>` prompt.
+
+**Serve over HTTP, not `file://`.** The AudioWorklet that drives the chiptune
+backdrop only loads from a real origin, so opening the file directly won't play
+audio (and some browsers block the worklet entirely).
+
+## Why `tracks/manifest.json`
+
+GitHub Pages has no directory autoindex, so a page can't discover the contents
+of a folder at runtime. `tracks/manifest.json` is an explicit list of the
+chiptune track filenames in `tracks/` that `index.html` fetches to know what to
+play. Add or remove a track by editing both the directory and that manifest.
+
+## History
+
+This used to host two other attempts that have since been **removed**: a v86
+harness (`index.html`) — v86's CPU is 32-bit only and panics on `#GP` the moment
+the kernel enters long mode — and a `qemu-wasm` experiment (`qemu/`) — real QEMU,
+but a multi-megabyte payload that needs threads + `SharedArrayBuffer` + COOP/COEP.
+Only nanox is kept; the full reasoning is in [`../WORKLOG.md`](../WORKLOG.md).

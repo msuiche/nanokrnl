@@ -1,4 +1,4 @@
-# ntemu — a bespoke x86-64 *full-machine* emulator for booting ntoskrnl-rs in
+# nanox — a bespoke x86-64 *full-machine* emulator for booting ntoskrnl-rs in
 # the browser, as a lighter alternative to qemu-wasm.
 #
 # Seed: the proven usermode x86-64 interpreter (REX/ModRM/SIB, RIP-relative,
@@ -9,7 +9,7 @@
 # Standalone workspace so the decoder unit-tests run on the host (`cargo test`)
 # while the crate stays no_std for the eventual wasm32 build.
 [package]
-name = "ntemu"
+name = "nanox"
 version = "0.1.0"
 edition = "2021"
 
@@ -37,4 +37,8 @@ oracle = ["dep:unicorn-engine"]
 
 [[example]]
 name = "diff_unicorn"
+required-features = ["oracle"]
+
+[[example]]
+name = "diff_trace"
 required-features = ["oracle"]

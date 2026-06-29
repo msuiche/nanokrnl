@@ -1,8 +1,8 @@
-# ntemu — bespoke x86-64 full-machine emulator
+# nanox — bespoke x86-64 full-machine emulator
 
 Goal: boot the unmodified ntoskrnl-rs kernel in the browser as a **lighter
 alternative to qemu-wasm**. qemu-wasm emulates a generic PC (real mode → SeaBIOS
-→ bootloader → long mode) and ships a large wasm with COOP/COEP + threads. ntemu
+→ bootloader → long mode) and ships a large wasm with COOP/COEP + threads. nanox
 emulates **only what our kernel needs**, starting the CPU already in long mode.
 
 ## Why not v86 / TinyEMU
@@ -29,7 +29,7 @@ emulates **only what our kernel needs**, starting the CPU already in long mode.
 
 ## Milestones
 - [x] **M0 — execution-core seed.** Restore the proven usermode interpreter
-  (REX/ModRM/SIB, RIP-relative, ALU/stack/control-flow) as the `ntemu` crate.
+  (REX/ModRM/SIB, RIP-relative, ALU/stack/control-flow) as the `nanox` crate.
   *12 tests green.*
 - [x] **M1 — long-mode MMU.** 4-level PML4 walk over flat physical memory, gated
   by CR0.PG/CR4.PAE/EFER.LMA; 1G/2M large pages; #PF error codes; canonical
@@ -54,7 +54,7 @@ emulates **only what our kernel needs**, starting the CPU already in long mode.
   the x86-64 layout, in `bootinfo.rs`), entered at `_start` with the pointer in
   RDI. **The real kernel boots.**
 - [x] **M6 — wasm32 packaging.** `cdylib` + `no_std` runtime (panic handler +
-  bump allocator) in `wasm.rs`; a pointer-free C ABI; JS shim in `web/ntemu/`
+  bump allocator) in `wasm.rs`; a pointer-free C ABI; JS shim in `web/nanox/`
   that fetches + boots the staged kernel ELF. 51 KB wasm, verified booting the
   real kernel in a WASM runtime.
 - [x] **M7 — opcode tail (boot-complete).** Trace-driven via
@@ -79,7 +79,7 @@ emulates **only what our kernel needs**, starting the CPU already in long mode.
 
 ## Status
 The **real ntoskrnl-rs kernel boots, runs preemptively, and completes its entire
-boot self-test suite** under ntemu — native and in the ~52 KB wasm — printing
+boot self-test suite** under nanox — native and in the ~52 KB wasm — printing
 "ALL SELF TESTS PASSED" (67 checks: Cpu/Mm/Ke/Io/Um/Ob/Cm, real `null.sys`
 driver, ring-3 processes). `cargo test` → **33 passing**; decode + semantics
 verified against iced-x86 and Unicorn.

@@ -1,15 +1,15 @@
 //! Differential **semantics** test: run each of the kernel's real instructions
-//! through both Unicorn (QEMU's CPU core — the oracle) and ntemu from identical
+//! through both Unicorn (QEMU's CPU core — the oracle) and nanox from identical
 //! register/flag/memory state, then diff the resulting GP registers and RFLAGS.
 //! Catches wrong-result bugs (flags, shifts, arithmetic) that the length-only
 //! conformance test can't see.
 //!
 //!   cargo run --release --example diff_unicorn
 //!
-//! AF (auxiliary carry) is excluded — ntemu does not model it.
+//! AF (auxiliary carry) is excluded — nanox does not model it.
 
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction};
-use ntemu::{Cpu, StepResult};
+use nanox::{Cpu, StepResult};
 use unicorn_engine::unicorn_const::{Arch, Mode, Prot};
 use unicorn_engine::{RegisterX86, Unicorn};
 
@@ -61,7 +61,7 @@ fn run_unicorn(code: &[u8], regs: &[u64; 16], rflags: u64) -> Option<([u64; 16],
     Some((out, fl))
 }
 
-fn run_ntemu(code: &[u8], regs: &[u64; 16], rflags: u64) -> Option<([u64; 16], u64)> {
+fn run_nanox(code: &[u8], regs: &[u64; 16], rflags: u64) -> Option<([u64; 16], u64)> {
     let mut mem = vec![0u8; (MAP_SIZE) as usize];
     mem[IP as usize..IP as usize + code.len()].copy_from_slice(code);
     let mut cpu = Cpu::new();
@@ -146,7 +146,7 @@ fn main() {
         let bytes = &code[off..off + instr.len()];
         let mn = format!("{:?}", instr.mnemonic());
         // REP string ops can't be compared 1:1: Unicorn's count=1 runs a single
-        // iteration while ntemu runs the whole rep in one step. Same final state,
+        // iteration while nanox runs the whole rep in one step. Same final state,
         // different per-step — skip to avoid false positives.
         if matches!(mn.as_str(), "Movsb" | "Movsw" | "Movsd" | "Movsq" | "Stosb" | "Stosw"
             | "Stosd" | "Stosq" | "Lodsb" | "Lodsw" | "Lodsd" | "Lodsq"
@@ -157,7 +157,7 @@ fn main() {
             for &fs in &rflag_seeds {
                 let regs = init_regs(s);
                 let (Some((ur, uf)), Some((nr, nf))) =
-                    (run_unicorn(bytes, &regs, fs), run_ntemu(bytes, &regs, fs))
+                    (run_unicorn(bytes, &regs, fs), run_nanox(bytes, &regs, fs))
                 else {
                     continue;
                 };

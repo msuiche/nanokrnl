@@ -1,24 +1,24 @@
 //! Differential decoder conformance: disassemble the real kernel's `.text` with
-//! iced-x86 (an authoritative x86 decoder) and check that ntemu decodes every
+//! iced-x86 (an authoritative x86 decoder) and check that nanox decodes every
 //! instruction to the **same length**. A length mismatch is a decode/operand-size
-//! bug that would desync ntemu mid-stream and corrupt the boot — exactly the
+//! bug that would desync nanox mid-stream and corrupt the boot — exactly the
 //! class of bug we keep hitting. This finds them automatically, with no
 //! single-stepping of the kernel.
 //!
 //!   cargo run --release --example conformance
 //!
-//! Reports: length mismatches (BUGS), and opcodes ntemu doesn't implement yet
+//! Reports: length mismatches (BUGS), and opcodes nanox doesn't implement yet
 //! (GAPS). It only checks instruction *length* here (the desync class); it does
 //! not execute semantics.
 
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction};
-use ntemu::{Cpu, StepResult};
+use nanox::{Cpu, StepResult};
 
-/// Decode-length of the instruction at the start of `bytes` per ntemu, by
+/// Decode-length of the instruction at the start of `bytes` per nanox, by
 /// executing one step over a flat buffer with registers pointing at valid
 /// memory. Returns Ok(len) only for sequential instructions (so rip-delta is
 /// the length); Err for unknown opcodes or non-sequential/﹣faulting steps.
-fn ntemu_len(bytes: &[u8]) -> Result<usize, &'static str> {
+fn nanox_len(bytes: &[u8]) -> Result<usize, &'static str> {
     const BASE: u64 = 0x80_0000; // 8 MiB into a 16 MiB buffer
     let mut mem = vec![0u8; 16 << 20];
     let n = bytes.len().min(15);
@@ -80,7 +80,7 @@ fn main() {
         }
         let off = (ip - text_va) as usize;
         let bytes = &code[off..(off + instr.len()).min(code.len())];
-        match ntemu_len(bytes) {
+        match nanox_len(bytes) {
             Ok(len) => {
                 checked += 1;
                 if len != instr.len() {
@@ -102,7 +102,7 @@ fn main() {
     println!("\n{} instructions, {} length-checked", total, checked);
     println!("LENGTH MISMATCHES (decode bugs): {}", bugs);
     for (ip, want, got, mn, hex) in &bug_samples {
-        println!("  {:#x} {:<10} iced_len={} ntemu_len={}  [{}]", ip, mn, want, got, hex);
+        println!("  {:#x} {:<10} iced_len={} nanox_len={}  [{}]", ip, mn, want, got, hex);
     }
     println!("\nUNIMPLEMENTED (gaps): {} sites across {} mnemonics", gaps, gap_opcodes.len());
     for (mn, count) in gap_opcodes.iter() {

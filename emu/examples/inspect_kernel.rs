@@ -1,4 +1,4 @@
-//! Boot the real ntoskrnl-rs ELF under ntemu via the bootloader_api handoff.
+//! Boot the real ntoskrnl-rs ELF under nanox via the bootloader_api handoff.
 //!
 //!   cargo run --example inspect_kernel -- ../target/x86_64-unknown-none/debug/kernel
 //!
@@ -6,8 +6,8 @@
 //! enters `_start`, and runs — reporting UART output and where it stops (the
 //! next opcode to implement, if any).
 
-use ntemu::elf::Elf;
-use ntemu::machine::{Machine, RunStop};
+use nanox::elf::Elf;
+use nanox::machine::{Machine, RunStop};
 
 fn main() {
     let path = std::env::args()
@@ -38,7 +38,7 @@ fn main() {
     m.boot_kernel(&image).expect("boot_kernel");
     println!(
         "booted: rip={:#x} rsp={:#x} rdi={:#x}",
-        m.cpu.rip, m.cpu.regs[ntemu::RSP], m.cpu.regs[ntemu::RDI]
+        m.cpu.rip, m.cpu.regs[nanox::RSP], m.cpu.regs[nanox::RDI]
     );
 
     m.trace_on = std::env::var("TRACE").is_ok();
@@ -84,7 +84,7 @@ fn main() {
         // kernel, phys-window, and user addresses) and dump the bytes there.
         print!("bytes at faulting rip:");
         for i in 0..12u64 {
-            match ntemu::mmu::translate(&m.ram, &m.cpu.paging, rip + i, ntemu::mmu::Access::Execute, false) {
+            match nanox::mmu::translate(&m.ram, &m.cpu.paging, rip + i, nanox::mmu::Access::Execute, false) {
                 Ok(p) if (p as usize) < m.ram.len() => print!(" {:02x}", m.ram[p as usize]),
                 _ => print!(" ??"),
             }

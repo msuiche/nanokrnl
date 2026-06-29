@@ -1,4 +1,4 @@
-# ntemu
+# nanox
 
 A bespoke x86-64 emulator written in Rust whose one job is to boot the
 unmodified `ntoskrnl-rs` kernel **in a web browser**, as a much lighter
@@ -17,7 +17,7 @@ boot status.
 
 We looked at all of them first. The short version: the ones that are *open and
 hostable* can't run a 64-bit kernel without heavy machinery, and the one that
-*can* run 64-bit guests in a tiny package is closed source. Hence ntemu.
+*can* run 64-bit guests in a tiny package is closed source. Hence nanox.
 
 | Project | What it is | Language / tech | 64-bit guest? | Browser size | Needs threads / COOP-COEP | Source |
 |---|---|---|---|---|---|---|
@@ -25,7 +25,7 @@ hostable* can't run a 64-bit kernel without heavy machinery, and the one that
 | **JSLinux / "asm.js"** | Bellard's browser x86 emulator | Hand-written x86 core, originally **asm.js**, now WASM via emscripten | **Yes** (runs Windows NT) | small | No | **Closed** (only the RISC-V half is released) |
 | **TinyEMU** | Small system emulator (the base JSLinux builds on) | C → WASM (emscripten) | RISC-V only in the open source; **x86 is KVM-based** (no software x86 released) | small | No | Open core is **RISC-V only** |
 | **qemu-wasm** | Full **QEMU** compiled to the browser | C, **TCG→WASM** JIT (emscripten) | **Yes** | **many MB** | **Yes** (pthreads + `SharedArrayBuffer` + COOP/COEP) | Open (GPL) |
-| **ntemu** (this) | Minimal emulator for *our* kernel | **Rust → WASM**, interpreter | **Yes** | **~52 KB** | **No** | This repo |
+| **nanox** (this) | Minimal emulator for *our* kernel | **Rust → WASM**, interpreter | **Yes** | **~52 KB** | **No** | This repo |
 
 ### v86
 An impressive, complete x86 *PC* emulator with an x86→WebAssembly JIT. But its
@@ -58,7 +58,7 @@ SeaBIOS → bootloader → long mode), ships a multi-megabyte WASM, and requires
 pthreads, `SharedArrayBuffer`, and COOP/COEP cross-origin-isolation headers.
 That's a lot of weight and deployment friction to boot one kernel.
 
-## What ntemu does differently
+## What nanox does differently
 
 We don't need to emulate a generic PC — we only need to boot *our* kernel, and
 we control its bootloader. That lets us cut almost everything qemu-wasm carries:
@@ -76,7 +76,7 @@ we control its bootloader. That lets us cut almost everything qemu-wasm carries:
   threads, no cross-origin isolation. The whole thing is a ~52 KB `.wasm` plus a
   ~4 KB HTML page that streams the UART to the screen.
 
-The lineage: ntemu grew from the project's earlier usermode x86-64 interpreter
+The lineage: nanox grew from the project's earlier usermode x86-64 interpreter
 (REX/ModRM/SIB decode, RIP-relative addressing, ALU/stack/control flow), then
 gained a long-mode MMU, the device set, interrupt/syscall handling, an ELF
 loader, and the bootloader handoff. A `machine_mode` flag keeps the original
@@ -93,12 +93,12 @@ cargo run --release --example inspect_kernel
 
 # Build the browser module + stage the kernel, then serve and open it:
 sh build-wasm.sh
-(cd ../web/ntemu && python3 -m http.server 8000)   # http://localhost:8000 → "Boot kernel"
+(cd ../web/nanox && python3 -m http.server 8000)   # http://localhost:8000 → "Boot kernel"
 ```
 
 ## Status (summary)
 
-ntemu boots the real `ntoskrnl-rs` kernel — native and in the browser — through
+nanox boots the real `ntoskrnl-rs` kernel — native and in the browser — through
 both init phases, runs it under a live preemptive scheduler, and **passes the
 kernel's entire boot self-test suite (67 checks → "ALL SELF TESTS PASSED")**,
 including loading and running the real Microsoft `null.sys` driver and ring-3
@@ -106,14 +106,14 @@ user processes (CreateProcess + CRT, scalar floating point). Verified identical
 on native and the wasm/browser build.
 
 ### How we know it's correct
-ntemu is validated by **differential testing against authoritative oracles**, not
+nanox is validated by **differential testing against authoritative oracles**, not
 by hand:
 - `cargo run --release --example conformance` — disassembles the kernel's
-  `.text` with [iced-x86](https://github.com/icedland/iced) and checks ntemu
+  `.text` with [iced-x86](https://github.com/icedland/iced) and checks nanox
   decodes every instruction to the **same length** (catches operand-size /
   decode desync bugs). 0 mismatches across ~53k instructions.
 - `cargo run --release --example diff_unicorn --features oracle` — runs each
-  kernel instruction through both **Unicorn (QEMU's CPU core)** and ntemu from
+  kernel instruction through both **Unicorn (QEMU's CPU core)** and nanox from
   identical state and diffs registers + flags (catches wrong-result / EFLAGS
   bugs). This found the register-width, CF/OF, and shift bugs that were
   corrupting the boot.
@@ -121,6 +121,6 @@ by hand:
 The `--features interactive` build goes further: it loads the **real Microsoft
 cmd.exe**, reaches a `C:\>` prompt, and runs typed commands (`ver`, `echo`,
 `exit`) — verified native and in the browser (keystrokes → COM1). The web page
-(`web/ntemu/index.html`) is a terminal UI with Boot / Restart / Shutdown
+(`web/nanox/index.html`) is a terminal UI with Boot / Restart / Shutdown
 controls; type into the console once the prompt appears. See
 [`SPEC.md`](../SPEC.md) §6–7 and `ROADMAP.md`.

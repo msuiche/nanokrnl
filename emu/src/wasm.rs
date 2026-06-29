@@ -1,7 +1,7 @@
 //! WebAssembly entry points + freestanding runtime for the browser build.
 //!
 //! Compiled with `cargo build --target wasm32-unknown-unknown --release`, this
-//! exposes a tiny C ABI the JS shim (web/ntemu/) drives: create a machine, load
+//! exposes a tiny C ABI the JS shim (web/nanox/) drives: create a machine, load
 //! an image, boot, step, drain the UART, feed keystrokes. A single global
 //! machine instance keeps the ABI pointer-free.
 //!
@@ -64,11 +64,11 @@ static ALLOC: Bump = Bump;
 /// The one global machine the JS shim drives.
 static mut MACHINE: Option<Machine> = None;
 
-/// A scratch buffer the JS side writes an image into before `ntemu_load_elf`.
+/// A scratch buffer the JS side writes an image into before `nanox_load_elf`.
 static mut IMAGE: Option<alloc::vec::Vec<u8>> = None;
 
 #[no_mangle]
-pub extern "C" fn ntemu_new(ram_mb: u32) {
+pub extern "C" fn nanox_new(ram_mb: u32) {
     unsafe {
         MACHINE = Some(Machine::new(ram_mb as usize * 1024 * 1024));
     }
@@ -76,7 +76,7 @@ pub extern "C" fn ntemu_new(ram_mb: u32) {
 
 /// Reserve an image buffer of `len` bytes and return a pointer for JS to fill.
 #[no_mangle]
-pub extern "C" fn ntemu_image_alloc(len: u32) -> *mut u8 {
+pub extern "C" fn nanox_image_alloc(len: u32) -> *mut u8 {
     unsafe {
         let mut v = alloc::vec![0u8; len as usize];
         let p = v.as_mut_ptr();
@@ -88,7 +88,7 @@ pub extern "C" fn ntemu_image_alloc(len: u32) -> *mut u8 {
 /// Parse the staged image as ELF, load it, and boot long mode at its entry with
 /// `rsp` as the stack pointer. Returns the entry, or 0 on failure.
 #[no_mangle]
-pub extern "C" fn ntemu_boot_elf(rsp: u64) -> u64 {
+pub extern "C" fn nanox_boot_elf(rsp: u64) -> u64 {
     unsafe {
         let (Some(m), Some(img)) = (MACHINE.as_mut(), IMAGE.as_ref()) else {
             return 0;
@@ -107,7 +107,7 @@ pub extern "C" fn ntemu_boot_elf(rsp: u64) -> u64 {
 /// high-half, build the page tables + BootInfo handoff, and enter `_start`.
 /// Returns 1 on success, 0 on failure.
 #[no_mangle]
-pub extern "C" fn ntemu_boot_kernel() -> u32 {
+pub extern "C" fn nanox_boot_kernel() -> u32 {
     unsafe {
         let (Some(m), Some(img)) = (MACHINE.as_mut(), IMAGE.as_ref()) else {
             return 0;
@@ -121,7 +121,7 @@ pub extern "C" fn ntemu_boot_kernel() -> u32 {
 
 /// Boot at an explicit entry (for raw, already-staged code).
 #[no_mangle]
-pub extern "C" fn ntemu_boot(entry: u64, rsp: u64) {
+pub extern "C" fn nanox_boot(entry: u64, rsp: u64) {
     unsafe {
         if let Some(m) = MACHINE.as_mut() {
             m.boot_long_mode(entry, rsp);
@@ -132,7 +132,7 @@ pub extern "C" fn ntemu_boot(entry: u64, rsp: u64) {
 /// Run up to `steps` instructions. Returns a status code:
 /// 0 halted, 1 max-steps, 2 unknown opcode, 3 unhandled fault, 4 syscall trap.
 #[no_mangle]
-pub extern "C" fn ntemu_run(steps: u32) -> u32 {
+pub extern "C" fn nanox_run(steps: u32) -> u32 {
     unsafe {
         let Some(m) = MACHINE.as_mut() else { return 0 };
         match m.run(steps as usize) {
@@ -145,25 +145,25 @@ pub extern "C" fn ntemu_run(steps: u32) -> u32 {
     }
 }
 
-/// Details of the last stop (valid after `ntemu_run` returns a non-running
+/// Details of the last stop (valid after `nanox_run` returns a non-running
 /// code): the RIP at the stop, a relevant address (CR2 for a fault), and the
 /// offending opcode byte for an unknown instruction.
 #[no_mangle]
-pub extern "C" fn ntemu_fault_rip() -> u64 {
+pub extern "C" fn nanox_fault_rip() -> u64 {
     unsafe { MACHINE.as_ref().map_or(0, |m| m.last_rip) }
 }
 #[no_mangle]
-pub extern "C" fn ntemu_fault_addr() -> u64 {
+pub extern "C" fn nanox_fault_addr() -> u64 {
     unsafe { MACHINE.as_ref().map_or(0, |m| m.last_addr) }
 }
 #[no_mangle]
-pub extern "C" fn ntemu_fault_byte() -> u32 {
+pub extern "C" fn nanox_fault_byte() -> u32 {
     unsafe { MACHINE.as_ref().map_or(0, |m| m.last_byte as u32) }
 }
 
 /// Pop one byte the guest wrote to the UART, or -1 if none.
 #[no_mangle]
-pub extern "C" fn ntemu_uart_read() -> i32 {
+pub extern "C" fn nanox_uart_read() -> i32 {
     unsafe {
         match MACHINE.as_mut().and_then(|m| m.cpu.dev.uart.tx.pop_front()) {
             Some(b) => b as i32,
@@ -174,7 +174,7 @@ pub extern "C" fn ntemu_uart_read() -> i32 {
 
 /// Feed a byte to the guest's UART receive queue (keyboard → COM1).
 #[no_mangle]
-pub extern "C" fn ntemu_uart_write(byte: u8) {
+pub extern "C" fn nanox_uart_write(byte: u8) {
     unsafe {
         if let Some(m) = MACHINE.as_mut() {
             m.cpu.dev.uart.push_rx(byte);
@@ -184,7 +184,7 @@ pub extern "C" fn ntemu_uart_write(byte: u8) {
 
 /// Install a 64-bit interrupt gate (vector → handler) in the guest IDT.
 #[no_mangle]
-pub extern "C" fn ntemu_set_idt_gate(vector: u8, handler: u64) {
+pub extern "C" fn nanox_set_idt_gate(vector: u8, handler: u64) {
     unsafe {
         if let Some(m) = MACHINE.as_mut() {
             m.set_idt_gate(vector, handler);
@@ -194,7 +194,7 @@ pub extern "C" fn ntemu_set_idt_gate(vector: u8, handler: u64) {
 
 /// Push a PS/2 scancode from the host keyboard.
 #[no_mangle]
-pub extern "C" fn ntemu_key(scancode: u8) {
+pub extern "C" fn nanox_key(scancode: u8) {
     unsafe {
         if let Some(m) = MACHINE.as_mut() {
             m.cpu.dev.ps2.push_scancode(scancode);

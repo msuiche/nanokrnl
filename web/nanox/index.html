@@ -1,0 +1,811 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nanokrnl · nanox</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0a0c12; --panel: #11141d; --panel2: #161a26; --line: #232838;
+    --fg: #c7d0e6; --dim: #6b7493; --accent: #7aa2f7; --green: #76d39a;
+    --red: #f77a8f; --amber: #e0af68;
+  }
+  * { box-sizing: border-box; }
+  html { background: #030712; }   /* base behind the animated ASCII-dither layer */
+  body {
+    margin: 0; min-height: 100vh; background: transparent;
+    color: var(--fg); font: 13px/1.5 Tahoma, "MS Sans Serif", Geneva, Verdana, sans-serif;
+    display: flex; flex-direction: column; align-items: center; padding: 24px 16px 40px;
+  }
+  /* The ASCII-dither animation mounts here as the whole-page background.
+     background.js forces its own inline styles (position:absolute; height:100vh)
+     and aspect-fits + centers the canvas, so we override with !important to pin
+     the layer to the full viewport and stretch its canvas to cover it. */
+  #bg { position: fixed !important; inset: 0 !important;
+        width: 100vw !important; height: 100vh !important;
+        z-index: 0; pointer-events: none; overflow: hidden; }
+  #bg canvas, #bg > div {
+        position: absolute !important; inset: 0 !important;
+        top: 0 !important; left: 0 !important; transform: none !important;
+        width: 100% !important; height: 100% !important;
+        max-width: none !important; max-height: none !important;
+        /* fill the page but keep the source proportions (crop, don't squash) */
+        object-fit: cover !important; }
+  .wrap { width: 100%; max-width: 920px; position: relative; z-index: 1; }
+  /* Shared Windows-95 window frame for the page's text panels, the same chrome as
+     the console / player / monitor windows, with the classic Tahoma UI font.
+     (The console, LCD and inline code keep their monospace face.) */
+  .win95 { color: #161616; background: #c0c0c0; padding: 3px;
+    font-family: Tahoma, "MS Sans Serif", Geneva, Verdana, sans-serif;
+    box-shadow: inset 1px 1px #fff, inset -1px -1px #404040, inset 2px 2px #dfdfdf, inset -2px -2px #808080, 4px 4px 0 rgba(0,0,0,.35); }
+  .win95 > .tb { display: flex; align-items: center; padding: 2px 5px 3px; color: #fff; font-size: 12px; font-weight: 700;
+    background: linear-gradient(90deg, #000082 0%, #1083d2 100%); }
+  .win95 > .wb { margin-top: 3px; padding: 11px 13px; }
+  .win95 code { font-family: ui-monospace, "Consolas", monospace; background: #000; color: #15e637;
+    padding: 0 4px; box-shadow: inset 1px 1px #404040, inset -1px -1px #fff; }
+
+  header.top { margin-bottom: 16px; }
+  header.top h1 { margin: 0 0 2px; font-size: 18px; letter-spacing: .2px; color: #0a0a0a; }
+  header.top h1 b { color: #000082; }
+  header.top .tagline { margin: 2px 0 9px; font-size: 14px; font-style: italic; color: #000082; }
+  header.top .desc { margin: 0; color: #1f1f1f; font-size: 12.5px; line-height: 1.5; }
+  header.top .desc b { color: #00148a; }
+  header.top .credits { margin: 10px 0 0; color: #4a4a4a; font-size: 12px; }
+  header.top .credits a { color: #0000c8; text-decoration: none; }
+  header.top .credits a:hover { text-decoration: underline; }
+
+  /* Closing note below the console. */
+  .reflect { margin-top: 14px; }
+  .reflect p { margin: 0; color: #2a2a2a; font-size: 12.5px; font-style: italic; line-height: 1.6; }
+  .reflect p + p { margin-top: 8px; }
+  .reflect b { color: #000082; font-style: normal; font-weight: 700; }
+
+  /* --- Windows 95 "Command Prompt" window --- */
+  .terminal { background: #c0c0c0; padding: 3px;
+    font-family: Tahoma, "MS Sans Serif", Geneva, Verdana, sans-serif;
+    box-shadow: inset 1px 1px #fff, inset -1px -1px #404040,
+                inset 2px 2px #dfdfdf, inset -2px -2px #808080, 6px 6px 0 rgba(0,0,0,.4); }
+  .titlebar { display: flex; align-items: center; gap: 5px; padding: 2px 2px 3px 3px;
+    background: linear-gradient(90deg, #000082 0%, #1083d2 100%); color: #fff; cursor: move; }
+  /* Once grabbed by the title bar, the window "tears off" into a free-floating
+     fixed panel; left/top/width are set inline from its in-flow rect. */
+  .terminal.floating { position: fixed; z-index: 4; margin: 0; }
+  .terminal.floating .titlebar:active { cursor: grabbing; }
+  .ico { width: 18px; height: 16px; flex: none; display: grid; place-items: center;
+    background: #000; color: #c0c0c0; font: 700 8px ui-monospace, monospace; border: 1px solid #dfdfdf; }
+  .title { font-weight: 700; font-size: 12px; }
+  .winbtns { margin-left: auto; display: flex; gap: 2px; }
+  .winbtns button { position: relative; width: 16px; height: 14px; padding: 0; font-size: 0;
+    background: #c0c0c0; color: #000;
+    box-shadow: inset 1px 1px #fff, inset -1px -1px #404040, inset 2px 2px #dfdfdf, inset -2px -2px #808080; }
+  .winbtns button:hover { background: #cacaca; }
+  .winbtns button:active { box-shadow: inset 1px 1px #404040, inset -1px -1px #fff, inset 2px 2px #808080, inset -2px -2px #dfdfdf; }
+  #winclose:hover { background: #d65a43; }
+  /* crisp drawn glyphs (sharper than the unicode chars) */
+  .b-min::before { content: ""; position: absolute; left: 3px; bottom: 3px; width: 8px; height: 2px; background: #000; }
+  .b-max::before { content: ""; position: absolute; left: 3px; top: 3px; width: 9px; height: 7px;
+    border: 1px solid #000; border-top-width: 2px; box-sizing: border-box; }
+  .b-close::before, .b-close::after { content: ""; position: absolute; left: 7px; top: 2px;
+    width: 2px; height: 9px; background: #000; }
+  .b-close::before { transform: rotate(45deg); }
+  .b-close::after { transform: rotate(-45deg); }
+  #winclose:hover.b-close::before, #winclose:hover.b-close::after { background: #fff; }
+
+  #screen { margin: 3px 0 0; padding: 8px 10px; height: 62vh; min-height: 340px; overflow-y: auto;
+    white-space: pre-wrap; word-break: break-word; outline: none;
+    background: #000; color: #c4c4c4; font-family: ui-monospace, "Consolas", "Courier New", monospace;
+    font-size: 12px; line-height: 1.4;
+    box-shadow: inset 1px 1px #808080, inset -1px -1px #fff, inset 2px 2px #404040; }
+  #screen:focus { color: #dcdcdc; }
+  #screen .cursor { display: inline-block; width: 8px; height: 13px; background: #c4c4c4;
+    vertical-align: text-bottom; animation: blink 1.05s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  .toolbar { display: flex; gap: 6px; align-items: center; padding: 5px 2px 3px; flex-wrap: wrap; }
+  button { font-family: Tahoma, "MS Sans Serif", sans-serif; font-size: 12px; color: #000;
+    background: #c0c0c0; border: none; padding: 4px 12px; cursor: pointer;
+    box-shadow: inset 1px 1px #fff, inset -1px -1px #404040, inset 2px 2px #dfdfdf, inset -2px -2px #808080; }
+  button:active:not(:disabled) { box-shadow: inset 1px 1px #404040, inset -1px -1px #fff, inset 2px 2px #808080, inset -2px -2px #dfdfdf; }
+  button:focus-visible { outline: 1px dotted #000; outline-offset: -4px; }
+  button:disabled { color: #808080; text-shadow: 1px 1px #fff; cursor: default; }
+  button.primary { font-weight: 700; }
+  .toolbar .spacer { flex: 1; }
+  .toolbar label { color: #000; font-size: 12px; cursor: pointer; }
+
+  .statusbar { display: flex; gap: 3px; padding: 2px 2px 3px; }
+  .status.meter { flex: 0 0 auto; font: 11px/1 ui-monospace, "Consolas", monospace; color: #1c1c1c;
+    font-variant-numeric: tabular-nums; }
+  .status { flex: 1; display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: #000;
+    padding: 2px 8px; box-shadow: inset 1px 1px #808080, inset -1px -1px #fff; }
+  .status .led { width: 8px; height: 8px; flex: none; background: #808080; box-shadow: inset 1px 1px rgba(0,0,0,.45); }
+  .status.run .led { background: #08a808; }
+  .status.boot .led { background: #d8b000; animation: pulse 1s infinite; }
+  .status.stop .led { background: #c00000; }
+  @keyframes pulse { 50% { opacity: .35; } }
+  /* readme.txt usage dialog, floating top-right */
+  #readme { position: fixed; top: 18px; right: 18px; width: 234px; z-index: 5; }
+  #readme > .tb { cursor: move; }
+  #readme > .tb .x { margin-left: auto; width: 16px; height: 14px; line-height: 11px; text-align: center; font-size: 11px;
+    color: #000; background: #c0c0c0; cursor: pointer;
+    box-shadow: inset 1px 1px #fff, inset -1px -1px #404040, inset 2px 2px #dfdfdf, inset -2px -2px #808080; }
+  #readme > .tb .x:hover { background: #d65a43; color: #fff; }
+  #readme .wb { color: #1f1f1f; font-size: 12px; line-height: 1.5; }
+  #readme b { color: #00148a; font-weight: 600; }
+  #readme.hidden { display: none; }
+  /* keycap, on the gray panel */
+  kbd { background: #e7e7e7; border: 1px solid #888; border-bottom-width: 2px; border-right-width: 2px;
+    border-radius: 3px; padding: 0 5px; font-size: 11px; color: #1a1a1a;
+    font-family: Tahoma, "MS Sans Serif", sans-serif; }
+
+
+  /* --- Winamp 2.x classic skin (flat, hard-beveled, no rounding) --- */
+  #winamp { position: fixed; right: 18px; top: calc(50% - 125px); width: 275px; z-index: 5;
+    color: #b9bfae; user-select: none; padding: 2px;
+    font: 11px Tahoma, "MS Sans Serif", sans-serif; background: #2f3842;
+    box-shadow: inset 1px 1px 0 #525e69, inset -1px -1px 0 #11151a, 0 9px 26px rgba(0,0,0,.6); }
+  /* embossed titlebar with "WINAMP" centered over a line texture */
+  #winamp .wa-title { position: relative; display: flex; align-items: center; justify-content: center;
+    height: 14px; cursor: move; background: #18212b;
+    background-image: repeating-linear-gradient(90deg, #283540 0 1px, #18212b 1px 3px);
+    box-shadow: inset 1px 1px 0 #3a4651, inset -1px -1px 0 #0b0e12; }
+  #winamp .wa-title .wa-name { background: #18212b; padding: 0 10px; color: #8ea0aa;
+    font-size: 9px; font-weight: 700; letter-spacing: 3px; text-shadow: 0 1px 0 #000; }
+  #winamp .wa-title .x { position: absolute; right: 3px; top: 2px; width: 10px; height: 9px;
+    line-height: 8px; text-align: center; font-size: 9px; color: #1c2228; cursor: pointer;
+    background: #aeb3a0; box-shadow: inset 1px 1px 0 #d6dac9, inset -1px -1px 0 #6d7264; }
+  #winamp .wa-title .x:hover { background: #c85a43; color: #fff; }
+  /* display: visualizer + green LCD */
+  #winamp .wa-display { display: flex; gap: 5px; padding: 5px 5px 3px; }
+  #winamp #wa-viz { width: 74px; height: 42px; flex: none; background: #000;
+    box-shadow: 0 0 0 1px #6b6e45, inset 1px 1px 2px #000; }
+  /* wide visualization strip (spectrum + oscilloscope, fed by the analyser) */
+  #winamp .wa-visbar { padding: 0 5px 4px; }
+  #winamp #wa-vis { display: block; width: 100%; height: 54px; background: #000814;
+    box-shadow: inset 1px 1px 2px #000, 0 0 0 1px #4b5a4f; }
+  #winamp .wa-info { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  #winamp .wa-lcd-line { display: flex; align-items: baseline; gap: 7px; background: #000; padding: 3px 6px 2px;
+    box-shadow: inset 1px 1px 2px #000, 0 0 0 1px #4b5a4f; min-width: 0; }
+  #winamp .wa-time { flex: none; font: 700 15px/1 ui-monospace, "Consolas", monospace; letter-spacing: 1px;
+    color: #18e632; text-shadow: 0 0 4px rgba(24,230,50,.5); }
+  #winamp .wa-track { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap;
+    color: #18e632; font: 11px/1 ui-monospace, monospace; text-shadow: 0 0 4px rgba(24,230,50,.45); }
+  #winamp .wa-track span { display: inline-block; padding-left: 100%; animation: marquee 13s linear infinite; }
+  @keyframes marquee { to { transform: translateX(-100%); } }
+  /* kbps / kHz / mono / stereo indicator strip */
+  #winamp .wa-tags { display: flex; align-items: center; gap: 6px; margin-top: 4px; padding: 0 1px;
+    font-size: 9px; letter-spacing: .5px; color: #6f7a6a; }
+  #winamp .wa-tags .box { display: inline-flex; align-items: center; gap: 4px; }
+  #winamp .wa-tags .box i { width: 20px; height: 10px; background: #000; font-style: normal;
+    box-shadow: inset 1px 1px 1px #000, 0 0 0 1px #46523f; }
+  #winamp .wa-tags .lamp { color: #4a5346; }
+  #winamp .wa-tags .lamp.on { color: #18e632; text-shadow: 0 0 5px rgba(24,230,50,.7); }
+  #winamp .wa-tags .eqpl { margin-left: auto; display: flex; gap: 3px; }
+  #winamp .wa-tags .eqpl b { font-size: 8px; font-weight: 700; padding: 1px 3px; color: #2a8f3a;
+    background: #1b2530; box-shadow: inset 1px 1px 0 #3a4651, inset -1px -1px 0 #0b0e12; }
+  /* sliders: seek + volume on one band */
+  #winamp .wa-sliders { display: flex; align-items: center; gap: 6px; padding: 5px 6px 4px; }
+  #winamp input[type=range] { -webkit-appearance: none; appearance: none; height: 8px; background: #11161b;
+    box-shadow: inset 1px 1px 1px #000, inset -1px -1px 0 #3a4651; cursor: pointer; }
+  #winamp input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 11px; height: 12px;
+    background: #b6bba8; box-shadow: inset 1px 1px 0 #e2e6d8, inset -1px -1px 0 #6d7264; }
+  #winamp input[type=range]::-moz-range-thumb { width: 11px; height: 12px; border: 0;
+    background: #b6bba8; box-shadow: inset 1px 1px 0 #e2e6d8, inset -1px -1px 0 #6d7264; }
+  #winamp .wa-seek { flex: 1; }
+  #winamp .wa-vol { width: 64px; flex: none; }
+  /* transport */
+  #winamp .wa-transport { display: flex; align-items: center; gap: 2px; padding: 0 5px 5px; }
+  #winamp .wa-transport button { height: 19px; min-width: 23px; padding: 0 2px; font-size: 9px;
+    color: #1a1f24; background: #c2c6bc; border: 0;
+    box-shadow: inset 1px 1px 0 #eef1e9, inset -1px -1px 0 #707a6c; cursor: pointer; }
+  #winamp .wa-transport button:active { box-shadow: inset 1px 1px 0 #707a6c, inset -1px -1px 0 #eef1e9; }
+  #winamp .wa-transport .tog { margin-left: auto; display: flex; gap: 2px; }
+  #winamp .wa-transport .tog button { font-weight: 700; letter-spacing: .5px; }
+  #winamp .wa-transport .tog button.on { color: #0a5e1d; background: #9ad6a4;
+    box-shadow: inset 1px 1px 0 #c6f0cd, inset -1px -1px 0 #4f8a5a; }
+  /* playlist */
+  #winamp .wa-pl-title { display: flex; align-items: center; justify-content: center; height: 13px;
+    background: #18212b; background-image: repeating-linear-gradient(90deg, #283540 0 1px, #18212b 1px 3px);
+    box-shadow: inset 1px 1px 0 #3a4651, inset -1px -1px 0 #0b0e12; }
+  #winamp .wa-pl-title span { background: #18212b; padding: 0 10px; color: #8ea0aa;
+    font-size: 8px; font-weight: 700; letter-spacing: 2px; text-shadow: 0 1px 0 #000; }
+  #winamp .wa-pl { margin: 2px; height: 96px; overflow-y: auto; background: #000; color: #2bd64f;
+    font: 11px/1.5 ui-monospace, monospace; box-shadow: inset 1px 1px 2px #000, 0 0 0 1px #46523f; }
+  #winamp .wa-pl div { padding: 0 7px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #winamp .wa-pl div:hover { background: #0c2616; }
+  #winamp .wa-pl div.cur { background: #0a2f6e; color: #fff; }   /* classic: current = white on blue */
+  #winamp .wa-pl div.bad { color: #5c6470; }
+  #winamp .wa-pl::-webkit-scrollbar { width: 8px; }
+  #winamp .wa-pl::-webkit-scrollbar-track { background: #1b2530; }
+  #winamp .wa-pl::-webkit-scrollbar-thumb { background: #c2c6bc; box-shadow: inset 1px 1px 0 #eef1e9, inset -1px -1px 0 #707a6c; }
+  #winamp.hidden { display: none; }
+
+  /* --- Resource Monitor (Win95 mini Task Manager, left side) --- */
+  #resmon { position: fixed; left: 18px; top: calc(50% - 96px); width: 190px; z-index: 5;
+    background: #c0c0c0; padding: 3px; font: 11px Tahoma, "MS Sans Serif", sans-serif;
+    box-shadow: inset 1px 1px #fff, inset -1px -1px #404040, inset 2px 2px #dfdfdf, inset -2px -2px #808080, 5px 5px 0 rgba(0,0,0,.4); }
+  #resmon .rm-title { display: flex; align-items: center; padding: 2px 3px 3px 5px; cursor: move;
+    background: linear-gradient(90deg, #000082 0%, #1083d2 100%); color: #fff; font-size: 12px; font-weight: 700; }
+  #resmon .rm-title .x { margin-left: auto; width: 16px; height: 14px; line-height: 11px; text-align: center;
+    font-size: 11px; color: #000; background: #c0c0c0; cursor: pointer;
+    box-shadow: inset 1px 1px #fff, inset -1px -1px #404040, inset 2px 2px #dfdfdf, inset -2px -2px #808080; }
+  #resmon .rm-title .x:hover { background: #d65a43; color: #fff; }
+  #resmon .rm-body { margin-top: 3px; padding: 6px 7px 4px; box-shadow: inset 1px 1px #808080, inset -1px -1px #fff; }
+  #resmon .rm-sec { font-size: 10px; font-weight: 700; color: #000; margin: 2px 0 3px; }
+  #resmon canvas { display: block; width: 100%; height: 40px; background: #000814;
+    box-shadow: inset 1px 1px #404040, inset -1px -1px #fff; }
+  #resmon .rm-row { display: flex; justify-content: space-between; align-items: baseline; margin: 3px 0 5px;
+    font: 11px ui-monospace, "Consolas", monospace; color: #1c1c1c; }
+  #resmon .rm-row b { color: #0a3d14; font-variant-numeric: tabular-nums; }
+  #resmon.hidden { display: none; }
+
+  /* --- Resources / links (Win95 mini window, top-left) --- */
+  #links { position: fixed; left: 18px; top: 18px; width: 184px; z-index: 5; background: #c0c0c0; padding: 3px;
+    font: 11px Tahoma, "MS Sans Serif", sans-serif;
+    box-shadow: inset 1px 1px #fff, inset -1px -1px #404040, inset 2px 2px #dfdfdf, inset -2px -2px #808080, 5px 5px 0 rgba(0,0,0,.4); }
+  #links .lk-title { display: flex; align-items: center; padding: 2px 3px 3px 5px; cursor: move;
+    background: linear-gradient(90deg, #000082 0%, #1083d2 100%); color: #fff; font-size: 12px; font-weight: 700; }
+  #links .lk-title .x { margin-left: auto; width: 16px; height: 14px; line-height: 11px; text-align: center;
+    font-size: 11px; color: #000; background: #c0c0c0; cursor: pointer;
+    box-shadow: inset 1px 1px #fff, inset -1px -1px #404040, inset 2px 2px #dfdfdf, inset -2px -2px #808080; }
+  #links .lk-title .x:hover { background: #d65a43; color: #fff; }
+  #links .lk-body { margin-top: 3px; padding: 5px; display: flex; flex-direction: column; gap: 3px;
+    box-shadow: inset 1px 1px #808080, inset -1px -1px #fff; }
+  #links .lk-body a { color: #001ca8; font-size: 12px; text-decoration: none; padding: 3px 5px; white-space: nowrap; }
+  #links .lk-body a:hover { background: #000082; color: #fff; }
+  #links.hidden { display: none; }
+  /* credits line inside the closing-note footer */
+</style>
+</head>
+<body>
+<!-- Animated ASCII-dither backdrop (self-mounting; renders behind the UI). -->
+<div id="bg" data-ascii-dither-bg aria-hidden="true"></div>
+<script src="./background.js"></script>
+<div class="wrap">
+  <header class="top win95">
+    <div class="tb">nanokrnl: a Windows kernel, from scratch, in your browser</div>
+    <div class="wb">
+      <p class="tagline">The end of an era.</p>
+      <p class="desc">An NT-compatible kernel written in Rust, booted by <b>nanox</b> (a ~60 KB x86-64
+         emulator) and running <b>real, unmodified Windows binaries</b> (cmd.exe, more.com, null.sys)
+         on its own syscalls. Hit <b>Boot</b> and wait for the <code>C:\&gt;</code> prompt.</p>
+      <p class="credits">By <a href="https://twitter.com/msuiche" target="_blank" rel="noopener">Matt&nbsp;Suiche&nbsp;(@msuiche)</a>,
+         Fable&nbsp;5, Opus&nbsp;4.8. Shout out to <a href="https://bellard.org/" target="_blank" rel="noopener">Fabrice&nbsp;Bellard</a>.</p>
+    </div>
+  </header>
+
+  <div class="terminal">
+    <div class="titlebar">
+      <span class="ico">C:\</span>
+      <span class="title">Command Prompt (nanokrnl)</span>
+      <span class="winbtns">
+        <button class="b-min" tabindex="-1" title="Minimize" aria-hidden="true"></button>
+        <button class="b-max" tabindex="-1" title="Maximize" aria-hidden="true"></button>
+        <button id="winclose" class="b-close" tabindex="-1" title="Close (shut down)"></button>
+      </span>
+    </div>
+    <pre id="screen" tabindex="0"></pre>
+    <div class="toolbar">
+      <button class="primary" id="boot">Boot</button>
+      <button id="restart" disabled>Restart</button>
+      <button id="shutdown" disabled>Shut Down</button>
+    </div>
+    <div class="statusbar">
+      <span class="status stop" id="status"><span class="led"></span><span id="statusText">idle</span></span>
+      <span class="status meter" id="stats" title="emulator RAM · emulation speed · JS heap"><span id="statsText">…</span></span>
+    </div>
+  </div>
+
+  <footer class="reflect win95">
+    <div class="tb">epilogue.txt</div>
+    <div class="wb">
+      <p>Both halves were built from scratch for this project: <b>nanokrnl</b>, a Windows-compatible
+         operating-system kernel, and <b>nanox</b>, the emulator that boots it in your browser.</p>
+      <p>Many of us spent the last 20 or 30 years on low-level system programming, emulation, reverse
+         engineering, and disassembly. Watching a Windows kernel, and the emulator that runs it (both
+         written from scratch), boot inside a browser tab feels like full circle: the close of one era
+         as another begins.</p>
+    </div>
+  </footer>
+</div>
+
+<!-- Winamp-style audio player; reads tracks/ -->
+<div id="winamp">
+  <div class="wa-title" id="wa-drag">
+    <span class="wa-name">WINAMP</span>
+    <span class="x" id="wa-close" title="Close">&times;</span>
+  </div>
+  <div class="wa-display">
+    <canvas id="wa-viz" width="74" height="42"></canvas>
+    <div class="wa-info">
+      <div class="wa-lcd-line">
+        <span class="wa-time" id="wa-time">--:--</span>
+        <span class="wa-track"><span id="wa-track">no track loaded</span></span>
+      </div>
+      <div class="wa-tags">
+        <span class="box"><i></i>kbps</span>
+        <span class="box"><i></i>kHz</span>
+        <span class="lamp">mono</span><span class="lamp on">stereo</span>
+        <span class="eqpl"><b>EQ</b><b>PL</b></span>
+      </div>
+    </div>
+  </div>
+  <div class="wa-visbar"><canvas id="wa-vis" width="263" height="54"></canvas></div>
+  <div class="wa-sliders">
+    <input type="range" class="wa-seek" id="wa-seek" min="0" max="1000" value="0" step="1">
+    <input type="range" class="wa-vol" id="wa-vol" min="0" max="100" value="80" title="Volume">
+  </div>
+  <div class="wa-transport">
+    <button id="wa-prev" title="Previous">&#9198;</button>
+    <button id="wa-play" title="Play">&#9654;</button>
+    <button id="wa-pause" title="Pause">&#10074;&#10074;</button>
+    <button id="wa-stop" title="Stop">&#9632;</button>
+    <button id="wa-next" title="Next">&#9197;</button>
+    <span class="tog">
+      <button id="wa-shuffle" title="Shuffle">SHUF</button>
+      <button id="wa-repeat" title="Repeat">&#8635;</button>
+    </span>
+  </div>
+  <div class="wa-pl-title"><span>WINAMP PLAYLIST</span></div>
+  <div class="wa-pl" id="wa-pl"></div>
+</div>
+
+<!-- Mini "Task Manager" resource monitor; samples nanox RAM + emulation speed -->
+<div id="resmon">
+  <div class="rm-title" id="rm-drag">Resource Monitor<span class="x" id="rm-close" title="Close">&times;</span></div>
+  <div class="rm-body">
+    <div class="rm-sec">CPU (emulation throughput)</div>
+    <canvas id="rm-cpu" width="166" height="40"></canvas>
+    <div class="rm-row"><span>speed</span><b id="rm-mips">0 MIPS</b></div>
+    <div class="rm-sec">Memory</div>
+    <canvas id="rm-mem" width="166" height="40"></canvas>
+    <div class="rm-row"><span>nanox RAM</span><b id="rm-ram">0 MB</b></div>
+    <div class="rm-row"><span>JS heap</span><b id="rm-heap">n/a</b></div>
+  </div>
+</div>
+
+<!-- Resources / links, as a small desktop window -->
+<div id="links">
+  <div class="lk-title" id="lk-drag">Resources<span class="x" id="lk-close" title="Close">&times;</span></div>
+  <div class="lk-body">
+    <a href="https://www.msuiche.com/posts/fable-5-windows-kernel/" target="_blank" rel="noopener">📄 Write-up · Part I</a>
+    <a href="https://www.msuiche.com/posts/fable-5-windows-kernel-part-2/" target="_blank" rel="noopener">📄 Write-up · Part II</a>
+    <a href="https://github.com/msuiche/nanokrnl" target="_blank" rel="noopener">📦 GitHub repository</a>
+  </div>
+</div>
+
+<!-- Usage hints, as a small desktop dialog (top-right) -->
+<div id="readme" class="win95">
+  <div class="tb" id="readme-drag">readme.txt<span class="x" id="readme-close" title="Close">&times;</span></div>
+  <div class="wb">Type directly into the console once you see <code>C:\&gt;</code>. Try <b>ver</b>, <b>echo hi</b>, or <b>exit</b>.
+     <kbd>Enter</kbd> sends the line. The kernel runs its self-tests first, so the prompt takes a few seconds.</div>
+</div>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const wa = $("winamp"), lcdTime = $("wa-time"), lcdTrack = $("wa-track");
+  const seek = $("wa-seek"), vol = $("wa-vol"), pl = $("wa-pl");
+  const viz = $("wa-viz"), vctx = viz.getContext("2d");
+  const vis = $("wa-vis"), vsx = vis.getContext("2d");   // wide visualization strip
+  vsx.imageSmoothingEnabled = false;                     // crisp 1px spectrogram scroll
+  const MOD_EXT = /\.(xm|mod|s3m|it|mptm|umx)$/i;
+  const AUDIO_EXT = /\.(mp3|ogg|wav|flac|m4a|aac|opus)$/i;
+
+  const audio = new Audio();
+  audio.crossOrigin = "anonymous";
+  let actx, analyser, freq, tracks = [], cur = -1, seeking = false;
+  let chip = null, modActive = false, modDur = 0;   // chiptune3 (tracker modules)
+
+  function setupAudioGraph() {           // lazily, on first user gesture
+    if (actx) return;
+    actx = new (window.AudioContext || window.webkitAudioContext)();
+    const src = actx.createMediaElementSource(audio);
+    analyser = actx.createAnalyser();
+    analyser.fftSize = 256;
+    freq = new Uint8Array(analyser.frequencyBinCount);   // 128 spectrum bins
+    src.connect(analyser); analyser.connect(actx.destination);
+    drawViz();
+  }
+  // Heat-map colour for the spectrogram: quiet→navy, then green→yellow→white.
+  function waterfall(v) {
+    if (v <= 0.02) return "#01060f";
+    const r = Math.round(255 * Math.max(0, (v - 0.45) / 0.55));
+    const g = Math.round(255 * Math.min(1, v * 1.5));
+    const b = Math.round(255 * Math.max(0, (v - 0.82) / 0.18));
+    return `rgb(${r},${g},${b})`;
+  }
+  function drawViz() {
+    requestAnimationFrame(drawViz);
+    // small classic spectrum bars inside the display
+    vctx.fillStyle = "#000"; vctx.fillRect(0, 0, viz.width, viz.height);
+    const W = vis.width, H = vis.height;
+    if (!analyser) { vsx.fillStyle = "#01060f"; vsx.fillRect(0, 0, W, H); return; }
+    analyser.getByteFrequencyData(freq);
+    const n = 24, bw = viz.width / n;
+    for (let i = 0; i < n; i++) {
+      const h = freq[i * 2] / 255 * viz.height;
+      vctx.fillStyle = "#15e637";
+      vctx.fillRect(i * bw, viz.height - h, bw - 1, h);
+    }
+    // wide strip: a *different* view: scrolling spectrogram (waterfall). The
+    // existing image shifts one pixel left; the newest spectrum is drawn as the
+    // rightmost column (vertical = frequency low→high, colour = magnitude).
+    vsx.drawImage(vis, 1, 0, W - 1, H, 0, 0, W - 1, H);
+    for (let y = 0; y < H; y++) {
+      const bin = Math.floor((1 - y / H) * (freq.length - 1));
+      vsx.fillStyle = waterfall(freq[bin] / 255);
+      vsx.fillRect(W - 1, y, 1, 1);
+    }
+  }
+
+  const fmt = (s) => isFinite(s) ? `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}` : "--:--";
+  function renderList() {
+    pl.innerHTML = "";
+    tracks.forEach((t, i) => {
+      const d = document.createElement("div");
+      d.textContent = `${i + 1}. ${t.replace(MOD_EXT, " [mod]").replace(AUDIO_EXT, "")}`;
+      if (i === cur) d.classList.add("cur");
+      d.onclick = () => play(i);
+      pl.appendChild(d);
+    });
+  }
+  function play(i) {
+    if (i < 0 || i >= tracks.length) return;
+    cur = i; renderList();
+    const name = tracks[i];
+    lcdTrack.textContent = name;
+    setupAudioGraph(); if (actx.state === "suspended") actx.resume();
+    if (MOD_EXT.test(name)) { playModule(name); return; }
+    // Plain audio (HTML5 <audio> → analyser → speakers).
+    modActive = false; if (chip) chip.stop();
+    audio.src = "tracks/" + encodeURIComponent(name);
+    audio.play().catch((e) => { lcdTrack.textContent = "error: " + e.message; });
+  }
+
+  // Tracker modules (.xm/.mod/.s3m/.it/…) play through chiptune3 (libopenmpt in
+  // an AudioWorklet), routed through the analyser so the visualizer reacts too.
+  // Bringing up the decoder (~1.5 MB JS + a wasm compile) is the slow part, so we
+  // (a) cache the init as one shared promise and (b) warm it up at page load,
+  // well before the user interacts, instead of on the first click.
+  let chipReady = null;
+  function initChip() {
+    if (chipReady) return chipReady;
+    setupAudioGraph();
+    chipReady = import("./chiptune/chiptune3.js").then((mod) => new Promise((res) => {
+      chip = new mod.ChiptuneJsPlayer({ context: actx, repeatCount: 0 });
+      chip.onInitialized(() => {
+        chip.gain.connect(analyser);
+        chip.onMetadata((m) => { modDur = (m && m.dur) || 0; });
+        chip.onProgress((p) => {
+          const pos = (p && p.pos) || 0;
+          if (!seeking) seek.value = modDur ? (pos / modDur) * 1000 : 0;
+          lcdTime.textContent = fmt(pos) + (modDur ? " / " + fmt(modDur) : "");
+        });
+        chip.onEnded(() => { if (repeatOn) play(cur); else play(pickNext()); });
+        chip.onError(() => { lcdTrack.textContent = "decode error"; });
+        res(chip);
+      });
+    }));
+    return chipReady;
+  }
+  async function playModule(name) {
+    audio.pause();
+    modActive = true;
+    lcdTime.textContent = chip ? "loading…" : "decoder…";
+    try {
+      // Init the decoder and fetch the module in parallel; by now the decoder is
+      // usually already warm, so this resolves quickly.
+      const [c, buf] = await Promise.all([
+        initChip(),
+        fetch("tracks/" + encodeURIComponent(name)).then((r) => r.arrayBuffer()),
+      ]);
+      c.setVol(vol.value / 100);
+      c.play(buf);
+    } catch (err) {
+      lcdTrack.textContent = "module error: " + err.message;
+    }
+  }
+
+  $("wa-play").onclick = () => {
+    if (cur < 0 && tracks.length) return play(0);
+    setupAudioGraph(); actx.resume();
+    if (modActive && chip) chip.unpause(); else audio.play();
+  };
+  $("wa-pause").onclick = () => { if (modActive && chip) chip.pause(); else audio.pause(); };
+  $("wa-stop").onclick = () => { if (modActive && chip) chip.stop(); else { audio.pause(); audio.currentTime = 0; } };
+  let shuffleOn = false, repeatOn = false;
+  const pickNext = () => {
+    if (!tracks.length) return -1;
+    if (shuffleOn && tracks.length > 1) {
+      let n; do { n = Math.floor(Math.random() * tracks.length); } while (n === cur);
+      return n;
+    }
+    return (cur + 1) % tracks.length;
+  };
+  $("wa-prev").onclick = () => play((cur - 1 + tracks.length) % tracks.length);
+  $("wa-next").onclick = () => play(pickNext());
+  $("wa-shuffle").onclick = (e) => { shuffleOn = !shuffleOn; e.currentTarget.classList.toggle("on", shuffleOn); };
+  $("wa-repeat").onclick = (e) => { repeatOn = !repeatOn; e.currentTarget.classList.toggle("on", repeatOn); };
+  audio.onended = () => { if (repeatOn) play(cur); else play(pickNext()); };
+  audio.ontimeupdate = () => {
+    if (!seeking) seek.value = audio.duration ? (audio.currentTime / audio.duration) * 1000 : 0;
+    lcdTime.textContent = fmt(audio.currentTime) + (audio.duration ? " / " + fmt(audio.duration) : "");
+  };
+  seek.oninput = () => { seeking = true; };
+  seek.onchange = () => {
+    if (modActive && chip) { if (modDur) chip.setPos((seek.value / 1000) * modDur); }
+    else if (audio.duration) audio.currentTime = (seek.value / 1000) * audio.duration;
+    seeking = false;
+  };
+  vol.oninput = () => { const v = vol.value / 100; audio.volume = v; if (chip) chip.setVol(v); };
+  audio.volume = 0.8;
+  $("wa-close").onclick = () => wa.classList.add("hidden");
+
+  // Drag the window by its title bar.
+  const drag = $("wa-drag");
+  drag.onmousedown = (e) => {
+    const r = wa.getBoundingClientRect();
+    const ox = e.clientX - r.left, oy = e.clientY - r.top;
+    wa.style.right = "auto"; wa.style.bottom = "auto";
+    const mv = (ev) => { wa.style.left = (ev.clientX - ox) + "px"; wa.style.top = (ev.clientY - oy) + "px"; };
+    const up = () => { document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up); };
+    document.addEventListener("mousemove", mv); document.addEventListener("mouseup", up);
+  };
+
+  // Make the Command Prompt window draggable. It lives in normal flow until you
+  // grab the title bar, at which point it "tears off" into a fixed, free-floating
+  // window (so the page looks like a little desktop you can rearrange).
+  const term = document.querySelector(".terminal");
+  const tbar = term && term.querySelector(".titlebar");
+  if (tbar) tbar.addEventListener("mousedown", (e) => {
+    if (e.button !== 0 || e.target.closest("button")) return; // window buttons keep their click
+    const r = term.getBoundingClientRect();
+    if (!term.classList.contains("floating")) {
+      term.style.width = r.width + "px";
+      term.classList.add("floating");
+    }
+    term.style.left = r.left + "px"; term.style.top = r.top + "px";
+    const ox = e.clientX - r.left, oy = e.clientY - r.top;
+    const mv = (ev) => {
+      const x = Math.max(0, Math.min(ev.clientX - ox, innerWidth - 40));
+      const y = Math.max(0, Math.min(ev.clientY - oy, innerHeight - 24));
+      term.style.left = x + "px"; term.style.top = y + "px";
+    };
+    const up = () => { document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up); };
+    document.addEventListener("mousemove", mv); document.addEventListener("mouseup", up);
+    e.preventDefault();
+  });
+
+  // Discover tracks: manifest.json first, else parse the server directory index.
+  (async () => {
+    try {
+      const m = await fetch("tracks/manifest.json", { cache: "no-store" }).then((r) => r.json());
+      if (Array.isArray(m) && m.length) tracks = m;
+    } catch {}
+    if (!tracks.length) {
+      try {
+        const html = await fetch("tracks/", { cache: "no-store" }).then((r) => r.text());
+        tracks = [...html.matchAll(/href="([^"?]+)"/gi)]
+          .map((x) => decodeURIComponent(x[1].replace(/^.*\//, "")))
+          .filter((f) => MOD_EXT.test(f) || AUDIO_EXT.test(f));
+      } catch {}
+    }
+    if (tracks.length) {
+      lcdTrack.textContent = tracks.length + " track(s)"; renderList(); autoplay();
+      // Warm the module decoder now (idle time) so it's ready before interaction.
+      if (tracks.some((t) => MOD_EXT.test(t))) initChip();
+    } else lcdTrack.textContent = "no tracks in tracks/";
+  })();
+
+  // Autoplay the first track. Browsers gate audio behind a user gesture, so we
+  // attempt right away and also (re)start/resume on the first interaction with
+  // the page (the Boot click, a keypress, any click), so no need to press Play.
+  function autoplay() { if (tracks.length && cur < 0) play(0); }
+  const resumeAudio = () => { if (actx) actx.resume(); autoplay(); };
+  document.addEventListener("pointerdown", resumeAudio, { once: true });
+  document.addEventListener("keydown", resumeAudio, { once: true });
+})();
+</script>
+
+<script type="module">
+const screen = document.getElementById("screen");
+const statusEl = document.getElementById("status");
+const statusText = document.getElementById("statusText");
+const statsEl = document.getElementById("statsText");
+const btnBoot = document.getElementById("boot");
+const btnRestart = document.getElementById("restart");
+const btnShutdown = document.getElementById("shutdown");
+const dec = new TextDecoder();
+
+// Fetch the wasm + kernel image once; re-instantiate the module on each boot so
+// the (bump-allocated, never-freed) machine starts from clean linear memory.
+// `no-store` defeats the browser cache so a reload always gets fresh artifacts
+// after a rebuild.
+const wasmBytes = await fetch("nanox.wasm", { cache: "no-store" }).then(r => r.arrayBuffer());
+let kernelBytes = null;
+try { kernelBytes = new Uint8Array(await fetch("kernel", { cache: "no-store" }).then(r => r.arrayBuffer())); } catch {}
+
+let e = null, running = false, raf = 0;
+let term = "";          // the console text buffer
+let col = 0;            // cursor column on the current (last) line, for \r overwrite
+// We run the emulator in chunks within a wall-clock budget per animation frame
+// rather than one giant blocking call, so the page stays responsive while
+// booting (the kernel's self-tests are millions of instructions).
+let perFrame = 2_000_000;     // instructions per nanox_run call
+const FRAME_MS = 12;          // stop running once this many ms elapse this frame
+let insAccum = 0, statsT0 = 0; // for the MIPS / memory readout
+const RUNSTOP = { 0: "halted", 1: "running", 2: "unknown opcode", 3: "unhandled fault", 4: "syscall trap" };
+
+function setStatus(cls, text) { statusEl.className = "status " + cls; statusText.textContent = text; }
+
+// --- Resource Monitor (mini Task Manager) -------------------------------
+// A standalone sampler (every 500 ms, always running, even before Boot) feeds
+// both the status-bar meter and the left-hand graphs: emulation speed (MIPS),
+// emulator RAM (wasm linear memory), and the JS heap (Chromium only).
+const rmCpu = document.getElementById("rm-cpu"), rmMem = document.getElementById("rm-mem");
+const rmCtxC = rmCpu.getContext("2d"), rmCtxM = rmMem.getContext("2d");
+const rmMips = document.getElementById("rm-mips"), rmRam = document.getElementById("rm-ram"), rmHeap = document.getElementById("rm-heap");
+const HIST = 64, cpuHist = [], memHist = [];
+let mipsScale = 100;
+function rmGraph(ctx, cv, hist, max, color) {
+  const w = cv.width, h = cv.height;
+  ctx.fillStyle = "#000814"; ctx.fillRect(0, 0, w, h);
+  ctx.strokeStyle = "rgba(40,120,70,.45)"; ctx.lineWidth = 1;
+  for (let y = h / 4; y < h; y += h / 4) { ctx.beginPath(); ctx.moveTo(0, y + .5); ctx.lineTo(w, y + .5); ctx.stroke(); }
+  if (!hist.length) return;
+  const step = w / (HIST - 1);
+  ctx.beginPath();
+  hist.forEach((v, i) => { const x = i * step, y = h - Math.min(v, max) / max * (h - 1); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+  ctx.lineTo((hist.length - 1) * step, h); ctx.lineTo(0, h); ctx.closePath();
+  ctx.fillStyle = color + "33"; ctx.fill();
+  ctx.beginPath();
+  hist.forEach((v, i) => { const x = i * step, y = h - Math.min(v, max) / max * (h - 1); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+  ctx.strokeStyle = color; ctx.lineWidth = 1; ctx.stroke();
+}
+function sampleStats() {
+  const now = performance.now();
+  const dt = now - statsT0; statsT0 = now;
+  const mips = dt > 0 ? Math.round(insAccum / dt / 1000) : 0; insAccum = 0;
+  const memMB = e ? Math.round(e.memory.buffer.byteLength / 1048576) : 0;
+  const heapMB = performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1048576) : null;
+  cpuHist.push(mips); if (cpuHist.length > HIST) cpuHist.shift();
+  memHist.push(memMB); if (memHist.length > HIST) memHist.shift();
+  mipsScale = Math.max(100, ...cpuHist);
+  rmGraph(rmCtxC, rmCpu, cpuHist, mipsScale, "#19e63a");
+  rmGraph(rmCtxM, rmMem, memHist, 192, "#48b6ff");
+  rmMips.textContent = mips + " MIPS";
+  rmRam.textContent = memMB + " MB";
+  rmHeap.textContent = heapMB == null ? "n/a" : heapMB + " MB";
+  statsEl.textContent = `${memMB} MB · ${mips} MIPS`;
+}
+statsT0 = performance.now();
+setInterval(sampleStats, 500);
+// Resource Monitor close + drag (same tear-off behaviour as the other windows).
+document.getElementById("rm-close").onclick = () => document.getElementById("resmon").classList.add("hidden");
+(() => {
+  dragWindow(document.getElementById("resmon"), document.getElementById("rm-drag"));
+})();
+// Small reusable "drag a window by its handle" helper (left/top based).
+function dragWindow(win, handle) {
+  handle.onmousedown = (e) => {
+    if (e.target.closest(".x")) return;
+    const r = win.getBoundingClientRect(); win.style.right = "auto";
+    const ox = e.clientX - r.left, oy = e.clientY - r.top;
+    const mv = (ev) => { win.style.left = Math.max(0, ev.clientX - ox) + "px"; win.style.top = Math.max(0, ev.clientY - oy) + "px"; };
+    const up = () => { document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up); };
+    document.addEventListener("mousemove", mv); document.addEventListener("mouseup", up);
+  };
+}
+// Resources / links window
+document.getElementById("lk-close").onclick = () => document.getElementById("links").classList.add("hidden");
+dragWindow(document.getElementById("links"), document.getElementById("lk-drag"));
+// readme.txt usage dialog
+document.getElementById("readme-close").onclick = () => document.getElementById("readme").classList.add("hidden");
+dragWindow(document.getElementById("readme"), document.getElementById("readme-drag"));
+function render() {
+  screen.textContent = term;
+  const c = document.createElement("span"); c.className = "cursor"; screen.appendChild(c);
+  screen.scrollTop = screen.scrollHeight;
+}
+// Minimal terminal: honor CR (\r) as "cursor to column 0" so programs like
+// more.com that clear a line by writing spaces + \r overwrite in place instead
+// of leaving the spaces as stray leading whitespace.
+function putChar(c) {
+  if (c === 0x07) return;                          // bell: ignore
+  if (c === 0x0d) { col = 0; return; }             // CR: move to line start
+  if (c === 0x0a) { term += "\n"; col = 0; return; } // LF: new line
+  if (c === 0x08) {                                // backspace: move left, erase if at end
+    if (col > 0) col--;
+    const ls = term.lastIndexOf("\n") + 1;
+    if (ls + col === term.length - 1) term = term.slice(0, -1);
+    return;
+  }
+  const ls = term.lastIndexOf("\n") + 1;
+  const pos = ls + col;
+  if (pos < term.length) term = term.slice(0, pos) + String.fromCharCode(c) + term.slice(pos + 1);
+  else term += String.fromCharCode(c);
+  col++;
+}
+function drainUart() {
+  let b, changed = false;
+  while ((b = e.nanox_uart_read()) >= 0) { changed = true; putChar(b); }
+  if (changed) {
+    if (term.length > 200000) { term = term.slice(-150000); col = Math.min(col, term.length - term.lastIndexOf("\n") - 1); }
+    render();
+  }
+}
+
+function loop() {
+  if (!running) return;
+  const t0 = performance.now();
+  let code = 1;
+  // Run sub-chunks until the frame's time budget is spent, then yield to the
+  // browser so rendering/input stay smooth instead of freezing on one big call.
+  do {
+    code = e.nanox_run(perFrame);
+    insAccum += perFrame;
+    if (code !== 1) break;
+  } while (performance.now() - t0 < FRAME_MS);
+  drainUart();
+  if (code === 1 || code === 0) {
+    raf = requestAnimationFrame(loop);
+    if (statusEl.classList.contains("boot") && term.includes("C:\\>")) {
+      perFrame = 500_000;     // interactive: small chunks → low input latency
+      setStatus("run", "running · interactive");
+    }
+  } else {
+    running = false; refreshButtons();
+    const hex = (n) => "0x" + n.toString(16);
+    let detail = RUNSTOP[code] || ("stop " + code);
+    if (code === 2) detail += ` ${hex(e.nanox_fault_byte())} @ rip ${hex(e.nanox_fault_rip())}`;
+    else if (code === 3) detail += ` @ rip ${hex(e.nanox_fault_rip())}, addr ${hex(e.nanox_fault_addr())}`;
+    // Always surface the stop in the console + status (not just faults).
+    term += `\n*** nanox stopped: ${detail} ***\n`; render();
+    setStatus("stop", detail);
+  }
+}
+
+async function boot(image) {
+  stop();
+  term = ""; col = 0; screen.textContent = ""; perFrame = 2_000_000;
+  insAccum = 0; statsT0 = performance.now();
+  setStatus("boot", "booting…");
+  const inst = (await WebAssembly.instantiate(wasmBytes, {})).instance;
+  e = inst.exports;
+  e.nanox_new(128);
+  const ptr = e.nanox_image_alloc(image.length);
+  new Uint8Array(e.memory.buffer, ptr, image.length).set(image);
+  if (e.nanox_boot_kernel() !== 1) { setStatus("stop", "failed to load kernel image"); return; }
+  running = true; refreshButtons(); screen.focus();
+  loop();
+}
+function stop() { running = false; if (raf) cancelAnimationFrame(raf); raf = 0; }
+function refreshButtons() {
+  btnBoot.disabled = running;
+  btnRestart.disabled = !e;
+  btnShutdown.disabled = !running;
+}
+
+btnBoot.onclick = () => {
+  if (!kernelBytes) { setStatus("stop", "kernel image not found; run emu/build-wasm.sh"); return; }
+  boot(kernelBytes);
+};
+btnRestart.onclick = () => kernelBytes && boot(kernelBytes);
+btnShutdown.onclick = () => { stop(); setStatus("stop", "halted by user"); refreshButtons(); term += "\n[machine powered off]\n"; render(); };
+document.getElementById("winclose").onclick = () => { if (running) btnShutdown.click(); };
+
+// Keyboard → COM1: the shell reads typed bytes from the UART. Enter → CR,
+// Backspace → DEL (what the cmd line editor expects).
+screen.addEventListener("keydown", (ev) => {
+  if (!running) return;
+  let s = null;
+  if (ev.key === "Enter") s = "\r";
+  else if (ev.key === "Backspace") s = "\x7f";
+  else if (ev.key.length === 1 && !ev.ctrlKey && !ev.metaKey) s = ev.key;
+  if (s !== null) { for (const ch of s) e.nanox_uart_write(ch.charCodeAt(0)); ev.preventDefault(); }
+});
+
+setStatus("stop", kernelBytes ? "ready, click Boot" : "no kernel image staged");
+</script>
+</body>
+</html>

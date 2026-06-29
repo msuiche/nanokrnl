@@ -370,7 +370,7 @@ impl Machine {
     /// enabled (RFLAGS.IF) and its priority class outranks the current IRQL
     /// (`v >> 4 > CR8`) — the x86-64 hardware delivery rule. Returns whether one
     /// was delivered.
-    fn service_pending_irq(&mut self) -> bool {
+    pub fn service_pending_irq(&mut self) -> bool {
         if !self.cpu.flag(IF) {
             return false;
         }
