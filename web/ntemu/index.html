@@ -33,48 +33,59 @@
         /* fill the page but keep the source proportions (crop, don't squash) */
         object-fit: cover !important; }
   .wrap { width: 100%; max-width: 920px; position: relative; z-index: 1; }
-  header.top { margin-bottom: 18px; }
-  header.top h1 { margin: 0; font-size: 20px; letter-spacing: .2px; }
+  /* Readable caption panel over the animated backdrop. */
+  header.top { margin-bottom: 16px; padding: 12px 16px; border-radius: 6px;
+    background: rgba(4, 8, 16, .72); border: 1px solid rgba(255,255,255,.10);
+    backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px); }
+  header.top h1 { margin: 0; font-size: 20px; letter-spacing: .2px; color: #eef2fb; }
   header.top h1 b { color: var(--accent); }
-  header.top p { margin: 4px 0 0; color: var(--dim); font-size: 12.5px; }
+  header.top p { margin: 6px 0 0; color: #b7c1da; font-size: 12.5px; }
 
-  .terminal { border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
-    background: var(--panel); box-shadow: 0 20px 60px rgba(0,0,0,.45); }
-  .titlebar { display: flex; align-items: center; gap: 10px; padding: 10px 14px;
-    background: linear-gradient(var(--panel2), var(--panel)); border-bottom: 1px solid var(--line); }
-  .dots { display: flex; gap: 7px; }
-  .dots i { width: 12px; height: 12px; border-radius: 50%; display: block; }
-  .dots .r { background: #ff5f57; } .dots .y { background: #febc2e; } .dots .g { background: #28c840; }
-  .title { color: var(--dim); font-size: 12.5px; }
-  .status { margin-left: auto; display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--dim); }
-  .status .led { width: 9px; height: 9px; border-radius: 50%; background: var(--dim); transition: background .2s; }
-  .status.run .led { background: var(--green); box-shadow: 0 0 8px var(--green); }
-  .status.boot .led { background: var(--amber); box-shadow: 0 0 8px var(--amber); animation: pulse 1s infinite; }
-  .status.stop .led { background: var(--red); }
-  @keyframes pulse { 50% { opacity: .35; } }
+  /* --- Windows 95 "Command Prompt" window --- */
+  .terminal { background: #c0c0c0; padding: 3px;
+    font-family: Tahoma, "MS Sans Serif", Geneva, Verdana, sans-serif;
+    box-shadow: inset 1px 1px #fff, inset -1px -1px #404040,
+                inset 2px 2px #dfdfdf, inset -2px -2px #808080, 6px 6px 0 rgba(0,0,0,.4); }
+  .titlebar { display: flex; align-items: center; gap: 5px; padding: 2px 2px 3px 3px;
+    background: linear-gradient(90deg, #000082 0%, #1083d2 100%); color: #fff; }
+  .ico { width: 18px; height: 16px; flex: none; display: grid; place-items: center;
+    background: #000; color: #c0c0c0; font: 700 8px ui-monospace, monospace; border: 1px solid #dfdfdf; }
+  .title { font-weight: 700; font-size: 12px; }
+  .winbtns { margin-left: auto; display: flex; gap: 2px; }
+  .winbtns button { width: 18px; height: 16px; padding: 0; font-size: 9px; line-height: 1; }
 
-  #screen { margin: 0; padding: 14px 16px; height: 64vh; min-height: 360px; overflow-y: auto;
+  #screen { margin: 3px 0 0; padding: 8px 10px; height: 62vh; min-height: 340px; overflow-y: auto;
     white-space: pre-wrap; word-break: break-word; outline: none;
-    font-size: 11.5px; line-height: 1.45; }
-  #screen:focus { box-shadow: inset 0 0 0 1px rgba(122,162,247,.35); }
-  #screen .cursor { display: inline-block; width: 7px; height: 13px; background: var(--accent);
+    background: #000; color: #c4c4c4; font-family: ui-monospace, "Consolas", "Courier New", monospace;
+    font-size: 12px; line-height: 1.4;
+    box-shadow: inset 1px 1px #808080, inset -1px -1px #fff, inset 2px 2px #404040; }
+  #screen:focus { color: #dcdcdc; }
+  #screen .cursor { display: inline-block; width: 8px; height: 13px; background: #c4c4c4;
     vertical-align: text-bottom; animation: blink 1.05s steps(1) infinite; }
   @keyframes blink { 50% { opacity: 0; } }
 
-  .toolbar { display: flex; gap: 10px; align-items: center; padding: 12px 14px;
-    border-top: 1px solid var(--line); background: var(--panel2); flex-wrap: wrap; }
-  button { font: inherit; font-size: 13px; color: var(--fg); background: #1d2333;
-    border: 1px solid #2b3247; border-radius: 7px; padding: 7px 14px; cursor: pointer;
-    transition: background .15s, border-color .15s, opacity .15s; }
-  button:hover:not(:disabled) { background: #252c40; border-color: var(--accent); }
-  button:disabled { opacity: .4; cursor: not-allowed; }
-  button.primary { background: #24406f; border-color: #2f5390; }
-  button.primary:hover:not(:disabled) { background: #2b4d85; }
-  button.danger:hover:not(:disabled) { border-color: var(--red); color: var(--red); }
+  .toolbar { display: flex; gap: 6px; align-items: center; padding: 5px 2px 3px; flex-wrap: wrap; }
+  button { font-family: Tahoma, "MS Sans Serif", sans-serif; font-size: 12px; color: #000;
+    background: #c0c0c0; border: none; padding: 4px 12px; cursor: pointer;
+    box-shadow: inset 1px 1px #fff, inset -1px -1px #404040, inset 2px 2px #dfdfdf, inset -2px -2px #808080; }
+  button:active:not(:disabled) { box-shadow: inset 1px 1px #404040, inset -1px -1px #fff, inset 2px 2px #808080, inset -2px -2px #dfdfdf; }
+  button:focus-visible { outline: 1px dotted #000; outline-offset: -4px; }
+  button:disabled { color: #808080; text-shadow: 1px 1px #fff; cursor: default; }
+  button.primary { font-weight: 700; }
   .toolbar .spacer { flex: 1; }
-  .toolbar label { color: var(--dim); font-size: 12px; cursor: pointer; }
-  .hint { margin-top: 12px; color: var(--dim); font-size: 12px; }
-  .hint b { color: var(--fg); font-weight: 600; }
+  .toolbar label { color: #000; font-size: 12px; cursor: pointer; }
+
+  .statusbar { display: flex; padding: 2px 2px 3px; }
+  .status { flex: 1; display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: #000;
+    padding: 2px 8px; box-shadow: inset 1px 1px #808080, inset -1px -1px #fff; }
+  .status .led { width: 8px; height: 8px; flex: none; background: #808080; box-shadow: inset 1px 1px rgba(0,0,0,.45); }
+  .status.run .led { background: #08a808; }
+  .status.boot .led { background: #d8b000; animation: pulse 1s infinite; }
+  .status.stop .led { background: #c00000; }
+  @keyframes pulse { 50% { opacity: .35; } }
+  .hint { margin-top: 12px; color: #aeb7d2; font-size: 12px; padding: 8px 12px; border-radius: 5px;
+    background: rgba(4, 8, 16, .66); backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px); }
+  .hint b { color: #e6ebf7; font-weight: 600; }
   kbd { background: #1d2333; border: 1px solid #2b3247; border-bottom-width: 2px;
     border-radius: 4px; padding: 1px 6px; font-size: 11px; color: var(--fg); }
 </style>
@@ -93,17 +104,24 @@
 
   <div class="terminal">
     <div class="titlebar">
-      <span class="dots"><i class="r"></i><i class="y"></i><i class="g"></i></span>
-      <span class="title">COM1 — ntoskrnl-rs console</span>
-      <span class="status stop" id="status"><span class="led"></span><span id="statusText">idle</span></span>
+      <span class="ico">C:\</span>
+      <span class="title">ntoskrnl-rs — Command Prompt</span>
+      <span class="winbtns">
+        <button tabindex="-1" title="Minimize" aria-hidden="true">_</button>
+        <button tabindex="-1" title="Maximize" aria-hidden="true">□</button>
+        <button id="winclose" tabindex="-1" title="Close (shut down)">✕</button>
+      </span>
     </div>
     <pre id="screen" tabindex="0"></pre>
     <div class="toolbar">
-      <button class="primary" id="boot">▶ Boot</button>
-      <button id="restart" disabled>↻ Restart</button>
-      <button class="danger" id="shutdown" disabled>⏻ Shutdown</button>
+      <button class="primary" id="boot">Boot</button>
+      <button id="restart" disabled>Restart</button>
+      <button id="shutdown" disabled>Shut Down</button>
       <span class="spacer"></span>
       <label>Load ELF… <input id="file" type="file" hidden></label>
+    </div>
+    <div class="statusbar">
+      <span class="status stop" id="status"><span class="led"></span><span id="statusText">idle</span></span>
     </div>
   </div>
   <p class="hint">Type directly into the console once you see <b>C:\&gt;</b> — try <b>ver</b>, <b>echo hi</b>, or <b>exit</b>.
@@ -189,6 +207,7 @@ btnBoot.onclick = () => {
 };
 btnRestart.onclick = () => kernelBytes && boot(kernelBytes);
 btnShutdown.onclick = () => { stop(); setStatus("stop", "halted by user"); refreshButtons(); term += "\n[machine powered off]\n"; render(); };
+document.getElementById("winclose").onclick = () => { if (running) btnShutdown.click(); };
 document.getElementById("file").onchange = async (ev) => {
   const f = ev.target.files[0]; if (f) boot(new Uint8Array(await f.arrayBuffer()));
 };

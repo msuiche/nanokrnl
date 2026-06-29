@@ -3,7 +3,7 @@
   "charset": "detailed",
   "customCharset": " .:-=+*#%@",
   "brailleVariant": "standard",
-  "fontSize": 12,
+  "fontSize": 8,
   "hoverStrength": 13,
   "mouseInteractionMode": "push",
   "mouseAreaSize": 129,
