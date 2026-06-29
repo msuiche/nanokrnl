@@ -21,6 +21,8 @@
 // or allocator. The wasm module supplies both.
 #![cfg_attr(target_arch = "wasm32", no_std)]
 
+extern crate alloc;
+
 pub mod bootinfo;
 pub mod devices;
 #[cfg(target_arch = "wasm32")]
@@ -124,6 +126,11 @@ pub struct Cpu {
     pub tr_base: u64,
     /// Retired-instruction counter — drives the APIC timer's countdown.
     pub icount: u64,
+    /// Debug: when set, record (service-number-in-EAX, arg1-in-R10) at each
+    /// `syscall` and (0xFFFF_FFFF, RAX) at each `sysret`, so a host tool can see
+    /// the syscall/return sequence.
+    pub trace_sys: bool,
+    pub sys_log: alloc::vec::Vec<(u32, u64)>,
 }
 
 /// Low-`size`-bytes mask as a u128 (size 8 -> full 64-bit mask).
@@ -202,6 +209,8 @@ impl Default for Cpu {
             tss_rsp0: 0,
             tr_base: 0,
             icount: 0,
+            trace_sys: false,
+            sys_log: alloc::vec::Vec::new(),
         }
     }
 }
@@ -1393,6 +1402,9 @@ impl Cpu {
                         // LSTAR. Otherwise (usermode/seed path) trap to the host.
                         let next = (pc + 2) as u64;
                         if self.machine_mode && self.lstar != 0 {
+                            if self.trace_sys {
+                                self.sys_log.push((self.regs[RAX] as u32, self.regs[10]));
+                            }
                             self.regs[RCX] = next;
                             self.regs[11] = self.rflags;
                             self.rflags &= !self.sfmask;
@@ -1965,6 +1977,9 @@ impl Cpu {
                     }
                     // sysret: return to ring 3 — RIP from RCX, RFLAGS from R11.
                     0x07 => {
+                        if self.trace_sys {
+                            self.sys_log.push((0xFFFF_FFFF, self.regs[RAX]));
+                        }
                         self.rip = self.regs[RCX];
                         self.rflags = self.regs[11];
                         self.cpl = 3;

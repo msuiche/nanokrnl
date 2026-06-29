@@ -39,16 +39,31 @@ fn main() {
     }
     let banner_len = out.len();
 
-    // Type a few commands. cmd reads COM1; feed each line + CR.
-    for cmd in ["more hello.txt", "type readme.txt", "dir", "ver"] {
-        for &byte in cmd.as_bytes() {
-            m.cpu.dev.uart.push_rx(byte);
-        }
-        m.cpu.dev.uart.push_rx(b'\r');
-        pump(&mut m, &mut out, 8);
+    // Trace syscalls while a single `type` runs.
+    m.cpu.trace_sys = true;
+    for &byte in b"type hello.txt\r" {
+        m.cpu.dev.uart.push_rx(byte);
     }
+    pump(&mut m, &mut out, 8);
+    m.cpu.trace_sys = false;
 
-    println!("===== full cmd.exe session =====");
-    println!("{}", out);
-    println!("===== ({} bytes total, {} after banner) =====", out.len(), out.len() - banner_len);
+    println!("===== cmd.exe session =====");
+    println!("{}", &out[banner_len..]);
+    println!("===== syscall trace for `type hello.txt` ({} events) =====", m.cpu.sys_log.len());
+    let name = |s: u32| match s {
+        2 => "NtWriteFile",
+        3 => "NtCreateFile",
+        4 => "NtClose",
+        5 => "NtReadFile",
+        6 => "NtAllocateVirtualMemory",
+        8 => "NtProtectVirtualMemory",
+        _ => "?",
+    };
+    for &(svc, val) in &m.cpu.sys_log {
+        if svc == 0xFFFF_FFFF {
+            println!("    -> ret {:#x}", val);
+        } else {
+            println!("  syscall {:>3} {:<24} arg1={:#x}", svc, name(svc), val);
+        }
+    }
 }
