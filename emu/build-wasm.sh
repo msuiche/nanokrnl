@@ -19,8 +19,8 @@ ls -lh "$OUT/nanox.wasm"
 # Stage the kernel ELF so the page can boot it directly (no BIOS image needed).
 KERNEL=../target/x86_64-unknown-none/debug/kernel
 if [ -f "$KERNEL" ]; then
-  cp "$KERNEL" "$OUT/kernel"
-  ls -lh "$OUT/kernel"
+  cp "$KERNEL" "$OUT/kernel.bin"
+  ls -lh "$OUT/kernel.bin"
 else
   echo "note: kernel ELF not found ($KERNEL); build it to enable in-browser boot"
 fi

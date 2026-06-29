@@ -254,7 +254,16 @@
   #links .lk-body a { color: #001ca8; font-size: 12px; text-decoration: none; padding: 3px 5px; white-space: nowrap; }
   #links .lk-body a:hover { background: #000082; color: #fff; }
   #links.hidden { display: none; }
-  /* credits line inside the closing-note footer */
+
+  /* On small screens the side/corner windows can't float without overlapping, so
+     drop them into the normal column flow (stacked, centered) below the console. */
+  @media (max-width: 900px) {
+    #winamp, #resmon, #links, #readme {
+      position: static; left: auto; right: auto; top: auto; bottom: auto;
+      width: min(100%, 340px); margin: 12px auto 0; z-index: 1;
+    }
+    .terminal.floating { position: static; left: auto; top: auto; width: auto !important; }
+  }
 </style>
 </head>
 <body>
@@ -621,9 +630,16 @@ const dec = new TextDecoder();
 // the (bump-allocated, never-freed) machine starts from clean linear memory.
 // `no-store` defeats the browser cache so a reload always gets fresh artifacts
 // after a rebuild.
-const wasmBytes = await fetch("nanox.wasm", { cache: "no-store" }).then(r => r.arrayBuffer());
-let kernelBytes = null;
-try { kernelBytes = new Uint8Array(await fetch("kernel", { cache: "no-store" }).then(r => r.arrayBuffer())); } catch {}
+// Fetch helper that fails loudly on a 404 instead of handing the host's HTML
+// error page to the wasm/kernel loader (fetch does not reject on HTTP errors).
+async function fetchBytes(url) {
+  const r = await fetch(url, { cache: "no-store" });
+  if (!r.ok) throw new Error(url + " → HTTP " + r.status);
+  return new Uint8Array(await r.arrayBuffer());
+}
+const wasmBytes = await fetchBytes("nanox.wasm");
+let kernelBytes = null, kernelErr = "";
+try { kernelBytes = await fetchBytes("kernel.bin"); } catch (err) { kernelErr = err.message; }
 
 let e = null, running = false, raf = 0;
 let term = "";          // the console text buffer
@@ -787,7 +803,7 @@ function refreshButtons() {
 }
 
 btnBoot.onclick = () => {
-  if (!kernelBytes) { setStatus("stop", "kernel image not found; run emu/build-wasm.sh"); return; }
+  if (!kernelBytes) { setStatus("stop", kernelErr ? ("kernel fetch failed: " + kernelErr) : "kernel image not found; run emu/build-wasm.sh"); return; }
   boot(kernelBytes);
 };
 btnRestart.onclick = () => kernelBytes && boot(kernelBytes);
