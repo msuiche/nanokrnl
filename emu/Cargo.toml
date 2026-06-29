@@ -19,3 +19,22 @@ edition = "2021"
 # (the no_std panic handler + allocator live in src/wasm.rs, gated on wasm32).
 [lib]
 crate-type = ["lib", "cdylib"]
+
+# iced-x86 (pure Rust) powers the decode-length conformance test. Unicorn
+# (QEMU's CPU core) is the semantics oracle for `diff_unicorn`; it builds a C
+# library via cmake, so it's optional and gated behind the `oracle` feature so
+# plain `cargo test` needs neither cmake nor a long build.
+#   cargo run --release --example diff_unicorn --features oracle
+# Unicorn (optional, builds via cmake) is only pulled in with `--features oracle`.
+[dependencies]
+unicorn-engine = { version = "2", optional = true }
+
+[dev-dependencies]
+iced-x86 = "1"
+
+[features]
+oracle = ["dep:unicorn-engine"]
+
+[[example]]
+name = "diff_unicorn"
+required-features = ["oracle"]

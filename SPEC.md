@@ -204,21 +204,35 @@ console via NtWriteFile)**, Ob (handles), and Cm (registry) checks — dozens of
 `[ OK ]` lines, with the scheduler servicing timer IRQs and `hlt` idles
 throughout.
 
-**Remaining gap (not yet at full QEMU parity):** the suite does not yet complete.
-During the **Ps (CreateProcess) / Ldr (PE driver load)** phase the kernel panics
-in its PE loader (`ldr/pe.rs`) on a DLL-import-name string slice — ntemu feeds
-that path bytes/offsets that diverge from the real loader, a data-flow bug in
-the process/PE-mapping path not yet isolated (it is past the single-opcode tier).
-So the full "ALL SELF TESTS PASSED" verdict and the `--features interactive`
-`cmd` shell are **still pending** on that path. Everything up to it is verified
-identical on native and the wasm/browser build.
+The suite **runs to completion: all 67 checks pass and the kernel prints
+"ALL SELF TESTS PASSED — system idle"**, including loading + running the real
+Microsoft `null.sys` driver and ring-3 user processes (CreateProcess + the CRT,
+which exercises scalar floating point). Verified identical on native and wasm.
 
-Opcodes are added **trace-driven** via the `Unknown { rip, byte }` signal; the
-boot above exercises the 8-bit ALU forms, `grp1`-8bit, REP string ops, `cpuid`,
-`imul`, `bsf/bsr`, `bt*`, `cmpxchg`, segment-register/`ltr`/far-return/`iret`,
-x2APIC and xAPIC paths, and the full long-mode system instruction set. Booting a
-guest that does more (a shell, user processes) will surface further opcodes the
-same way.
+The remaining target is the `--features interactive` `cmd` shell.
+
+### How correctness is established (differential testing)
+
+ntemu is validated against authoritative oracles rather than by hand — this is
+how the bugs that were corrupting the boot were found and fixed:
+
+- **Decode/length** (`examples/conformance.rs`): disassembles the kernel `.text`
+  with **iced-x86** and checks ntemu decodes each instruction to the same
+  length. 0 mismatches across ~53k instructions — proves no operand-size /
+  prefix desync.
+- **Semantics** (`examples/diff_unicorn.rs`, `--features oracle`): runs each
+  kernel instruction through both **Unicorn (QEMU's CPU core)** and ntemu from
+  identical register/flag/memory state and diffs the results. This surfaced the
+  real bugs: 8/16-bit register writes clobbering the upper bits, CF/OF computed
+  at 64-bit width regardless of operand size, the shift-count mask, and the
+  count==0 shift-flags rule — each fixed and re-verified.
+
+Opcodes were added **trace-driven** (the `Unknown { rip, byte }` signal): the
+full boot exercises the 8/16/32/64-bit ALU + immediate forms, REP string ops,
+`cpuid`, `imul`, `bsf/bsr`, `bt*`, `cmpxchg`, shifts/rotates incl. `rcl/rcr`,
+segment-register/`ltr`/far-return/`iretq`, x2APIC+xAPIC, and a working subset of
+**SSE/SSE2** (128-bit + scalar moves, `movd/movq`, `pcmpeqb`/`pmovmskb`, and
+scalar FP: `cvtsi2sd`, `add/sub/mul/div sd/ss`, `comisd`, conversions).
 
 ### Cross-architecture note
 The interpreter's program counter and all guest addresses are `u64`, never

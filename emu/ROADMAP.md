@@ -68,19 +68,24 @@ emulates **only what our kernel needs**, starting the CPU already in long mode.
   self-IPI fires once IRQL drops → the scheduler context-switches. The kernel's
   boot self-tests run and pass: Cpu (SMEP/SMAP), Mm (15), Ke (10), Io, Um
   (ring-3 program via NtWriteFile), Ob, Cm (registry).
-- [ ] **M9 — process/driver loading.** The suite panics in `ldr/pe.rs` during
-  the Ps (CreateProcess) / Ldr (PE driver) phase — a data divergence in the
-  PE-mapping path. Gates "ALL SELF TESTS PASSED" and the interactive `cmd` shell.
+- [x] **M9 — process/driver loading + full self-tests.** Ps (CreateProcess),
+  Ldr (real Microsoft `null.sys` DriverEntry/Unload), Ob/Cm, and ring-3 CRT
+  (scalar FP) all run. **All 67 self-tests pass: "ALL SELF TESTS PASSED".**
+- [x] **Differential test harness.** `examples/conformance.rs` (iced-x86 decode
+  lengths) + `examples/diff_unicorn.rs` (Unicorn semantics oracle, `--features
+  oracle`) — how the register/flag/shift bugs were found instead of single-
+  stepping the kernel.
+- [ ] **M10 — interactive shell.** The `--features interactive` `cmd` build.
 
 ## Status
-The **real ntoskrnl-rs kernel boots and runs** under ntemu — native and in the
-~52 KB wasm — through both init phases, then runs its self-test suite under a
-live preemptive scheduler, passing dozens of Cpu/Mm/Ke/Io/Um/Ob/Cm checks
-(including a ring-3 user program). It does **not** yet complete the suite: it
-panics in the PE loader during CreateProcess (M9). `cargo test` → **33 passing**.
+The **real ntoskrnl-rs kernel boots, runs preemptively, and completes its entire
+boot self-test suite** under ntemu — native and in the ~52 KB wasm — printing
+"ALL SELF TESTS PASSED" (67 checks: Cpu/Mm/Ke/Io/Um/Ob/Cm, real `null.sys`
+driver, ring-3 processes). `cargo test` → **33 passing**; decode + semantics
+verified against iced-x86 and Unicorn.
 
-Correctness fixes found by booting/running: RIP-relative immediate length;
-operand-size (0x66) immediates across mov/alu/test (`mov r16,imm16`, `0xC7`,
-`0x81`, acc-imm, `0xA9`, `0xF7`); `pc`/addresses `u64` not `usize` (wasm32);
-APIC self-IPI + CR8/IRQL-gated delivery (preemption); SMEP/SMAP CPUID +
-STAC/CLAC.
+Correctness bugs found by differential testing (Unicorn/iced) and fixed:
+8/16-bit register writes clobbering upper bits; CF/OF computed at 64-bit width
+regardless of operand size; shift count mask (64-bit) + count==0 flag rule;
+operand-size (0x66) immediate widths; `pc`/addresses `u64` not `usize` (wasm32);
+APIC self-IPI + CR8/IRQL-gated delivery (preemption); SMEP/SMAP CPUID + STAC/CLAC.

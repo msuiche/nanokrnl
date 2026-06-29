@@ -232,35 +232,45 @@ impl Cpu {
     /// return `(result, writeback)`. `writeback` is false for `cmp` (sel 7).
     /// sel: 0 add, 1 or, 2 adc, 3 sbb, 4 and, 5 sub, 6 xor, 7 cmp.
     fn apply_alu(&mut self, sel: u8, a: u64, b: u64, size: u8) -> (u64, bool) {
-        let cin = if self.flag(CF) { 1 } else { 0 };
+        // All flag math is done at the operand width, not 64-bit: CF is the
+        // carry/borrow out of bit (bits-1), OF the signed overflow at that bit.
+        let bits = size as u32 * 8;
+        let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+        let msb = 1u64 << (bits - 1);
+        let cin: u64 = if self.flag(CF) { 1 } else { 0 };
+        let (am, bm) = (a & mask, b & mask);
         let (res, writeback) = match sel {
-            0 => (a.wrapping_add(b), true),                 // add
-            1 => (a | b, true),                             // or
-            2 => (a.wrapping_add(b).wrapping_add(cin), true), // adc
-            3 => (a.wrapping_sub(b).wrapping_sub(cin), true), // sbb
-            4 => (a & b, true),                             // and
-            5 => (a.wrapping_sub(b), true),                 // sub
-            6 => (a ^ b, true),                             // xor
-            7 => (a.wrapping_sub(b), false),                // cmp
-            _ => (a, false),
-        };
-        match sel {
             0 | 2 => {
-                self.set_flag(CF, res < a || (sel == 2 && res == a && b != 0));
-                self.set_flag(OF, ((a ^ res) & (b ^ res)) >> 63 & 1 == 1);
+                // add / adc
+                let c = if sel == 2 { cin } else { 0 };
+                let wide = am as u128 + bm as u128 + c as u128;
+                let res = (wide as u64) & mask;
+                self.set_flag(CF, wide > mask as u128);
+                self.set_flag(OF, (!(am ^ bm) & (am ^ res)) & msb != 0);
+                (res, true)
             }
-            5 | 7 | 3 => {
-                self.set_flag(CF, a < b.wrapping_add(if sel == 3 { cin } else { 0 }));
-                self.set_flag(OF, ((a ^ b) & (a ^ res)) >> 63 & 1 == 1);
+            3 | 5 | 7 => {
+                // sbb / sub / cmp
+                let c = if sel == 3 { cin } else { 0 };
+                let res = am.wrapping_sub(bm).wrapping_sub(c) & mask;
+                self.set_flag(CF, (am as u128) < bm as u128 + c as u128);
+                self.set_flag(OF, ((am ^ bm) & (am ^ res)) & msb != 0);
+                (res, sel != 7)
             }
-            _ => {
-                // logical ops clear CF/OF
-                self.set_flag(CF, false);
-                self.set_flag(OF, false);
-            }
-        }
+            1 => (self.logic_flags((a | b) & mask), true), // or
+            4 => (self.logic_flags((a & b) & mask), true), // and
+            6 => (self.logic_flags((a ^ b) & mask), true), // xor
+            _ => (am, false),
+        };
         self.set_zsp(res, size);
         (res, writeback)
+    }
+
+    /// Logical ops clear CF and OF; returns the result unchanged for chaining.
+    fn logic_flags(&mut self, res: u64) -> u64 {
+        self.set_flag(CF, false);
+        self.set_flag(OF, false);
+        res
     }
 
     // --- translated little-endian memory ----------------------------------
@@ -365,7 +375,14 @@ impl Cpu {
     fn write_rm(&mut self, mem: &mut [u8], rm: Rm, val: u64, size: u8) -> bool {
         match rm {
             Rm::Reg(r) => {
-                self.regs[r] = if size == 4 { val & 0xFFFF_FFFF } else { val };
+                // 8/16-bit writes preserve the upper register bits; a 32-bit
+                // write zero-extends to 64; a 64-bit write is full-width.
+                self.regs[r] = match size {
+                    1 => (self.regs[r] & !0xff) | (val & 0xff),
+                    2 => (self.regs[r] & !0xffff) | (val & 0xffff),
+                    4 => val & 0xFFFF_FFFF,
+                    _ => val,
+                };
                 true
             }
             Rm::Mem(a) => self.store(mem, a, val, size),
@@ -944,6 +961,19 @@ impl Cpu {
                 }
                 None => StepResult::Halt,
             },
+            // ret imm16 (0xC2): pop return address, then add imm16 to RSP.
+            0xc2 => {
+                let imm = fetch(pc + 1) as u64 | ((fetch(pc + 2) as u64) << 8);
+                match self.pop64(mem) {
+                    Some(HALT_ADDR) => StepResult::Halt,
+                    Some(target) => {
+                        self.regs[RSP] = self.regs[RSP].wrapping_add(imm);
+                        self.rip = target;
+                        StepResult::Ok
+                    }
+                    None => StepResult::Halt,
+                }
+            }
             // jmp rel32 / rel8
             0xe9 => {
                 let rel = imm32(pc + 1);
@@ -1156,63 +1186,118 @@ impl Cpu {
                 self.rip = pc as u64;
                 StepResult::Ok
             }
-            // shift/rotate group: 0xC1 r/m,imm8 ; 0xD1 r/m,1 ; 0xD3 r/m,CL.
-            // ModRM.reg selects: /0 rol /1 ror /4 shl /5 shr /7 sar.
-            0xc1 | 0xd1 | 0xd3 => {
+            // shift/rotate group. 8-bit: C0 imm8 / D0 by 1 / D2 by CL.
+            // v-bit: C1 imm8 / D1 by 1 / D3 by CL. ModRM.reg selects:
+            // /0 rol /1 ror /2 rcl /3 rcr /4 shl /5 shr (/6 sal=shl) /7 sar.
+            0xc0 | 0xc1 | 0xd0 | 0xd1 | 0xd2 | 0xd3 => {
                 pc += 1;
-                let il = if b == 0xc1 { 1 } else { 0 };
+                let eight = matches!(b, 0xc0 | 0xd0 | 0xd2);
+                let sz: u8 = if eight { 1 } else { size };
+                let il = if matches!(b, 0xc0 | 0xc1) { 1 } else { 0 };
                 let (sel, rm, npc) = self.decode_modrm_imm(mem, pc, rex_r, rex_x, rex_b, il);
                 pc = npc;
                 let raw_count = match b {
-                    0xc1 => {
+                    0xc0 | 0xc1 => {
                         let c = fetch(pc);
                         pc += 1;
                         c as u32
                     }
-                    0xd1 => 1,
-                    _ => (self.regs[RCX] & 0xff) as u32, // 0xD3: count = CL
+                    0xd0 | 0xd1 => 1,
+                    _ => (self.regs[RCX] & 0xff) as u32, // D2/D3: count = CL
                 };
-                let bits = size as u32 * 8;
-                let count = raw_count & (if size == 8 { 63 } else { 31 });
-                let a = match self.read_rm(mem, rm, size) {
+                let bits = sz as u32 * 8;
+                let count = raw_count & (if sz == 8 { 63 } else { 31 }); // 6-bit count for 64-bit operands, else 5-bit
+                let a = match self.read_rm(mem, rm, sz) {
                     Some(v) => v,
                     None => return self.fault(rm),
                 };
                 let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
                 let av = a & mask;
-                let res = if count == 0 {
-                    av
-                } else {
-                    match sel & 7 {
-                        4 => {
-                            // shl
-                            self.set_flag(CF, (av >> (bits - count)) & 1 == 1);
-                            (av << count) & mask
-                        }
-                        5 => {
-                            // shr (logical)
-                            self.set_flag(CF, (av >> (count - 1)) & 1 == 1);
-                            av >> count
-                        }
-                        7 => {
-                            // sar (arithmetic)
-                            self.set_flag(CF, (av >> (count - 1)) & 1 == 1);
-                            let sign = (av >> (bits - 1)) & 1 == 1;
+                let op = sel & 7;
+                // A shift/rotate by zero changes nothing — flags included.
+                if count == 0 {
+                    self.rip = pc as u64;
+                    return StepResult::Ok;
+                }
+                let cf0 = self.flag(CF);
+                let res = match op {
+                    4 | 6 => {
+                        // shl / sal
+                        self.set_flag(CF, count <= bits && (av >> (bits - count)) & 1 == 1);
+                        (av.wrapping_shl(count)) & mask
+                    }
+                    5 => {
+                        // shr (logical)
+                        self.set_flag(CF, (av >> (count - 1).min(bits - 1)) & 1 == 1);
+                        if count >= bits { 0 } else { av >> count }
+                    }
+                    7 => {
+                        // sar (arithmetic)
+                        let sign = (av >> (bits - 1)) & 1 == 1;
+                        self.set_flag(CF, (av >> (count - 1).min(bits - 1)) & 1 == 1);
+                        if count >= bits {
+                            if sign { mask } else { 0 }
+                        } else {
                             let mut r = av >> count;
                             if sign {
                                 r |= mask & !(mask >> count);
                             }
                             r
                         }
-                        0 => ((av << count) | (av >> (bits - count))) & mask, // rol
-                        1 => ((av >> count) | (av << (bits - count))) & mask, // ror
-                        _ => return StepResult::Unknown { rip: start, byte: b },
                     }
+                    0 => {
+                        // rol
+                        let c = count % bits;
+                        let r = if c == 0 { av } else { ((av << c) | (av >> (bits - c))) & mask };
+                        self.set_flag(CF, r & 1 == 1);
+                        r
+                    }
+                    1 => {
+                        // ror
+                        let c = count % bits;
+                        let r = if c == 0 { av } else { ((av >> c) | (av << (bits - c))) & mask };
+                        self.set_flag(CF, (r >> (bits - 1)) & 1 == 1);
+                        r
+                    }
+                    2 | 3 => {
+                        // rcl / rcr — rotate through CF.
+                        let mut val = av;
+                        let mut cf = if cf0 { 1u64 } else { 0 };
+                        for _ in 0..count {
+                            if op == 2 {
+                                let nc = (val >> (bits - 1)) & 1;
+                                val = ((val << 1) | cf) & mask;
+                                cf = nc;
+                            } else {
+                                let nc = val & 1;
+                                val = (val >> 1) | (cf << (bits - 1));
+                                cf = nc;
+                            }
+                        }
+                        self.set_flag(CF, cf == 1);
+                        val & mask
+                    }
+                    _ => return StepResult::Unknown { rip: start, byte: b },
                 };
-                if matches!(sel & 7, 4 | 5 | 7) {
-                    self.set_zsp(res, size);
+                // OF is architecturally defined only for a count of 1.
+                if count == 1 {
+                    let cf = self.flag(CF);
+                    let msb = (res >> (bits - 1)) & 1 == 1;
+                    let of = match op {
+                        4 | 6 => msb ^ cf,                       // shl
+                        5 => (av >> (bits - 1)) & 1 == 1,        // shr: original MSB
+                        7 => false,                              // sar
+                        0 => msb ^ cf,                           // rol
+                        1 => msb ^ ((res >> (bits - 2)) & 1 == 1), // ror
+                        2 => msb ^ cf,                           // rcl
+                        _ => false,
+                    };
+                    self.set_flag(OF, of);
                 }
-                if !self.write_rm(mem, rm, res, size) {
+                if matches!(op, 4 | 5 | 6 | 7) {
+                    self.set_zsp(res, sz);
+                }
+                if !self.write_rm(mem, rm, res, sz) {
                     return self.fault(rm);
                 }
                 self.rip = pc as u64;
@@ -1447,7 +1532,18 @@ impl Cpu {
                             Some(v) => v,
                             None => return self.fault(rm),
                         };
-                        self.xmm[reg] = v;
+                        // movss (F3 0F 10) / movsd (F2 0F 10): scalar load — only
+                        // the low 32/64 bits move. A memory source zeroes the rest;
+                        // a register source preserves the destination's high bits.
+                        if b2 == 0x10 && (rep || repne) {
+                            let from_mem = matches!(rm, Rm::Mem(_));
+                            let width = if repne { 64 } else { 32 };
+                            let lomask: u128 = if width == 64 { u64::MAX as u128 } else { 0xFFFF_FFFF };
+                            let low = v & lomask;
+                            self.xmm[reg] = if from_mem { low } else { (self.xmm[reg] & !lomask) | low };
+                        } else {
+                            self.xmm[reg] = v;
+                        }
                         self.rip = pc as u64;
                         StepResult::Ok
                     }
@@ -1455,6 +1551,25 @@ impl Cpu {
                         pc += 2;
                         let (reg, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
                         pc = npc;
+                        // movss/movsd store: only the low 32/64 bits to memory.
+                        if b2 == 0x11 && (rep || repne) {
+                            if let Rm::Mem(a) = rm {
+                                let sz = if repne { 8 } else { 4 };
+                                let v = self.xmm[reg] as u64;
+                                if !self.store(mem, a, v, sz) {
+                                    return StepResult::Fault { addr: a };
+                                }
+                                self.rip = pc as u64;
+                                return StepResult::Ok;
+                            }
+                            // reg dest: scalar move preserving high bits.
+                            if let Rm::Reg(r) = rm {
+                                let lomask: u128 = if repne { u64::MAX as u128 } else { 0xFFFF_FFFF };
+                                self.xmm[r] = (self.xmm[r] & !lomask) | (self.xmm[reg] & lomask);
+                                self.rip = pc as u64;
+                                return StepResult::Ok;
+                            }
+                        }
                         let v = self.xmm[reg];
                         if !self.write_xmm_rm(mem, rm, v) {
                             return self.fault(rm);
@@ -1473,6 +1588,290 @@ impl Cpu {
                             None => return self.fault(rm),
                         };
                         self.xmm[reg] ^= v;
+                        self.rip = pc as u64;
+                        StepResult::Ok
+                    }
+                    // movd/movq xmm, r/m (66 0F 6E): zero-extend a 32/64-bit GPR
+                    // or memory operand into the low bits of xmm, clearing the rest.
+                    0x6e => {
+                        pc += 2;
+                        let (reg, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                        pc = npc;
+                        let sz = if rex_w { 8 } else { 4 };
+                        let v = match self.read_rm(mem, rm, sz) {
+                            Some(v) => v,
+                            None => return self.fault(rm),
+                        };
+                        self.xmm[reg] = v as u128;
+                        self.rip = pc as u64;
+                        StepResult::Ok
+                    }
+                    // 0F 7E: F3 prefix → movq xmm, xmm/m64 (load low 64, zero high);
+                    // otherwise (66) → movd/movq r/m, xmm (store xmm low 32/64).
+                    0x7e => {
+                        pc += 2;
+                        let (reg, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                        pc = npc;
+                        if rep {
+                            let v = match rm {
+                                Rm::Reg(r) => self.xmm[r] as u64,
+                                Rm::Mem(a) => match self.load(mem, a, 8) {
+                                    Some(v) => v,
+                                    None => return self.fault(rm),
+                                },
+                            };
+                            self.xmm[reg] = v as u128;
+                        } else {
+                            let sz = if rex_w { 8 } else { 4 };
+                            let v = self.xmm[reg] as u64;
+                            if !self.write_rm(mem, rm, v, sz) {
+                                return self.fault(rm);
+                            }
+                        }
+                        self.rip = pc as u64;
+                        StepResult::Ok
+                    }
+                    // SSE 64-bit lane moves. 0F 12 movlps/movhlps, 0F 13 movlps
+                    // store, 0F 16 movhps/movlhps, 0F 17 movhps store. The 64-bit
+                    // move semantics are the same for the ps/pd variants we need.
+                    0x12 | 0x16 => {
+                        let high = b2 == 0x16; // 0x16 targets the high lane
+                        pc += 2;
+                        let (reg, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                        pc = npc;
+                        let src64 = match rm {
+                            // reg form: 0F12 movhlps (use src high), 0F16 movlhps (src low).
+                            Rm::Reg(r) => {
+                                if high { self.xmm[r] as u64 } else { (self.xmm[r] >> 64) as u64 }
+                            }
+                            Rm::Mem(a) => match self.load(mem, a, 8) {
+                                Some(v) => v,
+                                None => return self.fault(rm),
+                            },
+                        };
+                        let lo = self.xmm[reg] as u64;
+                        let hi = (self.xmm[reg] >> 64) as u64;
+                        self.xmm[reg] = if high {
+                            (lo as u128) | ((src64 as u128) << 64)
+                        } else {
+                            (src64 as u128) | ((hi as u128) << 64)
+                        };
+                        self.rip = pc as u64;
+                        StepResult::Ok
+                    }
+                    0x13 | 0x17 => {
+                        let high = b2 == 0x17;
+                        pc += 2;
+                        let (reg, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                        pc = npc;
+                        let v = if high { (self.xmm[reg] >> 64) as u64 } else { self.xmm[reg] as u64 };
+                        match rm {
+                            Rm::Mem(a) => {
+                                if !self.store(mem, a, v, 8) {
+                                    return StepResult::Fault { addr: a };
+                                }
+                            }
+                            Rm::Reg(_) => return StepResult::Unknown { rip: start, byte: 0x0f },
+                        }
+                        self.rip = pc as u64;
+                        StepResult::Ok
+                    }
+                    // pcmpeqb/w/d (66 0F 74/75/76): packed equality compare,
+                    // setting each element to all-ones on match. Used by SSE
+                    // string scans (strlen/memchr).
+                    0x74 | 0x75 | 0x76 => {
+                        let esz = match b2 {
+                            0x74 => 1,
+                            0x75 => 2,
+                            _ => 4,
+                        };
+                        pc += 2;
+                        let (reg, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                        pc = npc;
+                        let src = match self.read_xmm_rm(mem, rm) {
+                            Some(v) => v,
+                            None => return self.fault(rm),
+                        };
+                        let dst = self.xmm[reg];
+                        let mut res = 0u128;
+                        let mut i = 0;
+                        while i < 16 {
+                            let sh = i * 8;
+                            let m: u128 = if esz == 1 {
+                                0xff
+                            } else if esz == 2 {
+                                0xffff
+                            } else {
+                                0xffff_ffff
+                            } << sh;
+                            if dst & m == src & m {
+                                res |= m;
+                            }
+                            i += esz;
+                        }
+                        self.xmm[reg] = res;
+                        self.rip = pc as u64;
+                        StepResult::Ok
+                    }
+                    // pmovmskb (66 0F D7): gather the high bit of each of the 16
+                    // bytes of an xmm register into a GPR.
+                    0xd7 => {
+                        pc += 2;
+                        let (reg, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                        pc = npc;
+                        let src = match rm {
+                            Rm::Reg(r) => self.xmm[r],
+                            Rm::Mem(_) => return StepResult::Unknown { rip: start, byte: 0x0f },
+                        };
+                        let mut mask = 0u64;
+                        for i in 0..16 {
+                            if (src >> (i * 8 + 7)) & 1 == 1 {
+                                mask |= 1 << i;
+                            }
+                        }
+                        self.regs[reg] = mask; // zero-extended into the 64-bit GPR
+                        self.rip = pc as u64;
+                        StepResult::Ok
+                    }
+                    // --- SSE2 scalar floating-point -------------------------
+                    // Prefix selects width: F2 (repne) = double, F3 (rep) =
+                    // single. xmm low 64/32 bits hold the scalar; the rest is
+                    // preserved on register writes.
+                    //
+                    // cvtsi2sd/ss (F2/F3 0F 2A): integer (GPR/mem) → scalar float.
+                    0x2a => {
+                        pc += 2;
+                        let (reg, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                        pc = npc;
+                        let isz = if rex_w { 8 } else { 4 };
+                        let iv = match self.read_rm(mem, rm, isz) {
+                            Some(v) => v,
+                            None => return self.fault(rm),
+                        };
+                        let signed = if isz == 8 { iv as i64 } else { iv as i32 as i64 };
+                        if repne {
+                            let f = signed as f64;
+                            self.xmm[reg] = (self.xmm[reg] & !0xFFFF_FFFF_FFFF_FFFF) | f.to_bits() as u128;
+                        } else {
+                            let f = signed as f32;
+                            self.xmm[reg] = (self.xmm[reg] & !0xFFFF_FFFF) | f.to_bits() as u128;
+                        }
+                        self.rip = pc as u64;
+                        StepResult::Ok
+                    }
+                    // cvttsd2si/cvtsd2si + ss (F2/F3 0F 2C/2D): scalar float → int.
+                    0x2c | 0x2d => {
+                        pc += 2;
+                        let (reg, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                        pc = npc;
+                        let src = match self.read_xmm_rm(mem, rm) {
+                            Some(v) => v,
+                            None => return self.fault(rm),
+                        };
+                        // (2C truncates; 2D rounds. We truncate for both — the CRT
+                        // paths that matter use the truncating form.)
+                        let val: i64 = if repne {
+                            f64::from_bits(src as u64) as i64
+                        } else {
+                            f32::from_bits(src as u32) as f32 as i64
+                        };
+                        self.regs[reg] = if rex_w { val as u64 } else { val as u32 as u64 };
+                        self.rip = pc as u64;
+                        StepResult::Ok
+                    }
+                    // ucomisd/comisd + ss (66/none 0F 2E/2F): compare scalars,
+                    // setting ZF/PF/CF (OF/SF/AF cleared); unordered → ZF=PF=CF=1.
+                    0x2e | 0x2f => {
+                        pc += 2;
+                        let (reg, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                        pc = npc;
+                        let src = match self.read_xmm_rm(mem, rm) {
+                            Some(v) => v,
+                            None => return self.fault(rm),
+                        };
+                        let (a, b) = if opsize16 {
+                            (f64::from_bits(self.xmm[reg] as u64), f64::from_bits(src as u64))
+                        } else {
+                            (f32::from_bits(self.xmm[reg] as u32) as f64, f32::from_bits(src as u32) as f64)
+                        };
+                        self.set_flag(OF, false);
+                        self.set_flag(SF, false);
+                        let (zf, pf, cf) = if a.is_nan() || b.is_nan() {
+                            (true, true, true)
+                        } else if a < b {
+                            (false, false, true)
+                        } else if a > b {
+                            (false, false, false)
+                        } else {
+                            (true, false, false)
+                        };
+                        self.set_flag(ZF, zf);
+                        self.set_flag(PF, pf);
+                        self.set_flag(CF, cf);
+                        self.rip = pc as u64;
+                        StepResult::Ok
+                    }
+                    // Scalar arithmetic: add/mul/sub/div/min/max ss/sd
+                    // (F3/F2 0F 58/59/5C/5E/5D/5F).
+                    0x58 | 0x59 | 0x5c | 0x5e | 0x5d | 0x5f => {
+                        pc += 2;
+                        let (reg, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                        pc = npc;
+                        let src = match self.read_xmm_rm(mem, rm) {
+                            Some(v) => v,
+                            None => return self.fault(rm),
+                        };
+                        let dst = self.xmm[reg];
+                        if repne {
+                            let a = f64::from_bits(dst as u64);
+                            let s = f64::from_bits(src as u64);
+                            let r = match b2 {
+                                0x58 => a + s,
+                                0x59 => a * s,
+                                0x5c => a - s,
+                                0x5e => a / s,
+                                0x5d => if s < a { s } else { a },
+                                _ => if s > a { s } else { a },
+                            };
+                            self.xmm[reg] = (dst & !0xFFFF_FFFF_FFFF_FFFF) | r.to_bits() as u128;
+                        } else if rep {
+                            let a = f32::from_bits(dst as u32);
+                            let s = f32::from_bits(src as u32);
+                            let r = match b2 {
+                                0x58 => a + s,
+                                0x59 => a * s,
+                                0x5c => a - s,
+                                0x5e => a / s,
+                                0x5d => if s < a { s } else { a },
+                                _ => if s > a { s } else { a },
+                            };
+                            self.xmm[reg] = (dst & !0xFFFF_FFFF) | r.to_bits() as u128;
+                        } else {
+                            return StepResult::Unknown { rip: start, byte: 0x0f }; // packed: later
+                        }
+                        self.rip = pc as u64;
+                        StepResult::Ok
+                    }
+                    // cvtsd2ss / cvtss2sd (F2/F3 0F 5A): convert between double/single.
+                    0x5a => {
+                        pc += 2;
+                        let (reg, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                        pc = npc;
+                        let src = match self.read_xmm_rm(mem, rm) {
+                            Some(v) => v,
+                            None => return self.fault(rm),
+                        };
+                        if repne {
+                            // sd -> ss
+                            let f = f64::from_bits(src as u64) as f32;
+                            self.xmm[reg] = (self.xmm[reg] & !0xFFFF_FFFF) | f.to_bits() as u128;
+                        } else if rep {
+                            // ss -> sd
+                            let f = f32::from_bits(src as u32) as f64;
+                            self.xmm[reg] = (self.xmm[reg] & !0xFFFF_FFFF_FFFF_FFFF) | f.to_bits() as u128;
+                        } else {
+                            return StepResult::Unknown { rip: start, byte: 0x0f };
+                        }
                         self.rip = pc as u64;
                         StepResult::Ok
                     }

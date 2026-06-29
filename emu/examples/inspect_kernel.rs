@@ -79,6 +79,18 @@ fn main() {
         let hit = m.watch_hits.contains(&(KV + a));
         println!("  [{}] {}", if hit { "HIT " } else { "miss" }, name);
     }
+    if let RunStop::Unknown { rip, .. } = stop {
+        // Translate the faulting rip through the current page tables (works for
+        // kernel, phys-window, and user addresses) and dump the bytes there.
+        print!("bytes at faulting rip:");
+        for i in 0..12u64 {
+            match ntemu::mmu::translate(&m.ram, &m.cpu.paging, rip + i, ntemu::mmu::Access::Execute, false) {
+                Ok(p) if (p as usize) < m.ram.len() => print!(" {:02x}", m.ram[p as usize]),
+                _ => print!(" ??"),
+            }
+        }
+        println!();
+    }
     if let RunStop::Unknown { rip, byte } = stop {
         // Show the bytes around the faulting RIP for context.
         println!("next opcode to implement: {:#04x} at rip {:#x}", byte, rip);
