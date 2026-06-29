@@ -40,7 +40,7 @@ fn main() {
     let banner_len = out.len();
 
     // Type a few commands. cmd reads COM1; feed each line + CR.
-    for cmd in ["ver", "echo hello from ntemu", "exit"] {
+    for cmd in ["more hello.txt", "type readme.txt", "dir", "ver"] {
         for &byte in cmd.as_bytes() {
             m.cpu.dev.uart.push_rx(byte);
         }

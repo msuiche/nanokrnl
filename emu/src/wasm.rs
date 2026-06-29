@@ -145,6 +145,22 @@ pub extern "C" fn ntemu_run(steps: u32) -> u32 {
     }
 }
 
+/// Details of the last stop (valid after `ntemu_run` returns a non-running
+/// code): the RIP at the stop, a relevant address (CR2 for a fault), and the
+/// offending opcode byte for an unknown instruction.
+#[no_mangle]
+pub extern "C" fn ntemu_fault_rip() -> u64 {
+    unsafe { MACHINE.as_ref().map_or(0, |m| m.last_rip) }
+}
+#[no_mangle]
+pub extern "C" fn ntemu_fault_addr() -> u64 {
+    unsafe { MACHINE.as_ref().map_or(0, |m| m.last_addr) }
+}
+#[no_mangle]
+pub extern "C" fn ntemu_fault_byte() -> u32 {
+    unsafe { MACHINE.as_ref().map_or(0, |m| m.last_byte as u32) }
+}
+
 /// Pop one byte the guest wrote to the UART, or -1 if none.
 #[no_mangle]
 pub extern "C" fn ntemu_uart_read() -> i32 {

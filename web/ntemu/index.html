@@ -176,7 +176,19 @@ function loop() {
       perFrame = 2_000_000;   // interactive: small chunks → low input latency
       setStatus("run", "running · interactive");
     }
-  } else { running = false; setStatus("stop", RUNSTOP[code] || ("stop " + code)); refreshButtons(); }
+  } else {
+    running = false; refreshButtons();
+    let detail = RUNSTOP[code] || ("stop " + code);
+    if (code === 2 || code === 3) {   // unknown opcode / unhandled fault: show specifics
+      const hex = (n) => "0x" + n.toString(16);
+      const rip = hex(e.ntemu_fault_rip());
+      detail += code === 2
+        ? ` ${hex(e.ntemu_fault_byte())} @ rip ${rip}`
+        : ` @ rip ${rip}, addr ${hex(e.ntemu_fault_addr())}`;
+      term += `\n*** ntemu stopped: ${detail} ***\n`; render();
+    }
+    setStatus("stop", detail);
+  }
 }
 
 async function boot(image) {

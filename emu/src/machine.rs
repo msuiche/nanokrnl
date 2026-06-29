@@ -60,6 +60,12 @@ pub struct Machine {
     /// Debug watchpoints: rips to flag the first time they execute.
     pub watch: Vec<u64>,
     pub watch_hits: Vec<u64>,
+    /// Details of the last stop (for surfacing to the host on a fault/unknown):
+    /// the RIP at the stop, a relevant address (CR2 for a fault), and the
+    /// offending opcode byte for an unknown instruction.
+    pub last_rip: u64,
+    pub last_addr: u64,
+    pub last_byte: u8,
 }
 
 impl Machine {
@@ -77,6 +83,9 @@ impl Machine {
             hlts: 0,
             watch: Vec::new(),
             watch_hits: Vec::new(),
+            last_rip: 0,
+            last_addr: 0,
+            last_byte: 0,
         }
     }
 
@@ -335,14 +344,20 @@ impl Machine {
                     return RunStop::Halted;
                 }
                 StepResult::Fault { addr } => {
-                    // Deliver #PF (vector 14) with a best-effort error code.
+                    // Deliver #PF (vector 14) through the guest IDT.
                     self.cpu.cr2 = addr;
-                    let err = mmu::PageFault::P; // present-ish; refined later
+                    let err = mmu::PageFault::P; // best-effort error code
                     if !self.cpu.deliver_interrupt(&mut self.ram, 14, Some(err as u64)) {
+                        self.last_rip = self.cpu.rip;
+                        self.last_addr = addr;
                         return RunStop::UnhandledFault { addr };
                     }
                 }
-                StepResult::Unknown { rip, byte } => return RunStop::Unknown { rip, byte },
+                StepResult::Unknown { rip, byte } => {
+                    self.last_rip = rip;
+                    self.last_byte = byte;
+                    return RunStop::Unknown { rip, byte };
+                }
                 StepResult::Syscall => return RunStop::Syscall,
                 StepResult::Halt => return RunStop::Halted,
                 StepResult::Import { .. } => return RunStop::Halted,

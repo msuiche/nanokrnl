@@ -117,6 +117,11 @@ pub struct Cpu {
     /// Ring-0 stack pointer loaded on an interrupt that changes privilege
     /// (TSS.RSP0). Set by the machine when building the TSS.
     pub tss_rsp0: u64,
+    /// Base of the live TSS (decoded from the GDT when `ltr` loads TR). On a
+    /// privilege-raising interrupt the CPU loads RSP0 from `[tr_base + 4]` — the
+    /// kernel updates that field in memory on every context switch, so we must
+    /// read it dynamically, not cache a boot-time value.
+    pub tr_base: u64,
     /// Retired-instruction counter — drives the APIC timer's countdown.
     pub icount: u64,
 }
@@ -195,6 +200,7 @@ impl Default for Cpu {
             sfmask: 0,
             kernel_gs_base: 0,
             tss_rsp0: 0,
+            tr_base: 0,
             icount: 0,
         }
     }
@@ -1889,8 +1895,20 @@ impl Cpu {
                                 }
                             }
                             2 | 3 => {
-                                if self.read_rm(mem, rm, 2).is_none() {
-                                    return self.fault(rm);
+                                let sel = match self.read_rm(mem, rm, 2) {
+                                    Some(v) => v,
+                                    None => return self.fault(rm),
+                                };
+                                // ltr (/3): decode the 64-bit TSS descriptor from
+                                // the GDT to find the TSS base, so interrupts can
+                                // read the live RSP0. (lldt /2 is left a no-op.)
+                                if ext & 7 == 3 {
+                                    let d = self.gdtr_base + (sel & 0xFFF8);
+                                    let lo = self.load(mem, d, 8).unwrap_or(0);
+                                    let hi = self.load(mem, d + 8, 8).unwrap_or(0);
+                                    self.tr_base = ((lo >> 16) & 0xFF_FFFF)        // base 0..23
+                                        | (((lo >> 56) & 0xFF) << 24)             // base 24..31
+                                        | ((hi & 0xFFFF_FFFF) << 32); // base 32..63
                                 }
                             }
                             4 | 5 => self.set_flag(ZF, true),
@@ -2622,6 +2640,12 @@ impl Cpu {
     /// interrupt frame (SS, RSP, RFLAGS, CS, RIP [, error code]), and jump to the
     /// handler. Returns false if the gate or a stack push could not be accessed.
     pub fn deliver_interrupt(&mut self, mem: &mut [u8], vector: u8, error: Option<u64>) -> bool {
+        // Every memory access made *by delivery itself* — reading the IDT gate
+        // and TSS, pushing the interrupt frame — is a supervisor access, so drop
+        // to CPL 0 up front. (Otherwise, on a ring-3 fault, the MMU's U/S check
+        // rejects the read of the supervisor IDT/stack and delivery fails.)
+        let old_cpl = self.cpl;
+        self.cpl = 0;
         let desc = self.idtr_base + vector as u64 * 16;
         let lo = match self.load(mem, desc, 8) {
             Some(v) => v,
@@ -2638,11 +2662,16 @@ impl Cpu {
             return false; // gate not present
         }
         let target_cpl = (selector & 3) as u8;
-        let old_cpl = self.cpl;
         let old_rsp = self.regs[RSP];
         if target_cpl < old_cpl {
             // Privilege increased (ring3 → ring0): switch to the kernel stack.
-            self.regs[RSP] = self.tss_rsp0;
+            // Read RSP0 from the live TSS (the kernel rewrites it on every
+            // context switch); fall back to the boot value if TR isn't loaded.
+            self.regs[RSP] = if self.tr_base != 0 {
+                self.load(mem, self.tr_base + 4, 8).unwrap_or(self.tss_rsp0)
+            } else {
+                self.tss_rsp0
+            };
         }
         let ok = self.push64(mem, Self::ss_for(old_cpl))
             && self.push64(mem, old_rsp)
