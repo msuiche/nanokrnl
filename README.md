@@ -65,6 +65,44 @@ cd web/nanox && python3 -m http.server 8000   # http://localhost:8000
 (Serve over HTTP, not `file://`; the demo's AudioWorklet backdrop needs a real
 origin.)
 
+## Architecture & boot sequence
+
+Two pieces cooperate. **nanox** (the emulator) brings up a bare x86-64 machine
+and hands control to **nanokrnl** (the kernel), which then boots itself the way
+NT does, in phases. The flow below traces the whole path, from the web page
+loading the wasm to a ring-3 program running on the kernel's own syscalls.
+
+```mermaid
+flowchart TD
+    subgraph HOST["nanox: bespoke x86-64 emulator (Rust to wasm, ~60 KB)"]
+        A["Browser loads index.html,<br/>fetches nanox.wasm + kernel.bin"]
+        A --> B["nanox_new(ram): allocate guest RAM"]
+        B --> C["nanox_boot_kernel(kernel ELF)"]
+        C --> D["Parse ELF, load high-half,<br/>apply R_X86_64_RELATIVE relocations"]
+        D --> E["Build 4-level page tables:<br/>identity map, physical-memory window, high-half"]
+        E --> F["Build GDT / TSS / IDT"]
+        F --> G["Encode BootInfo (bootloader_api handoff)"]
+        G --> H["Set CR0/CR3/CR4 + EFER.LME/LMA,<br/>enter long mode"]
+        H --> RUN["Run loop: step CPU, tick APIC timer,<br/>deliver IRQ or page fault via IDT,<br/>service UART / PS2 / APIC MMIO"]
+    end
+
+    RUN ==>|"CPU executes _start (RDI = BootInfo)"| S0
+
+    subgraph GUEST["nanokrnl: NT-compatible kernel (Rust)"]
+        S0["KiSystemStartup"]
+        S0 --> S1["Phase 0: GDT/TSS/IDT, KPCR online;<br/>MM PFN bitmap + pool;<br/>HAL PIC masked, APIC on, clock vector 0xD1"]
+        S1 --> S2["Phase 1: scheduler online, interrupts enabled"]
+        S2 --> S3["Register SSDT (Nt* services),<br/>load kernel32 / msvcrt / ulib shims,<br/>load null.sys PE driver"]
+        S3 --> S4["Run boot self-test suite"]
+        S4 --> S5["ALL SELF TESTS PASSED"]
+        S5 --> S6["interactive build: load cmd.exe,<br/>reach the command prompt"]
+        S6 --> S7["Run real binaries (more.com, sort, whoami)<br/>in ring 3 via syscall/sysret, swapgs, iretq"]
+    end
+
+    S7 -.->|"syscall traps to the emulated CPU"| RUN
+    RUN -.->|"timer IRQ or page fault through the guest IDT"| S2
+```
+
 ## What "NT-compatible" means here
 
 The point is fidelity to NT's *kernel architecture*, not binary compatibility
