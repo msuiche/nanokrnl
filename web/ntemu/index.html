@@ -117,8 +117,6 @@
       <button class="primary" id="boot">Boot</button>
       <button id="restart" disabled>Restart</button>
       <button id="shutdown" disabled>Shut Down</button>
-      <span class="spacer"></span>
-      <label>Load ELF… <input id="file" type="file" hidden></label>
     </div>
     <div class="statusbar">
       <span class="status stop" id="status"><span class="led"></span><span id="statusText">idle</span></span>
@@ -208,9 +206,6 @@ btnBoot.onclick = () => {
 btnRestart.onclick = () => kernelBytes && boot(kernelBytes);
 btnShutdown.onclick = () => { stop(); setStatus("stop", "halted by user"); refreshButtons(); term += "\n[machine powered off]\n"; render(); };
 document.getElementById("winclose").onclick = () => { if (running) btnShutdown.click(); };
-document.getElementById("file").onchange = async (ev) => {
-  const f = ev.target.files[0]; if (f) boot(new Uint8Array(await f.arrayBuffer()));
-};
 
 // Keyboard → COM1: the shell reads typed bytes from the UART. Enter → CR,
 // Backspace → DEL (what the cmd line editor expects).

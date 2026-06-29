@@ -45,3 +45,11 @@ drivers/*.sys
 .omc/
 
 web/disk-bios.img
+
+# Generated qemu-wasm browser artifacts (produced by scripts/build-qemu-wasm.sh).
+# The hand-written sources (index.html, module.js, coi-serviceworker.js) ARE tracked.
+web/qemu/out.js
+web/qemu/load.js
+web/qemu/pack.data
+web/qemu/qemu-system-x86_64.wasm
+web/qemu/qemu-system-x86_64.worker.js

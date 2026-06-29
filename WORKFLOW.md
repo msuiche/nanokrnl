@@ -132,6 +132,24 @@ commit log starts at a baseline that already contains Phases A–G. The
 commit-by-commit code history of those phases was not captured; this section and
 the dated entries in the project memory are the authoritative record of them.
 
+### 0.2 Which model did what (Fable vs Opus)
+
+Derived from the resumed session that built the kernel (`e470ab1a…`,
+2026-06-10 → 2026-06-18). The model split is lopsided — it maps to *task type*
+rather than being interleaved, and each phase ran on one model end-to-end:
+
+| Model | ~Turns | Window | Task type |
+|-------|--------|--------|-----------|
+| **Opus 4.8** | ~12 | Jun 10, 13:33–13:34 (~1 min) | Kickoff: acknowledge the goal, stand up the toolchain (Rust 1.95, QEMU, lld). Interrupted almost immediately. |
+| **Fable 5** | ~200 | Jun 10, 13:35–17:59 (~4.5 h) | **Greenfield scaffolding** — the whole Phase A core from nothing in one burst: workspace, IDT/trap machinery (256 stubs + dispatcher), build/run + `qemu-test` harness, README; got it booting and the self-test to PASS, then fixed the `qemu-test` 60 s timeout bug. High-volume generation from a blank slate. |
+| **Opus 4.8** | ~7,500 | Jun 10 18:00 → Jun 18 (~8 days) | **Everything else** — triggered by "continue … until we can load kernel drivers." Phases B–H and the WASM efforts: driver loading, user mode, the dynamic-linking shims, SMEP/SMAP hardening, sort/choice/where/cmd bring-up, the in-kernel debugger, registry + CreateProcess, more/whoami, the first own-emulator `nanokrnl.wasm` port, and finally the qemu-wasm browser build. Long, iterative, debug-heavy work. |
+
+Takeaway: **Fable for the initial fast-from-scratch sprint; Opus for the long,
+debug-heavy bring-up tail.** The single Fable→Opus handoff (Jun 10, ~18:00)
+coincided with a deliberate task shift — from "write the kernel core" to "load
+real drivers and run real binaries" — so the two models were never mixed within
+a task.
+
 ---
 
 ## 1. The strategy: own-ABI shims, not real system DLLs
@@ -417,3 +435,279 @@ persistence to disk.
 - **Ring-3 faults terminate the thread, not the kernel** — a user `#PF`/`#GP`
   ends just that process; the boot suite survives a crashing binary.
 - **cmd.exe** loads, runs its command loop, and exits cleanly.
+
+---
+
+## 9. Model notes — Fable 5 vs Opus 4.8 (a field report)
+
+The kernel was built across one resumed session that used both Claude Fable 5
+(`claude-fable-5`) and Claude Opus 4.8 (`claude-opus-4-8`), in two cleanly
+separated stints (see §0.2 for the turn-by-turn timeline). Working with both
+back-to-back on the same codebase made their differences concrete in a way the
+spec sheets don't. This section is the field report — written so it can be
+reused as a blog post.
+
+### 9.1 The split — and what Fable actually did
+
+Fable 5 was used **once**, in a single contiguous stint (2026-06-10 13:35 →
+17:59). It wrote the kernel **from scratch** (Phase A); Opus 4.8 then did
+everything after — driver loading, user mode, the shims, real-binary bring-up,
+the debugger, registry, CreateProcess, and the qemu-wasm port (~7,500 turns
+over 8 days, ~97% of the project). The two were never mixed within a task.
+
+**The Fable stint at a glance** (read from the transcript):
+
+| Metric | Value |
+|---|---|
+| Runs / invocations | **1** (one contiguous stint) |
+| Assistant turns | 197 (28 narration, 110 tool calls) |
+| Tool calls | 45 Write · 25 Bash · 18 Edit · 13 TaskUpdate · 7 TaskCreate |
+| Files created/edited | 43 unique (63 write/edit ops) |
+| Tokens | ~407K output (the code) on ~11K fresh input; ~27.5M served from cache |
+| Active work | two bursts — ~38 min to a bootable core, then ~13 min on test fixes |
+
+Fable opened by **decomposing the kernel the way ntoskrnl itself is built**,
+creating seven tasks for itself in dependency order:
+
+1. Scaffold workspace (kernel crate, boot builder, target config, README)
+2. `rtl` — NTSTATUS, LIST_ENTRY, UNICODE_STRING, bitmap, spinlock primitives
+3. `hal`/`ki` — serial KdPrint, GDT/TSS/IDT with NT selector layout, exception
+   handlers, KPCR, IRQL, APIC timer
+4. `mm` — PFN database, page tables, NonPagedPool, global allocator
+5. `ke` — dispatcher objects, DPCs, threads, scheduler
+6. `ob`/`ps`/`ex`/`io` — object manager, processes, pool API, I/O manager skeleton
+7. Boot in QEMU, run smoke tests, host unit tests, finalize docs
+
+It then executed that plan top-to-bottom and **38 minutes in had a bootable
+kernel** — ~5,100 lines across 27 files, NT-exact where it is ABI (bit-exact
+`NTSTATUS`, `LIST_ENTRY`/`UNICODE_STRING` layouts, the `KGDT64_*` selector
+arrangement chosen so `syscall`/`sysret` bolt on later, IRQL as CR8/TPR with the
+clock on vector 0xD1). The QEMU boot proved it live:
+
+```
+KiSystemStartup: running self tests
+[ OK ] Mm: pool allocations succeed
+[ OK ] Mm: page-table walk translates pool VA
+[ OK ] Ke: KeDelayExecutionThread sleeps >= requested
+[ OK ] Ke: sync event wakes one waiter per set
+[ OK ] Ke: DPC queued from thread retires at DISPATCH
+[ OK ] Io: null.sys DriverEntry + IoCreateDevice
+[ OK ] Io: IRP_MJ_WRITE to \Device\Null consumes all bytes
+[ OK ] Ob: ObCreateObject
+...
+ALL SELF TESTS PASSED — system idle
+qemu-test: PASS (exit 33)
+```
+
+Fourteen `[ OK ]` boot self-tests covering pool, page tables, timers, events,
+DPCs, the null-driver IRP path, and the object manager — ending in the
+project's standing PASS contract, exit code 33.
+
+Fable also **caught and fixed its own bugs along the way** — a useful signal for
+how it behaves unsupervised:
+
+- Trap-dispatch ordering: **EOI must precede a potential context switch** (a
+  preemption mid-dispatch otherwise deadlocks the LAPIC).
+- Host IRQL emulation used one global atomic shared across test threads → **must
+  be per-thread** like a real per-CPU TPR; fixed with `thread_local`. This was
+  the one failing host test (11/12 → 12/12).
+- Two function-cast warnings; a stray attribute left in `main.rs`.
+- Verified the **release** build also boots — "LTO can expose latent UB in
+  low-level code."
+- After the idle gap, fixed `qemu-test.sh`'s 60 s timeout (GNU `timeout` + TTY
+  interaction swallowed the serial output) using `script(1)` to reproduce the
+  interactive case.
+
+The headline beat, in Fable's own words at 14:13:
+
+> Done. `~/Documents/Projects/ntoskrnl-rs` is a working NT-compatible kernel in
+> Rust — ~5,100 lines across 27 files, booting in QEMU with all self tests
+> passing in both debug and release builds.
+
+So the often-quoted "~4.5 h on Fable" is wall-clock; the kernel core went from
+blank to booting-and-passing — including self-debugging — in **38 minutes**.
+That is the stint that earned Fable its place in this project.
+
+### 9.2 Fable's reasoning on a novel task
+
+Rewriting ntoskrnl in Rust has no real precedent — there are active efforts to
+write kernel *drivers* in Rust (and Linux is absorbing them), but a full,
+booting, NT-shaped kernel in Rust is another level of problem. So *how* Fable
+reasoned about it is the interesting question, and the most relevant to where
+model capability is heading.
+
+**The caveat first.** Fable produced 59 thinking blocks during its stint, and
+**all 59 came back with empty text** — the raw chain of thought is never
+returned (by design; see §9.5). We cannot inspect Fable's internal reasoning
+directly. What we *can* read is its output: the design choices, the code, and
+the diagnoses. On all three it reasons like a systems engineer, not a pattern
+matcher.
+
+**The strongest evidence is in the code comments** — Fable documented the
+*why*, not just the *what*. From `ke/gdt.rs`, on the NT selector layout:
+
+```rust
+//! 0x10 KGDT64_R0_CODE    kernel mode 64-bit code   (CS in kernel)
+//! 0x20 KGDT64_R3_CMCODE  user mode 32-bit code     (WoW64 compatibility)
+//! 0x28 KGDT64_R3_DATA    user mode data            (user SS, RPL 3)
+//! 0x30 KGDT64_R3_CODE    user mode 64-bit code     (user CS, RPL 3)
+//! ...
+//! The ordering of 0x20/0x28/0x30 is not arbitrary: x86 `syscall`/`sysret`
+//! require user32-code, user-data, user64-code to be consecutive selectors
+//! starting at `IA32_STAR[63:48]`... NT's layout is *designed* around that;
+//! by adopting it we get syscall support for free later.
+```
+
+That is forward-looking ABI reasoning: match NT's exact GDT arrangement now, at
+the segmentation layer, so the syscall path is a future bolt-on rather than a
+redesign. From `ke/irql.rs`, on IRQL:
+
+```rust
+//! On x86_64 the IRQL *is* the APIC Task Priority Register, conveniently
+//! architecturally aliased as CR8: an interrupt vector `v` is delivered
+//! only if `v >> 4 > CR8`. ...
+//! Raising IRQL is therefore a single `mov cr8, x` — no LAPIC MMIO access —
+//! which is why `KeRaiseIrql`/`KeLowerIrql` are cheap enough to wrap every
+//! spinlock acquisition.
+```
+
+Hardware-fidelity reasoning with the cost consequence derived from it. And from
+`ke/traps.rs`, a *deliberate simplification* stated explicitly:
+
+```rust
+//! we save the volatile *and* non-volatile GP registers unconditionally for
+//! simplicity; NT splits them between KTRAP_FRAME and KEXCEPTION_FRAME.
+//! ...
+//! Note: there is no `swapgs` handling yet because the kernel has no user
+//! mode to return to; the syscall path will add it.
+```
+
+It knew what NT does, what it chose to skip, and why — and flagged the skip so
+the next phase picks it up. That is design judgement, not transcription.
+
+**Diagnostic reasoning under pressure.** When the boot script silently produced
+no output, Fable root-caused it instead of retrying: `exit 124` + zero serial
+output → GNU `timeout` had placed QEMU in a background process group → QEMU's
+`-serial stdio` then called `tcsetattr` to put the TTY in raw mode → from a
+background group that delivers `SIGTTOU` → QEMU froze before emitting a byte →
+the 60 s watchdog killed it. The chain runs from an exit code to a TTY
+signal-delivery rule — genuine systems debugging.
+
+**Methodological reasoning.** Asked what to push next, it went straight for the
+concentration of risk: "The dispatcher lock hand-off, spinlocks, and DPC queue
+are where kernels die," proposing `loom` to exhaustively explore the
+interleavings, Miri to catch UB that emulated hardware happily runs, and
+`proptest` against a reference allocator model. It picked the highest-leverage
+verification surface, not the most features.
+
+The pattern across all four: Fable reasoned about *why* — ABI fidelity, hardware
+constraints, forward compatibility, root cause, risk concentration. The
+reasoning itself is opaque; its fruits are not, and they are the fruits of
+engineering judgement applied to a problem with no prior solutions to copy.
+
+### 9.3 The headline difference: Fable 5 refuses security-adjacent work that Opus serves
+
+This is the difference you feel, and it explains the "I asked for a secure
+implementation and it refused" experience.
+
+Fable 5 runs **safety classifiers on incoming requests that Opus 4.8 does not
+have**, targeting cybersecurity (`stop_details.category: "cyber"`) and research
+biology (`"bio"`). Anthropic states plainly that Fable 5 "is not intended for
+those domains," and — importantly — **acknowledges that benign adjacent work
+trips false positives**: "security tooling, life-sciences tasks." A flagged
+request returns HTTP 200 with `stop_reason: "refusal"` (empty content if it
+fires before output, unbilled; partial output billed if it fires mid-stream).
+
+Opus 4.8 has no such classifier. In fact **Opus 4.8 is the designated fallback
+model for Fable refusals** — the documented recovery for a Fable refusal is to
+re-run the same request on `claude-opus-4-8`. That is the clearest possible
+signal that Opus serves the content Fable declines.
+
+The classifier's reach is wider than "won't write an exploit." Anthropic notes
+that Fable's bug-finding improvements **"exclude security-focused analysis,
+where the cyber classifiers apply"** — i.e., Fable is *by design* less useful
+than its raw capability suggests on anything security-flavored, including
+defensive code review. For a project whose entire surface is security-adjacent
+(ring-0/ring-3 boundaries, SMEP/SMAP, PE loading, the syscall ABI, a user-mode
+debugger), that gating matters.
+
+**A concrete artifact from this project.** The session's goal was set via a
+session-scoped Stop hook. The Opus stint (2026-06-10 13:33:42) carried:
+
+> "Write a compatible ntoskrnl in rust. Modern, **secure**, well
+> documented/commented."
+
+Two minutes later the Fable stint (13:35:00) restarted with:
+
+> "Write a compatible ntoskrnl in rust. Modern, well documented/commented."
+
+— the word **"secure" was dropped at the exact moment the model switched to
+Fable.** Whether pre-emption or coincidence, it lines up precisely with the
+classifier risk: framing a kernel project as "secure" is exactly the kind of
+language Fable's cyber classifier keys on.
+
+Honest caveat: Fable did **not** actually refuse anything in *this* session — 0
+`stop_reason: "refusal"` events, and no refusal-style text in its turns. The
+scaffolding work was benign enough not to trip the classifier. The "it refused"
+experience came from a separate request; the mechanism is the same. The
+interesting finding here is the softer one: **the classifier's existence shaped
+how the work was framed for Fable before any refusal could occur.**
+
+### 9.4 Capability and cost positioning
+
+| | Claude Fable 5 | Claude Opus 4.8 |
+|---|---|---|
+| Positioning | "Most capable widely released model" | "Most capable **Opus-tier** model" |
+| Input / output (per 1M tok) | $10 / $50 | $5 / $25 (**half the price**) |
+| Context / max output | 1M / 128K | 1M / 128K |
+| Tokenizer | same as Opus 4.8 (from 4.7) | — |
+| Safety classifiers (cyber / bio) | **yes — can refuse** | no |
+
+Fable sits *above* Opus in the lineup — the ceiling model for the hardest,
+longest-horizon agentic work (overnight runs, first-shot system builds). You pay
+double for that ceiling, and on a security-heavy codebase you also pay in
+classifier friction.
+
+### 9.5 API and behavioral differences
+
+Both share the modern Claude API surface — both reject last-turn assistant
+prefills, both reject `temperature`/`top_p`/`top_k`, both support `effort`
+(`low`–`max`), adaptive thinking, task budgets, compaction, and high-res
+vision. The divergences that matter in practice:
+
+| | Fable 5 | Opus 4.8 |
+|---|---|---|
+| Thinking | **Always on** — `{type:"disabled"}` is a 400; raw chain-of-thought is never returned (summaries only, opt-in via `display:"summarized"`). | Adaptive — on, off, or omitted. More flexible. |
+| Data retention | Requires **30-day** retention; unavailable under zero data retention (ZDR orgs get 400 on every request). | No such requirement. |
+| Single-request length | Designed for **minutes-long** turns on hard tasks (a 15-min single request is normal). | Strong long-horizon, but less extreme. |
+| Effort at the low end | Even `low` often beats prior models' `xhigh` — sweep it, don't default to `max`. | `high` is the recommended default; sweep per route. |
+| Writing voice / agentic style | Can over-elaborate / over-plan at high effort; wants a no-tidying instruction; excels at parallel **async** sub-agents and benefits from a memory surface. | Warmer, clearer, less hedged; more deliberate — asks more often (~12 pp ask-rate drop with explicit autonomy guidance); under-reaches for search / sub-agents / memory unless prompted. |
+
+### 9.6 When we'd reach for which
+
+Derived from this project, not from a spec sheet:
+
+- **Opus 4.8 is the better default for security-adjacent systems work.** No
+  classifier, half the cost, and more than capable enough for kernel bring-up,
+  debugging, and tooling. This is why ~97% of the project ran on it.
+- **Fable 5 earns its premium on the hardest, longest, *non-security* agentic
+  runs** — a from-scratch greenfield scaffold where you want maximum first-shot
+  quality and the domain won't trip the classifier. That is exactly the Phase A
+  burst in this project.
+- **Don't frame security work for Fable.** If Fable must be used on a
+  security-adjacent task, lead with the *engineering* framing (build, scaffold,
+  test) rather than the *security* framing, and opt into a server-side
+  `fallbacks: [{"model":"claude-opus-4-8"}]` (beta header
+  `server-side-fallback-2026-06-01`) so any refusal transparently retries on
+  Opus instead of failing the request outright.
+
+### 9.7 The broader takeaway
+
+Model choice is a **safety-surface lever**, not just a capability/cost dial.
+Fable 5's extra classifiers buy a tighter guardrail on the riskiest domains —
+and they cost false positives on exactly the benign, defensive work that
+security engineers spend most of their time on. Opus 4.8 trades that guardrail
+for uninterrupted throughput on the same work. For a project where "secure" is
+the whole point, Opus wasn't the compromise choice; it was the right tool, and
+Fable's higher ceiling never got a chance to pay off because the classifier
+gated the very work that defines the project.
