@@ -118,5 +118,9 @@ by hand:
   bugs). This found the register-width, CF/OF, and shift bugs that were
   corrupting the boot.
 
-The interactive `--features interactive` `cmd` shell is the remaining target.
-See [`SPEC.md`](../SPEC.md) §6–7 and `ROADMAP.md`.
+The `--features interactive` build goes further: it loads the **real Microsoft
+cmd.exe**, reaches a `C:\>` prompt, and runs typed commands (`ver`, `echo`,
+`exit`) — verified native and in the browser (keystrokes → COM1). The web page
+(`web/ntemu/index.html`) is a terminal UI with Boot / Restart / Shutdown
+controls; type into the console once the prompt appears. See
+[`SPEC.md`](../SPEC.md) §6–7 and `ROADMAP.md`.
