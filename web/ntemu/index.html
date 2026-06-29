@@ -88,6 +88,44 @@
   .hint b { color: #e6ebf7; font-weight: 600; }
   kbd { background: #1d2333; border: 1px solid #2b3247; border-bottom-width: 2px;
     border-radius: 4px; padding: 1px 6px; font-size: 11px; color: var(--fg); }
+
+  /* --- Winamp-style audio player (classic 2.x look) --- */
+  #winamp { position: fixed; right: 18px; bottom: 18px; width: 300px; z-index: 5;
+    background: #2b2f36; color: #b9c4cc; user-select: none;
+    font: 11px Tahoma, "MS Sans Serif", sans-serif;
+    box-shadow: inset 1px 1px #565d68, inset -1px -1px #14161a, 4px 6px 18px rgba(0,0,0,.55); }
+  #winamp .wa-title { display: flex; align-items: center; height: 16px; padding: 0 5px; cursor: move;
+    background: linear-gradient(90deg, #3a4f6e, #1c2533); color: #c9d6e6;
+    font-size: 10px; font-weight: 700; letter-spacing: 1px; }
+  #winamp .wa-title .x { margin-left: auto; cursor: pointer; padding: 0 3px; color: #9fb0c4; }
+  #winamp .wa-title .x:hover { color: #fff; }
+  #winamp .wa-main { padding: 8px; display: flex; gap: 8px; }
+  #winamp canvas { width: 76px; height: 38px; background: #000; box-shadow: inset 1px 1px #000, inset -1px -1px #3a3f47; }
+  #winamp .wa-lcd { flex: 1; min-width: 0; background: #000; padding: 4px 6px; color: #15e637;
+    font: 11px/1.35 ui-monospace, "Consolas", monospace; text-shadow: 0 0 4px rgba(21,230,55,.55);
+    box-shadow: inset 1px 1px #000, inset -1px -1px #3a3f47; overflow: hidden; }
+  #winamp .wa-time { font-size: 15px; letter-spacing: 1px; }
+  #winamp .wa-track { white-space: nowrap; overflow: hidden; }
+  #winamp .wa-track span { display: inline-block; padding-left: 100%; animation: marquee 12s linear infinite; }
+  @keyframes marquee { to { transform: translateX(-100%); } }
+  #winamp .wa-ctrl { display: flex; align-items: center; gap: 4px; padding: 0 8px 8px; }
+  #winamp .wa-ctrl button { width: 26px; height: 20px; padding: 0; font-size: 11px;
+    background: #3a3f47; color: #d7dde4; border: none;
+    box-shadow: inset 1px 1px #565d68, inset -1px -1px #14161a; cursor: pointer; }
+  #winamp .wa-ctrl button:active { box-shadow: inset 1px 1px #14161a, inset -1px -1px #565d68; }
+  #winamp input[type=range] { -webkit-appearance: none; appearance: none; height: 6px; background: #14161a;
+    box-shadow: inset 1px 1px #000, inset -1px -1px #3a3f47; cursor: pointer; }
+  #winamp input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 8px; height: 14px;
+    background: #6f7681; box-shadow: inset 1px 1px #99a, inset -1px -1px #222; }
+  #winamp .wa-seek { width: 100%; margin: 0 8px 6px; box-sizing: border-box; }
+  #winamp .wa-vol { flex: 1; }
+  #winamp .wa-pl { margin: 0 8px 8px; height: 92px; overflow-y: auto; background: #000; color: #2fe06a;
+    font: 11px/1.5 ui-monospace, monospace; box-shadow: inset 1px 1px #000, inset -1px -1px #3a3f47; }
+  #winamp .wa-pl div { padding: 1px 6px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #winamp .wa-pl div:hover { background: #10301c; }
+  #winamp .wa-pl div.cur { background: #1d5f37; color: #d6ffe6; }
+  #winamp .wa-pl div.bad { color: #6b7280; }
+  #winamp.hidden { display: none; }
 </style>
 </head>
 <body>
@@ -125,6 +163,137 @@
   <p class="hint">Type directly into the console once you see <b>C:\&gt;</b> — try <b>ver</b>, <b>echo hi</b>, or <b>exit</b>.
      <kbd>Enter</kbd> sends the line. The kernel runs its self-tests first, so the prompt takes a few seconds.</p>
 </div>
+
+<!-- Winamp-style audio player; reads tracks/ -->
+<div id="winamp">
+  <div class="wa-title" id="wa-drag">WINAMP &middot; ntoskrnl-rs<span class="x" id="wa-close" title="Close">&times;</span></div>
+  <div class="wa-main">
+    <canvas id="wa-viz" width="76" height="38"></canvas>
+    <div class="wa-lcd">
+      <div class="wa-time" id="wa-time">--:--</div>
+      <div class="wa-track"><span id="wa-track">no track loaded</span></div>
+    </div>
+  </div>
+  <input type="range" class="wa-seek" id="wa-seek" min="0" max="1000" value="0" step="1">
+  <div class="wa-ctrl">
+    <button id="wa-prev" title="Previous">&#9198;</button>
+    <button id="wa-play" title="Play">&#9654;</button>
+    <button id="wa-pause" title="Pause">&#10074;&#10074;</button>
+    <button id="wa-stop" title="Stop">&#9632;</button>
+    <button id="wa-next" title="Next">&#9197;</button>
+    <input type="range" class="wa-vol" id="wa-vol" min="0" max="100" value="80" title="Volume">
+  </div>
+  <div class="wa-pl" id="wa-pl"></div>
+</div>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const wa = $("winamp"), lcdTime = $("wa-time"), lcdTrack = $("wa-track");
+  const seek = $("wa-seek"), vol = $("wa-vol"), pl = $("wa-pl");
+  const viz = $("wa-viz"), vctx = viz.getContext("2d");
+  const MOD_EXT = /\.(xm|mod|s3m|it|mptm|umx)$/i;
+  const AUDIO_EXT = /\.(mp3|ogg|wav|flac|m4a|aac|opus)$/i;
+
+  const audio = new Audio();
+  audio.crossOrigin = "anonymous";
+  let actx, analyser, freq, tracks = [], cur = -1, seeking = false;
+
+  function setupAudioGraph() {           // lazily, on first user gesture
+    if (actx) return;
+    actx = new (window.AudioContext || window.webkitAudioContext)();
+    const src = actx.createMediaElementSource(audio);
+    analyser = actx.createAnalyser();
+    analyser.fftSize = 128;
+    freq = new Uint8Array(analyser.frequencyBinCount);
+    src.connect(analyser); analyser.connect(actx.destination);
+    drawViz();
+  }
+  function drawViz() {
+    requestAnimationFrame(drawViz);
+    vctx.fillStyle = "#000"; vctx.fillRect(0, 0, viz.width, viz.height);
+    if (!analyser) return;
+    analyser.getByteFrequencyData(freq);
+    const n = 24, bw = viz.width / n;
+    for (let i = 0; i < n; i++) {
+      const v = freq[i * 2] / 255, h = v * viz.height;
+      vctx.fillStyle = "#15e637";
+      vctx.fillRect(i * bw, viz.height - h, bw - 1, h);
+    }
+  }
+
+  const fmt = (s) => isFinite(s) ? `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}` : "--:--";
+  function renderList() {
+    pl.innerHTML = "";
+    tracks.forEach((t, i) => {
+      const d = document.createElement("div");
+      d.textContent = `${i + 1}. ${t.replace(MOD_EXT, " [module]").replace(AUDIO_EXT, "")}`;
+      if (MOD_EXT.test(t)) d.className = "bad";
+      if (i === cur) d.classList.add("cur");
+      d.onclick = () => play(i);
+      pl.appendChild(d);
+    });
+  }
+  function play(i) {
+    if (i < 0 || i >= tracks.length) return;
+    cur = i; renderList();
+    const name = tracks[i];
+    lcdTrack.textContent = name;
+    if (MOD_EXT.test(name)) {          // tracker module: needs libopenmpt (not bundled)
+      lcdTime.textContent = "MOD";
+      lcdTrack.textContent = name + " — tracker module needs libopenmpt.js (not bundled)";
+      return;
+    }
+    setupAudioGraph(); if (actx.state === "suspended") actx.resume();
+    audio.src = "tracks/" + encodeURIComponent(name);
+    audio.play().catch((e) => { lcdTrack.textContent = "error: " + e.message; });
+  }
+
+  $("wa-play").onclick = () => { if (cur < 0 && tracks.length) play(0); else { setupAudioGraph(); actx.resume(); audio.play(); } };
+  $("wa-pause").onclick = () => audio.pause();
+  $("wa-stop").onclick = () => { audio.pause(); audio.currentTime = 0; };
+  $("wa-prev").onclick = () => play((cur - 1 + tracks.length) % tracks.length);
+  $("wa-next").onclick = () => play((cur + 1) % tracks.length);
+  audio.onended = () => play((cur + 1) % tracks.length);
+  audio.ontimeupdate = () => {
+    if (!seeking) seek.value = audio.duration ? (audio.currentTime / audio.duration) * 1000 : 0;
+    lcdTime.textContent = fmt(audio.currentTime) + (audio.duration ? " / " + fmt(audio.duration) : "");
+  };
+  seek.oninput = () => { seeking = true; };
+  seek.onchange = () => { if (audio.duration) audio.currentTime = (seek.value / 1000) * audio.duration; seeking = false; };
+  vol.oninput = () => { audio.volume = vol.value / 100; };
+  audio.volume = 0.8;
+  $("wa-close").onclick = () => wa.classList.add("hidden");
+
+  // Drag the window by its title bar.
+  const drag = $("wa-drag");
+  drag.onmousedown = (e) => {
+    const r = wa.getBoundingClientRect();
+    const ox = e.clientX - r.left, oy = e.clientY - r.top;
+    wa.style.right = "auto"; wa.style.bottom = "auto";
+    const mv = (ev) => { wa.style.left = (ev.clientX - ox) + "px"; wa.style.top = (ev.clientY - oy) + "px"; };
+    const up = () => { document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up); };
+    document.addEventListener("mousemove", mv); document.addEventListener("mouseup", up);
+  };
+
+  // Discover tracks: manifest.json first, else parse the server directory index.
+  (async () => {
+    try {
+      const m = await fetch("tracks/manifest.json", { cache: "no-store" }).then((r) => r.json());
+      if (Array.isArray(m) && m.length) tracks = m;
+    } catch {}
+    if (!tracks.length) {
+      try {
+        const html = await fetch("tracks/", { cache: "no-store" }).then((r) => r.text());
+        tracks = [...html.matchAll(/href="([^"?]+)"/gi)]
+          .map((x) => decodeURIComponent(x[1].replace(/^.*\//, "")))
+          .filter((f) => MOD_EXT.test(f) || AUDIO_EXT.test(f));
+      } catch {}
+    }
+    if (tracks.length) { lcdTrack.textContent = tracks.length + " track(s) — press play"; renderList(); }
+    else lcdTrack.textContent = "no tracks in tracks/";
+  })();
+})();
+</script>
 
 <script type="module">
 const screen = document.getElementById("screen");

@@ -1,0 +1,5 @@
+# Keep the folder + docs; don't commit dropped-in media.
+*
+!.gitignore
+!README.txt
+!manifest.json
