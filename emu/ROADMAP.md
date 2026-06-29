@@ -63,12 +63,24 @@ emulates **only what our kernel needs**, starting the CPU already in long mode.
   `ltr`/`lgdt`/`lidt`, far-return/`iretq`, x2APIC+xAPIC. Enough for a full boot
   to the idle loop; a richer guest (shell, user processes) will surface more.
 
-## Status
-M0–M7 complete and tested. The **real ntoskrnl-rs kernel boots** under ntemu —
-native and in the 51 KB wasm — through both init phases to a live,
-APIC-timer-driven scheduler idle loop. `cargo test` → **33 passing**. See
-`SPEC.md` at the repo root for the full specification and boot evidence.
+- [x] **M8 — preemptive scheduling.** APIC ICR self-IPI + a 256-bit IRR + the
+  `v>>4 > CR8` delivery rule (CR8/IRQL now stored). The clock ISR's dispatch
+  self-IPI fires once IRQL drops → the scheduler context-switches. The kernel's
+  boot self-tests run and pass: Cpu (SMEP/SMAP), Mm (15), Ke (10), Io, Um
+  (ring-3 program via NtWriteFile), Ob, Cm (registry).
+- [ ] **M9 — process/driver loading.** The suite panics in `ldr/pe.rs` during
+  the Ps (CreateProcess) / Ldr (PE driver) phase — a data divergence in the
+  PE-mapping path. Gates "ALL SELF TESTS PASSED" and the interactive `cmd` shell.
 
-Key correctness fixes found by booting: RIP-relative immediate length (seed),
-`mov r16,imm16` operand-size, and `pc`/addresses must be `u64` not `usize`
-(wasm32 truncation).
+## Status
+The **real ntoskrnl-rs kernel boots and runs** under ntemu — native and in the
+~52 KB wasm — through both init phases, then runs its self-test suite under a
+live preemptive scheduler, passing dozens of Cpu/Mm/Ke/Io/Um/Ob/Cm checks
+(including a ring-3 user program). It does **not** yet complete the suite: it
+panics in the PE loader during CreateProcess (M9). `cargo test` → **33 passing**.
+
+Correctness fixes found by booting/running: RIP-relative immediate length;
+operand-size (0x66) immediates across mov/alu/test (`mov r16,imm16`, `0xC7`,
+`0x81`, acc-imm, `0xA9`, `0xF7`); `pc`/addresses `u64` not `usize` (wasm32);
+APIC self-IPI + CR8/IRQL-gated delivery (preemption); SMEP/SMAP CPUID +
+STAC/CLAC.

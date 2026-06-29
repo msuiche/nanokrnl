@@ -46,6 +46,7 @@ const SF: u64 = 1 << 7;
 const IF: u64 = 1 << 9; // interrupt-enable flag
 const DF: u64 = 1 << 10; // direction flag (string ops)
 const OF: u64 = 1 << 11;
+const AC: u64 = 1 << 18; // alignment-check / SMAP access (stac/clac)
 
 /// Return address that means "the program returned to its entry caller" — the
 /// interpreter stops (mirrors the native loader's NtTerminateThread return stub).
@@ -93,6 +94,9 @@ pub struct Cpu {
     pub paging: mmu::Paging,
     /// CR2 — the linear address of the most recent page fault.
     pub cr2: u64,
+    /// CR8 — the task priority register, aliased to IRQL on x86-64. A pending
+    /// interrupt vector `v` is delivered only when `v >> 4 > cr8`.
+    pub cr8: u64,
     /// Current privilege level (0 = kernel, 3 = user). Drives U/S page checks
     /// and the syscall/sysret/interrupt ring transitions.
     pub cpl: u8,
@@ -179,6 +183,7 @@ impl Default for Cpu {
             machine_mode: false,
             paging: mmu::Paging::default(),
             cr2: 0,
+            cr8: 0,
             cpl: 0,
             dev: devices::Devices::new(),
             idtr_base: 0,
@@ -501,6 +506,9 @@ impl Cpu {
             }
             v as i32 as i64
         };
+        let imm16 = |p: u64| -> i64 {
+            (fetch(p) as u16 | ((fetch(p + 1) as u16) << 8)) as i16 as i64
+        };
 
         // Legacy prefixes (segment override sets the operand segment base; the
         // rest are consumed — size/rep semantics handled per-opcode as needed).
@@ -670,8 +678,8 @@ impl Cpu {
             0x05 | 0x0d | 0x15 | 0x1d | 0x25 | 0x2d | 0x35 | 0x3d => {
                 let sel = (b >> 3) & 7;
                 pc += 1;
-                let imm = imm32(pc) as u64; // sign-extended to 64
-                pc += 4;
+                let imm = if opsize16 { imm16(pc) as u64 } else { imm32(pc) as u64 };
+                pc += if opsize16 { 2 } else { 4 };
                 let a = if size == 4 { self.regs[RAX] & 0xFFFF_FFFF } else { self.regs[RAX] };
                 let (res, wb) = self.apply_alu(sel, a, imm, size);
                 if wb {
@@ -691,8 +699,8 @@ impl Cpu {
             }
             0xa9 => {
                 pc += 1;
-                let imm = imm32(pc) as u64;
-                pc += 4;
+                let imm = if opsize16 { imm16(pc) as u64 } else { imm32(pc) as u64 };
+                pc += if opsize16 { 2 } else { 4 };
                 let a = if size == 4 { self.regs[RAX] & 0xFFFF_FFFF } else { self.regs[RAX] };
                 self.apply_alu(4, a, imm, size);
                 self.rip = pc as u64;
@@ -702,18 +710,17 @@ impl Cpu {
             // ModRM.reg is the op selector (add/or/adc/sbb/and/sub/xor/cmp).
             0x81 | 0x83 => {
                 pc += 1;
-                let il = if b == 0x83 { 1 } else { 4 };
+                let il = if b == 0x83 { 1 } else if opsize16 { 2 } else { 4 };
                 let (sel, rm, npc) = self.decode_modrm_imm(mem, pc, rex_r, rex_x, rex_b, il);
                 pc = npc;
                 let imm = if b == 0x83 {
-                    let v = fetch(pc) as i8 as i64 as u64;
-                    pc += 1;
-                    v
+                    fetch(pc) as i8 as i64 as u64
+                } else if opsize16 {
+                    imm16(pc) as u64
                 } else {
-                    let v = imm32(pc) as u64; // sign-extended to 64
-                    pc += 4;
-                    v
+                    imm32(pc) as u64 // sign-extended to 64
                 };
+                pc += il as u64;
                 let a = match self.read_rm(mem, rm, size) {
                     Some(v) => v,
                     None => return self.fault(rm),
@@ -882,13 +889,17 @@ impl Cpu {
                 self.rip = pc as u64;
                 StepResult::Ok
             }
-            // mov r/m, imm32  (0xC7 /0)
+            // mov r/m, imm  (0xC7 /0): imm16 with a 0x66 override, else imm32
+            // (sign-extended for a 64-bit operand). The immediate length also
+            // feeds RIP-relative addressing, so it must match.
             0xc7 => {
                 pc += 1;
-                let (_, rm, npc) = self.decode_modrm_imm(mem, pc, rex_r, rex_x, rex_b, 4);
+                let il = if opsize16 { 2 } else { 4 };
+                let (_, rm, npc) = self.decode_modrm_imm(mem, pc, rex_r, rex_x, rex_b, il);
                 pc = npc;
-                let imm = imm32(pc) as u64 & if size == 4 { 0xFFFF_FFFF } else { u64::MAX };
-                pc += 4;
+                let imm = if opsize16 { imm16(pc) as u64 } else { imm32(pc) as u64 };
+                pc += il as u64;
+                let imm = imm & mask128(size) as u64;
                 if !self.write_rm(mem, rm, imm, size) {
                     return self.fault(rm);
                 }
@@ -1074,9 +1085,9 @@ impl Cpu {
                 };
                 match sub & 7 {
                     0 | 1 => {
-                        // test r/m, imm32 (sign-extended)
-                        let imm = imm32(pc) as u64;
-                        pc += 4;
+                        // test r/m, imm (imm16 with 0x66, else imm32 sign-extended)
+                        let imm = if opsize16 { imm16(pc) as u64 } else { imm32(pc) as u64 };
+                        pc += if opsize16 { 2 } else { 4 };
                         self.apply_alu(4, a, imm, size); // AND -> flags only
                     }
                     2 => {
@@ -1202,6 +1213,24 @@ impl Cpu {
                     self.set_zsp(res, size);
                 }
                 if !self.write_rm(mem, rm, res, size) {
+                    return self.fault(rm);
+                }
+                self.rip = pc as u64;
+                StepResult::Ok
+            }
+            // group 4 (0xFE /digit): 8-bit inc (/0) / dec (/1). Affect ZF/SF/PF/OF,
+            // not CF.
+            0xfe => {
+                pc += 1;
+                let (sub, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
+                pc = npc;
+                let v = match self.read_rm(mem, rm, 1) {
+                    Some(v) => v & 0xff,
+                    None => return self.fault(rm),
+                };
+                let res = if sub & 7 == 0 { v.wrapping_add(1) } else { v.wrapping_sub(1) } & 0xff;
+                self.set_zsp(res, 1);
+                if !self.write_rm(mem, rm, res, 1) {
                     return self.fault(rm);
                 }
                 self.rip = pc as u64;
@@ -1480,6 +1509,13 @@ impl Cpu {
                             self.rip = (pc + 3) as u64;
                             return StepResult::Ok;
                         }
+                        if sub == 0xcb || sub == 0xca {
+                            // stac (CB) / clac (CA): set/clear RFLAGS.AC, the
+                            // SMAP "kernel may touch user pages" override.
+                            self.set_flag(AC, sub == 0xcb);
+                            self.rip = (pc + 3) as u64;
+                            return StepResult::Ok;
+                        }
                         pc += 2;
                         let (ext, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
                         pc = npc;
@@ -1532,7 +1568,8 @@ impl Cpu {
                                 2 => self.cr2 = v,
                                 3 => self.paging.cr3 = v,
                                 4 => self.paging.cr4 = v,
-                                _ => {} // CR8 (TPR) etc.: accept and ignore
+                                8 => self.cr8 = v & 0xF, // IRQL / task priority class
+                                _ => {}
                             }
                             self.recompute_lma();
                         } else {
@@ -1541,6 +1578,7 @@ impl Cpu {
                                 2 => self.cr2,
                                 3 => self.paging.cr3,
                                 4 => self.paging.cr4,
+                                8 => self.cr8,
                                 _ => 0,
                             };
                         }
@@ -2152,7 +2190,9 @@ impl Cpu {
                     | (1 << 23); // POPCNT
                 (0x0006_03A9, 0, ecx, edx)
             }
-            7 => (0, 0, 0, 0),
+            // Structured extended features. EBX: SMEP (bit 7), SMAP (bit 20) —
+            // the kernel enables CR4.SMEP/SMAP only when these are advertised.
+            7 => (0, (1 << 7) | (1 << 20), 0, 0),
             0x8000_0000 => (0x8000_0008, 0, 0, 0),
             0x8000_0001 => {
                 let edx = (1 << 11)  // SYSCALL

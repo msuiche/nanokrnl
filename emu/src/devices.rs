@@ -90,8 +90,10 @@ pub struct Apic {
     pub initial_count: u32,
     pub current_count: u32,
     pub divide_config: u32,
-    /// A pending vector raised by the timer, awaiting injection by the machine.
-    pub pending_vector: Option<u8>,
+    /// Interrupt Request Register: a 256-bit set of pending vectors (timer +
+    /// self-IPIs from the ICR). The machine injects the highest-priority one
+    /// whose priority class outranks the current IRQL (CR8).
+    pub irr: [u64; 4],
 }
 
 // Local APIC register offsets.
@@ -100,6 +102,7 @@ const APIC_VERSION: u64 = 0x30;
 const APIC_TPR: u64 = 0x80;
 const APIC_EOI: u64 = 0xB0;
 const APIC_SVR: u64 = 0xF0;
+const APIC_ICR_LOW: u64 = 0x300; // interrupt command register (low) — IPIs
 const APIC_LVT_TIMER: u64 = 0x320;
 const APIC_TIMER_INIT: u64 = 0x380;
 const APIC_TIMER_CUR: u64 = 0x390;
@@ -146,6 +149,13 @@ impl Apic {
             APIC_TPR => self.tpr = val,
             APIC_EOI => {} // end-of-interrupt: acknowledge (no nested state modeled)
             APIC_SVR => self.svr = val,
+            APIC_ICR_LOW => {
+                // Inter-processor interrupt. The kernel uses destination
+                // shorthand "self" (bits 18..19 = 01) to raise a software
+                // interrupt (e.g. the dispatch/DPC vector). Either way, on a
+                // uniprocessor the only target is us — queue the vector.
+                self.request((val & 0xFF) as u8);
+            }
             APIC_LVT_TIMER => self.lvt_timer = val,
             APIC_TIMER_INIT => {
                 self.initial_count = val;
@@ -155,8 +165,28 @@ impl Apic {
             _ => {}
         }
     }
-    /// Advance the timer by `cycles` retired instructions. Returns the vector to
-    /// inject if the count crossed zero and the LVT is unmasked.
+
+    /// Raise a pending interrupt for `vector` (set the IRR bit).
+    pub fn request(&mut self, vector: u8) {
+        self.irr[(vector >> 6) as usize] |= 1u64 << (vector & 63);
+    }
+    /// Clear a pending interrupt (on injection / acknowledge).
+    pub fn ack(&mut self, vector: u8) {
+        self.irr[(vector >> 6) as usize] &= !(1u64 << (vector & 63));
+    }
+    /// Highest-numbered (highest-priority) pending vector, if any.
+    pub fn highest_pending(&self) -> Option<u8> {
+        for word in (0..4).rev() {
+            if self.irr[word] != 0 {
+                let bit = 63 - self.irr[word].leading_zeros();
+                return Some((word as u32 * 64 + bit) as u8);
+            }
+        }
+        None
+    }
+
+    /// Advance the timer by `cycles` retired instructions; raise the timer
+    /// vector in the IRR if the count crosses zero. Returns that vector if so.
     pub fn tick(&mut self, cycles: u32) -> Option<u8> {
         if self.lvt_timer & LVT_MASKED != 0 || self.initial_count == 0 {
             return None;
@@ -169,16 +199,7 @@ impl Apic {
             self.current_count -= dec;
             return None;
         }
-        // Reached zero.
-        let vector = (self.lvt_timer & 0xFF) as u8;
-        if self.lvt_timer & LVT_PERIODIC != 0 {
-            self.current_count = self.initial_count;
-        } else {
-            self.current_count = 0;
-            self.initial_count = 0; // one-shot: stop
-        }
-        self.pending_vector = Some(vector);
-        Some(vector)
+        Some(self.fire_timer())
     }
 
     /// Force an armed timer to expire now (used to wake a `hlt` waiting on the
@@ -187,15 +208,19 @@ impl Apic {
         if self.lvt_timer & LVT_MASKED != 0 || self.initial_count == 0 {
             return None;
         }
+        Some(self.fire_timer())
+    }
+
+    fn fire_timer(&mut self) -> u8 {
         let vector = (self.lvt_timer & 0xFF) as u8;
         if self.lvt_timer & LVT_PERIODIC != 0 {
             self.current_count = self.initial_count;
         } else {
             self.current_count = 0;
-            self.initial_count = 0;
+            self.initial_count = 0; // one-shot: stop
         }
-        self.pending_vector = Some(vector);
-        Some(vector)
+        self.request(vector);
+        vector
     }
 }
 

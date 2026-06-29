@@ -42,7 +42,18 @@ fn main() {
     );
 
     m.trace_on = std::env::var("TRACE").is_ok();
-    let stop = m.run(50_000_000);
+    const KV: u64 = 0xFFFF_8000_0000_0000;
+    // (name, link-vaddr) of the post-scheduler dispatch path.
+    let watch = [
+        ("ki_dispatch_trap", 0x209a80u64),
+        ("switch_away_locked", 0x1e32d0),
+        ("ki_swap_context", 0x1ee338),
+        ("ki_finish_switch_to_new_thread", 0x1e50f0),
+        ("smoke_test_thread", 0x1d4840),
+    ];
+    m.watch = watch.iter().map(|(_, a)| KV + a).collect();
+    let steps: usize = std::env::var("STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(2_000_000_000);
+    let stop = m.run(steps);
     if m.trace_on {
         println!("--- last {} rips ---", m.trace_log.len());
         for r in &m.trace_log {
@@ -63,6 +74,11 @@ fn main() {
         m.cpu.rflags & (1 << 9) != 0
     );
     println!("timer IRQs delivered: {}   hlts: {}", m.irqs_delivered, m.hlts);
+    println!("--- dispatch-path watchpoints ---");
+    for (name, a) in &watch {
+        let hit = m.watch_hits.contains(&(KV + a));
+        println!("  [{}] {}", if hit { "HIT " } else { "miss" }, name);
+    }
     if let RunStop::Unknown { rip, byte } = stop {
         // Show the bytes around the faulting RIP for context.
         println!("next opcode to implement: {:#04x} at rip {:#x}", byte, rip);

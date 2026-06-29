@@ -189,10 +189,29 @@ KiSystemStartup: phase 1
 KE: scheduler online, interrupts enabled
 ```
 
-After this it enters a healthy APIC-timer-driven idle loop: in a 50M-instruction
-run, **134,936 `hlt` idles each woken by exactly one vector-0xD1 timer
-interrupt** — i.e. the scheduler tick is live. No crashes, unknown opcodes, or
-unhandled faults.
+After this the clock drives **preemptive multitasking**: the timer ISR raises an
+APIC self-IPI at the dispatch vector (0x2F), and once IRQL (CR8) drops the
+dispatcher context-switches onto the created system thread. ntemu models this
+faithfully — the APIC ICR self-IPI, a 256-bit IRR, and the x86-64 delivery rule
+"vector `v` is delivered only when `v >> 4 > CR8`".
+
+The kernel's boot **self-test suite then runs under that scheduler** and passes,
+in order, its Cpu (SMEP/SMAP enabled), Mm (15: probes, per-process address
+spaces, pool stress, page-table walk), Ke (10: KeDelayExecutionThread, events,
+wait timeouts, WaitForMultiple, mutants, DPC-at-DISPATCH), Io (null.sys
+DriverEntry + IoCreateDevice), **Um (a ring-3 user program writing to the
+console via NtWriteFile)**, Ob (handles), and Cm (registry) checks — dozens of
+`[ OK ]` lines, with the scheduler servicing timer IRQs and `hlt` idles
+throughout.
+
+**Remaining gap (not yet at full QEMU parity):** the suite does not yet complete.
+During the **Ps (CreateProcess) / Ldr (PE driver load)** phase the kernel panics
+in its PE loader (`ldr/pe.rs`) on a DLL-import-name string slice — ntemu feeds
+that path bytes/offsets that diverge from the real loader, a data-flow bug in
+the process/PE-mapping path not yet isolated (it is past the single-opcode tier).
+So the full "ALL SELF TESTS PASSED" verdict and the `--features interactive`
+`cmd` shell are **still pending** on that path. Everything up to it is verified
+identical on native and the wasm/browser build.
 
 Opcodes are added **trace-driven** via the `Unknown { rip, byte }` signal; the
 boot above exercises the 8-bit ALU forms, `grp1`-8bit, REP string ops, `cpuid`,

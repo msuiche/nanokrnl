@@ -57,6 +57,9 @@ pub struct Machine {
     /// Counters (debug): timer/IRQ deliveries and `hlt` idles serviced.
     pub irqs_delivered: u64,
     pub hlts: u64,
+    /// Debug watchpoints: rips to flag the first time they execute.
+    pub watch: Vec<u64>,
+    pub watch_hits: Vec<u64>,
 }
 
 impl Machine {
@@ -72,6 +75,8 @@ impl Machine {
             trace_log: Vec::new(),
             irqs_delivered: 0,
             hlts: 0,
+            watch: Vec::new(),
+            watch_hits: Vec::new(),
         }
     }
 
@@ -306,20 +311,24 @@ impl Machine {
                 }
                 self.trace_log.push(self.cpu.rip);
             }
+            if !self.watch.is_empty() {
+                let r = self.cpu.rip;
+                if self.watch.contains(&r) && !self.watch_hits.contains(&r) {
+                    self.watch_hits.push(r);
+                }
+            }
 
             match self.cpu.step(&mut self.ram) {
                 StepResult::Ok => continue,
                 StepResult::Hlt => {
                     self.hlts += 1;
-                    // Idle. If a vector is already pending and enabled, take it.
+                    // Idle. Deliver an eligible pending interrupt, or fast-forward
+                    // the armed timer to its next fire and deliver that.
                     if self.cpu.flag(IF) {
-                        if self.cpu.dev.apic.pending_vector.is_some() {
-                            self.service_pending_irq();
+                        if self.service_pending_irq() {
                             continue;
                         }
-                        // Fast-forward an armed one-shot/periodic timer to wake.
-                        if self.cpu.dev.apic.expire().is_some() {
-                            self.service_pending_irq();
+                        if self.cpu.dev.apic.expire().is_some() && self.service_pending_irq() {
                             continue;
                         }
                     }
@@ -342,14 +351,23 @@ impl Machine {
         RunStop::MaxSteps
     }
 
-    /// If the APIC has a pending vector and interrupts are enabled, deliver it.
-    fn service_pending_irq(&mut self) {
-        if self.cpu.flag(IF) {
-            if let Some(vec) = self.cpu.dev.apic.pending_vector.take() {
+    /// Inject the highest-priority pending APIC interrupt if interrupts are
+    /// enabled (RFLAGS.IF) and its priority class outranks the current IRQL
+    /// (`v >> 4 > CR8`) — the x86-64 hardware delivery rule. Returns whether one
+    /// was delivered.
+    fn service_pending_irq(&mut self) -> bool {
+        if !self.cpu.flag(IF) {
+            return false;
+        }
+        if let Some(vec) = self.cpu.dev.apic.highest_pending() {
+            if (vec >> 4) as u64 > self.cpu.cr8 {
+                self.cpu.dev.apic.ack(vec);
                 self.cpu.deliver_interrupt(&mut self.ram, vec, None);
                 self.irqs_delivered += 1;
+                return true;
             }
         }
+        false
     }
 }
 
