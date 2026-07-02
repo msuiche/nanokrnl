@@ -195,6 +195,29 @@ pub extern "C" fn nanox_uart_write(byte: u8) {
     }
 }
 
+/// Pop one byte the guest wrote to the P9 transport (a 9P request), or -1 if
+/// none. The JS 9P server drains these, assembles a message, and replies via
+/// `nanox_p9_write`. See docs/9p-over-nanox.md.
+#[no_mangle]
+pub extern "C" fn nanox_p9_read() -> i32 {
+    unsafe {
+        match MACHINE.as_mut().and_then(|m| m.cpu.dev.p9.tx.pop_front()) {
+            Some(b) => b as i32,
+            None => -1,
+        }
+    }
+}
+
+/// Push one response byte for the guest to read from the P9 transport.
+#[no_mangle]
+pub extern "C" fn nanox_p9_write(byte: u8) {
+    unsafe {
+        if let Some(m) = MACHINE.as_mut() {
+            m.cpu.dev.p9.rx.push_back(byte);
+        }
+    }
+}
+
 /// Install a 64-bit interrupt gate (vector → handler) in the guest IDT.
 #[no_mangle]
 pub extern "C" fn nanox_set_idt_gate(vector: u8, handler: u64) {

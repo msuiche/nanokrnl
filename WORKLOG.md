@@ -233,3 +233,16 @@ at speed would need an x86-to-wasm JIT, a separate large project. The pitch:
 "Linux has WALI; Windows has nothing, because Windows has no open kernel to pass
 through to. nanokrnl is an open NT kernel in Rust that compiles to wasm, so it
 can be the thin Windows kernel interface for WebAssembly."
+
+### 2026-07-02 (later) - 9P milestone 1: the p9 transport device
+
+First step of the 9P plan (docs/9p-over-nanox.md). Added a `p9` transport device
+to nanox: a byte-stream MMIO device at 0xFED0_0000 modelled on the UART. It has a
+DATA register (a guest write appends to the tx queue, a guest read pops the rx
+queue) and a STATUS register (bit0 = a response byte is ready). 9P is
+self-framing (every message starts with a 4-byte length), so no packet
+boundaries are needed. The CPU memory path (load/store) intercepts the page
+right next to the APIC, and the host drives it through a new
+`nanox_p9_read`/`nanox_p9_write` wasm ABI (the same shape as the UART). Two tests
+cover it: a device-level loopback and a CPU-path MMIO round trip. Next milestones:
+the JS 9P2000.L server, then the kernel client `io/p9.rs`.

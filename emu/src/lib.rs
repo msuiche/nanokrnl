@@ -311,6 +311,9 @@ impl Cpu {
         if self.machine_mode && self.dev.is_apic_mmio(phys) {
             return Some(self.dev.apic_read(phys) & mask128(size) as u64);
         }
+        if self.machine_mode && self.dev.is_p9_mmio(phys) {
+            return Some(self.dev.p9_read(phys) & mask128(size) as u64);
+        }
         let a = phys as usize;
         let n = size as usize;
         if a + n > mem.len() {
@@ -329,6 +332,10 @@ impl Cpu {
         };
         if self.machine_mode && self.dev.is_apic_mmio(phys) {
             self.dev.apic_write(phys, val);
+            return true;
+        }
+        if self.machine_mode && self.dev.is_p9_mmio(phys) {
+            self.dev.p9_write(phys, val);
             return true;
         }
         let a = phys as usize;
@@ -2803,6 +2810,22 @@ impl Cpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn p9_mmio_via_cpu() {
+        // Drive the P9 transport through the real CPU memory path (store/load),
+        // proving the MMIO interception, not just the device methods.
+        let mut m = crate::machine::Machine::new(16 * 1024 * 1024);
+        m.boot_long_mode(0x1000, 0x10_0000); // identity paging, ring 0
+        assert!(m.cpu.store(&mut m.ram, 0xFED0_0000, 0x41, 1));
+        assert!(m.cpu.store(&mut m.ram, 0xFED0_0000, 0x42, 1));
+        assert_eq!(m.cpu.dev.p9.tx.pop_front(), Some(0x41));
+        assert_eq!(m.cpu.dev.p9.tx.pop_front(), Some(0x42));
+        m.cpu.dev.p9.rx.push_back(0x99);
+        assert_eq!(m.cpu.load(&m.ram, 0xFED0_0004, 1), Some(1)); // STATUS: ready
+        assert_eq!(m.cpu.load(&m.ram, 0xFED0_0000, 1), Some(0x99)); // DATA
+        assert_eq!(m.cpu.load(&m.ram, 0xFED0_0004, 1), Some(0)); // drained
+    }
 
     #[test]
     fn alu_reg() {

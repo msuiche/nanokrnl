@@ -247,17 +247,35 @@ impl Ps2 {
     }
 }
 
+/// Host-filesystem transport (9P). MMIO byte stream: the guest writes a framed
+/// 9P T-message to the DATA register (queued in `tx`), the host drains it, serves
+/// it, and pushes the R-message back (into `rx`) for the guest to read. 9P is
+/// self-framing (every message starts with a 4-byte length), so a byte stream
+/// with no packet boundaries is enough. See docs/9p-over-nanox.md.
+pub const P9_BASE: u64 = 0xFED0_0000;
+pub const P9_SIZE: u64 = 0x1000;
+// Register offsets within the P9 MMIO page.
+const P9_DATA: u64 = 0x00; // write: push a byte to tx; read: pop a byte from rx
+const P9_STATUS: u64 = 0x04; // read: bit0 = rx has data
+
+#[derive(Default, Clone)]
+pub struct P9 {
+    pub tx: VecDeque<u8>, // guest -> host (requests)
+    pub rx: VecDeque<u8>, // host -> guest (responses)
+}
+
 /// The whole device set, owned by the machine.
 #[derive(Clone)]
 pub struct Devices {
     pub uart: Uart,
     pub apic: Apic,
     pub ps2: Ps2,
+    pub p9: P9,
 }
 
 impl Default for Devices {
     fn default() -> Self {
-        Devices { uart: Uart::new(), apic: Apic::new(), ps2: Ps2::new() }
+        Devices { uart: Uart::new(), apic: Apic::new(), ps2: Ps2::new(), p9: P9::default() }
     }
 }
 
@@ -297,6 +315,26 @@ impl Devices {
     }
     pub fn apic_write(&mut self, phys: u64, val: u64) {
         self.apic.write(phys - APIC_BASE, val as u32);
+    }
+
+    /// `true` if a physical address falls in the P9 transport MMIO page.
+    pub fn is_p9_mmio(&self, phys: u64) -> bool {
+        (P9_BASE..P9_BASE + P9_SIZE).contains(&phys)
+    }
+    /// Guest MMIO read: DATA pops the next response byte (0 if none); STATUS
+    /// returns bit0 = a response byte is available.
+    pub fn p9_read(&mut self, phys: u64) -> u64 {
+        match phys - P9_BASE {
+            P9_DATA => self.p9.rx.pop_front().unwrap_or(0) as u64,
+            P9_STATUS => u64::from(!self.p9.rx.is_empty()),
+            _ => 0,
+        }
+    }
+    /// Guest MMIO write: DATA appends a request byte to the transmit stream.
+    pub fn p9_write(&mut self, phys: u64, val: u64) {
+        if phys - P9_BASE == P9_DATA {
+            self.p9.tx.push_back(val as u8);
+        }
     }
 }
 
@@ -368,5 +406,23 @@ mod tests {
     fn unknown_port_floats_high() {
         let mut d = Devices::new();
         assert_eq!(d.port_in(0xCFC, 4), 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn p9_loopback() {
+        let mut d = Devices::new();
+        assert!(d.is_p9_mmio(P9_BASE));
+        assert!(!d.is_p9_mmio(P9_BASE + P9_SIZE));
+        assert_eq!(d.p9_read(P9_BASE + P9_STATUS) & 1, 0); // nothing to read yet
+        // Guest writes a two-byte request to DATA; the host sees it on tx.
+        d.p9_write(P9_BASE + P9_DATA, 0x41);
+        d.p9_write(P9_BASE + P9_DATA, 0x42);
+        assert_eq!(d.p9.tx.pop_front(), Some(0x41));
+        assert_eq!(d.p9.tx.pop_front(), Some(0x42));
+        // Host pushes a response; the guest reads it back through DATA.
+        d.p9.rx.push_back(0x99);
+        assert_eq!(d.p9_read(P9_BASE + P9_STATUS) & 1, 1);
+        assert_eq!(d.p9_read(P9_BASE + P9_DATA), 0x99);
+        assert_eq!(d.p9_read(P9_BASE + P9_STATUS) & 1, 0); // drained
     }
 }
