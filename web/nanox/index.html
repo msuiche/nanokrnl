@@ -600,19 +600,30 @@
       } catch {}
     }
     if (tracks.length) {
-      lcdTrack.textContent = tracks.length + " track(s)"; renderList(); autoplay();
+      lcdTrack.textContent = tracks.length + " track(s)"; renderList();
       // Warm the module decoder now (idle time) so it's ready before interaction.
       if (tracks.some((t) => MOD_EXT.test(t))) initChip();
     } else lcdTrack.textContent = "no tracks in tracks/";
   })();
 
-  // Autoplay the first track. Browsers gate audio behind a user gesture, so we
-  // attempt right away and also (re)start/resume on the first interaction with
-  // the page (the Boot click, a keypress, any click), so no need to press Play.
-  function autoplay() { if (tracks.length && cur < 0) play(0); }
-  const resumeAudio = () => { if (actx) actx.resume(); autoplay(); };
-  document.addEventListener("pointerdown", resumeAudio, { once: true });
-  document.addEventListener("keydown", resumeAudio, { once: true });
+  // Autoplay: browsers require a user gesture before any audio, so we start on
+  // the first interaction with the page (the Boot click, a keypress, any click).
+  // We do NOT touch audio at load: creating/resuming an AudioContext before a
+  // gesture leaves it suspended, and priming the module into a suspended worklet
+  // then just resuming it does not reliably start playback. Instead we run the
+  // exact same play(0) the Play button does, into a now-live context.
+  let autoStarted = false;
+  function kickstart() {
+    if (autoStarted || !tracks.length) return;
+    autoStarted = true;
+    setupAudioGraph();
+    if (actx.state === "suspended") actx.resume();
+    if (cur < 0) play(0);
+    else if (modActive && chip) chip.unpause();
+    else if (audio.paused) audio.play().catch(() => {});
+  }
+  document.addEventListener("pointerdown", kickstart, { once: true });
+  document.addEventListener("keydown", kickstart, { once: true });
 })();
 </script>
 
