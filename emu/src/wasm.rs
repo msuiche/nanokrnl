@@ -119,6 +119,19 @@ pub extern "C" fn nanox_boot_kernel() -> u32 {
     }
 }
 
+/// Restore a `Machine::snapshot()` blob staged via `nanox_image_alloc`, resuming
+/// the guest at the state it was captured in (e.g. right at the `C:\>` prompt),
+/// with no boot. Returns 1 on success, 0 on a bad blob or RAM-size mismatch.
+#[no_mangle]
+pub extern "C" fn nanox_restore() -> u32 {
+    unsafe {
+        let (Some(m), Some(img)) = (MACHINE.as_mut(), IMAGE.as_ref()) else {
+            return 0;
+        };
+        if m.restore(img) { 1 } else { 0 }
+    }
+}
+
 /// Boot at an explicit entry (for raw, already-staged code).
 #[no_mangle]
 pub extern "C" fn nanox_boot(entry: u64, rsp: u64) {

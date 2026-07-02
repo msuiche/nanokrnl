@@ -26,9 +26,9 @@ pub struct Uart {
     pub tx: VecDeque<u8>,
     /// Bytes the host queued from the terminal for the guest to read.
     pub rx: VecDeque<u8>,
-    ier: u8,
-    lcr: u8,
-    mcr: u8,
+    pub(crate) ier: u8,
+    pub(crate) lcr: u8,
+    pub(crate) mcr: u8,
 }
 
 // 16550 register offsets from the base port.
@@ -227,7 +227,7 @@ impl Apic {
 /// PS/2 keyboard controller (8042), data port 0x60 / status+command port 0x64.
 #[derive(Default, Clone)]
 pub struct Ps2 {
-    queue: VecDeque<u8>,
+    pub(crate) queue: VecDeque<u8>,
 }
 const PS2_STATUS_OBF: u8 = 1 << 0; // output buffer full (a byte is readable at 0x60)
 

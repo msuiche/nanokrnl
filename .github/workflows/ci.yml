@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# The emulator (nanox, in emu/) builds from a clean checkout and is what CI
+# guards. The kernel itself is intentionally not built here: its image embeds
+# third-party Microsoft binaries (winbin/, gitignored), so it cannot be built
+# from a fresh clone. The instruction-level differential (diff_unicorn /
+# diff_trace, feature "oracle") needs cmake + Unicorn and a kernel image, so it
+# stays a local gate; see emu/examples/.
+jobs:
+  nanox:
+    name: nanox (build, test, wasm)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: emu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - name: Unit tests (decoder + machine)
+        run: cargo test --release
+      - name: Build nanox.wasm (wasm32, no_std)
+        run: cargo build --release --target wasm32-unknown-unknown
+      - name: Clippy (advisory)
+        continue-on-error: true
+        run: cargo clippy --release

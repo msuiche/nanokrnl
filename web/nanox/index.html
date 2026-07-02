@@ -640,6 +640,16 @@ async function fetchBytes(url) {
 const wasmBytes = await fetchBytes("nanox.wasm");
 let kernelBytes = null, kernelErr = "";
 try { kernelBytes = await fetchBytes("kernel.bin"); } catch (err) { kernelErr = err.message; }
+// Optional boot-to-prompt snapshot (gzipped): if present, resume from it for an
+// instant C:\> instead of interpreting the whole boot. Gunzipped in-browser.
+let snapshotBytes = null;
+try {
+  const r = await fetch("snapshot.bin.gz", { cache: "no-store" });
+  if (r.ok && "DecompressionStream" in window) {
+    const stream = r.body.pipeThrough(new DecompressionStream("gzip"));
+    snapshotBytes = new Uint8Array(await new Response(stream).arrayBuffer());
+  }
+} catch {}
 
 let e = null, running = false, raf = 0;
 let term = "";          // the console text buffer
@@ -795,6 +805,32 @@ async function boot(image) {
   running = true; refreshButtons(); screen.focus();
   loop();
 }
+
+// Resume from a boot-to-prompt snapshot: no interpreted boot, straight to C:\>.
+async function resume(snap) {
+  stop();
+  term = ""; col = 0; screen.textContent = ""; perFrame = 500_000;  // interactive at once
+  insAccum = 0; statsT0 = performance.now();
+  setStatus("boot", "restoring…");
+  const inst = (await WebAssembly.instantiate(wasmBytes, {})).instance;
+  e = inst.exports;
+  e.nanox_new(128);
+  const ptr = e.nanox_image_alloc(snap.length);
+  new Uint8Array(e.memory.buffer, ptr, snap.length).set(snap);
+  if (e.nanox_restore() !== 1) { setStatus("stop", "snapshot restore failed"); return; }
+  running = true; refreshButtons(); screen.focus();
+  setStatus("run", "running · interactive");
+  e.nanox_uart_write(13);   // nudge the shell to redraw its C:\> prompt
+  loop();
+}
+
+// Boot the machine: resume the snapshot if present (instant), else interpret
+// the full boot from the kernel image.
+function start() {
+  if (snapshotBytes) { resume(snapshotBytes); return; }
+  if (kernelBytes) { boot(kernelBytes); return; }
+  setStatus("stop", kernelErr ? ("kernel fetch failed: " + kernelErr) : "kernel image not found; run emu/build-wasm.sh");
+}
 function stop() { running = false; if (raf) cancelAnimationFrame(raf); raf = 0; }
 function refreshButtons() {
   btnBoot.disabled = running;
@@ -802,11 +838,8 @@ function refreshButtons() {
   btnShutdown.disabled = !running;
 }
 
-btnBoot.onclick = () => {
-  if (!kernelBytes) { setStatus("stop", kernelErr ? ("kernel fetch failed: " + kernelErr) : "kernel image not found; run emu/build-wasm.sh"); return; }
-  boot(kernelBytes);
-};
-btnRestart.onclick = () => kernelBytes && boot(kernelBytes);
+btnBoot.onclick = start;
+btnRestart.onclick = start;
 btnShutdown.onclick = () => { stop(); setStatus("stop", "halted by user"); refreshButtons(); term += "\n[machine powered off]\n"; render(); };
 document.getElementById("winclose").onclick = () => { if (running) btnShutdown.click(); };
 
@@ -821,7 +854,7 @@ screen.addEventListener("keydown", (ev) => {
   if (s !== null) { for (const ch of s) e.nanox_uart_write(ch.charCodeAt(0)); ev.preventDefault(); }
 });
 
-setStatus("stop", kernelBytes ? "ready, click Boot" : "no kernel image staged");
+setStatus("stop", snapshotBytes ? "ready, click Boot (instant resume)" : kernelBytes ? "ready, click Boot" : "no kernel image staged");
 </script>
 </body>
 </html>

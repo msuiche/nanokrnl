@@ -150,3 +150,86 @@ through the shipped `web/nanox` wasm; boot self-tests still pass.
 - Also fixed a web-console rendering bug: the terminal ignored carriage returns,
   so `more.com`'s line-clearing (spaces + `\r`) left stray leading whitespace.
   The console now honors `\r` as "cursor to column 0, overwrite."
+
+### 2026-07-02 - hardening pass now that nanokrnl is a live HTTP demo
+
+The kernel now serves as a plain HTTP site (web/nanox), booting under nanox in
+the browser. This pass improves boot time, correctness, packaging, and sets up
+the two "beyond the demo" directions with their own design docs.
+
+**1. Instant boot via snapshot.** Interpreting the whole boot (self tests
+included) costs millions of guest instructions before `C:\>`. Since a machine is
+just RAM plus CPU/device state, we now capture it once and resume. Added
+`Machine::snapshot()` / `restore()` (machine.rs): a self-describing blob of the
+CPU registers, XMM, paging, segment/MSR state, IDTR/GDTR, the device set (UART,
+APIC, PS/2 queues), and only the non-zero 4 KiB RAM pages. A native tool
+(`emu/examples/snapshot.rs`) boots to the prompt and dumps it; `build-wasm.sh`
+gzips it to `web/nanox/snapshot.bin.gz`; the page gunzips it with
+`DecompressionStream` and calls the new `nanox_restore` ABI, then nudges the
+shell with a CR so the prompt redraws. If the snapshot is absent it falls back to
+a normal boot. Result: 4.1 MiB raw, 898 KiB gzipped (smaller than the libopenmpt
+we already ship), and boot becomes instant. Verified natively and through the
+shipped wasm (restore -> `ver` prints the version banner).
+
+**2. Ship the release kernel.** `build-wasm.sh` staged the debug kernel (4.4 MB,
+many more guest instructions to boot). It now prefers
+`target/x86_64-unknown-none/release/kernel` (2.5 MB), which is smaller and
+reaches the prompt in far fewer instructions.
+
+**3. LICENSE.** Added MIT (c) Matt Suiche, plus a third-party note: the Microsoft
+binaries embedded in the kernel image remain Microsoft's, and libopenmpt
+(BSD-3) and the ASCII background are bundled.
+
+**4. mul/imul CF/OF.** nanox computed the product but never set CF/OF for the
+one-operand `mul`/`imul` (F6/F7 /4/5) or the two/three-operand `imul`
+(0x69/0x6B/0x0F AF). Implemented the x86 rule (CF=OF set when the upper half is
+significant, or the result is not the sign-extension of the low half).
+`diff_unicorn` over the kernel now shows the CF/OF divergences gone; the only
+residual flag differences are architecturally *undefined* bits (PF after
+`mul`/`imul`, OF after a multi-bit shift/rotate), which programs must not rely
+on. Shift/rotate OF was already correct at count 1.
+
+**5. CI.** Added `.github/workflows/ci.yml`: builds nanox, runs the decoder and
+machine unit tests, builds `nanox.wasm` (wasm32, no_std), and runs clippy. The
+kernel itself is not built in CI because its image embeds gitignored Microsoft
+binaries; the Unicorn differential (feature `oracle`) needs cmake plus a kernel
+image, so it stays a local gate.
+
+**6. 9P host filesystem (design: `docs/9p-over-nanox.md`).** The reasoning: today
+files come from an in-kernel RAM filesystem baked into the image, so the demo
+can only ever see what was compiled in. 9P (the Plan 9 protocol Linux exposes as
+v9fs, and what QEMU's virtfs uses) is the minimal, well-worn way to let a *host*
+serve files to a guest. The plan is a small `p9` transport device in nanox
+(byte FIFOs, like the UART, since 9P is self-framing), a 9P2000.L client in the
+kernel (`io/p9.rs`: version/attach/walk/lopen/getattr/read over a doorbell), and
+a few-hundred-line 9P server in JavaScript. The one real design decision is that
+a browser page cannot read the host disk directly, so the server's backing store
+is one of `fetch` of bundled files, an in-memory object, `<input type=file>` /
+drag-drop, the File System Access API (real host folder, Chromium, permissioned),
+or OPFS; all but the in-memory case are async, which is why the transport is the
+cooperative yield design rather than a synchronous import. Wiring a `\\host\`
+prefix into `nt_create_file` then makes `more \\host\notes.txt` read a live host
+file with no kernel rebuild. It is exactly the v9fs client role, over a
+browser-shaped transport.
+
+**7. WANI, a WebAssembly NT Interface (design: `docs/wani-webassembly-nt-interface.md`).**
+The reasoning, and why it is the genuinely novel direction: WALI (EuroSys 2025)
+exposes a kernel's userspace syscall layer to wasm so recompiled programs run
+sandboxed and ISA-portable; crucially it is a thin *passthrough* to a real host
+kernel (they did Linux and Zephyr). Agent sandboxes and microVMs (Firecracker
+and friends) are all Linux for this reason. Windows is the gap, and it is a hard
+one: in a sandbox there is no Windows kernel underneath to pass through to, so a
+Windows thin interface cannot be a passthrough. Someone has to actually
+*implement* the NT services, and that from-scratch NT implementation is precisely
+what nanokrnl already is, in Rust, compiling to wasm. So WANI is WALI's layering
+with one box swapped: recompiled program -> Win32/CRT personality (the existing
+kernel32/msvcrt/ulib shims) -> a small `Nt*` import ABI -> nanokrnl's NT services
+in wasm -> host for raw memory/time/IO. The honest limitation, spelled out in the
+doc: like WALI, this runs only programs recompiled to wasm, not existing
+closed-source PEs, so it is a portable sandboxed runtime with an NT personality,
+not a Windows-compatibility layer; that scope is identical to Linux WALI, not
+worse. Running unmodified PEs stays nanox's job (x86 emulation), and doing that
+at speed would need an x86-to-wasm JIT, a separate large project. The pitch:
+"Linux has WALI; Windows has nothing, because Windows has no open kernel to pass
+through to. nanokrnl is an open NT kernel in Rust that compiles to wasm, so it
+can be the thin Windows kernel interface for WebAssembly."

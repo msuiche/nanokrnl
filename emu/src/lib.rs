@@ -812,8 +812,14 @@ impl Cpu {
                     pc += 4;
                     v
                 };
-                let prod = (sign_ext(src, size) as i128 * imm as i128) as u64;
+                let full = sign_ext(src, size) as i128 * imm as i128;
+                let prod = full as u64;
                 self.regs[reg] = if size == 4 { prod & 0xFFFF_FFFF } else { prod };
+                // CF=OF when the true product does not fit in the destination.
+                let lo = sign_ext((full as u128 & mask128(size)) as u64, size) as i128;
+                let ovf = full != lo;
+                self.set_flag(CF, ovf);
+                self.set_flag(OF, ovf);
                 self.rip = pc as u64;
                 StepResult::Ok
             }
@@ -1091,14 +1097,20 @@ impl Cpu {
                         }
                     }
                     4 | 5 => {
-                        // mul/imul: AX = AL * r/m8
+                        // mul/imul: AX = AL * r/m8. CF=OF is set when the result
+                        // does not fit in AL: the high byte is significant (mul),
+                        // or AX is not the sign-extension of AL (imul).
                         let al = self.regs[RAX] & 0xff;
-                        let prod = if sub & 7 == 4 {
-                            (al * a) & 0xffff
+                        let (prod, ovf) = if sub & 7 == 4 {
+                            let p = (al * a) & 0xffff;
+                            (p, p >> 8 != 0)
                         } else {
-                            (((al as i8 as i64) * (a as i8 as i64)) as u64) & 0xffff
+                            let p = (((al as i8 as i64) * (a as i8 as i64)) as u64) & 0xffff;
+                            (p, (p as u8 as i8 as i16) != p as u16 as i16)
                         };
                         self.regs[RAX] = (self.regs[RAX] & !0xffff) | prod;
+                        self.set_flag(CF, ovf);
+                        self.set_flag(OF, ovf);
                     }
                     6 | 7 => {
                         // div/idiv: AL = AX / r/m8, AH = AX % r/m8
@@ -1152,13 +1164,19 @@ impl Cpu {
                         }
                     }
                     4 | 5 => {
-                        // mul/imul: rdx:rax = rax * r/m
-                        let prod: u128 = if sub & 7 == 4 {
-                            (self.regs[RAX] as u128 & mask128(size)) * (a as u128 & mask128(size))
+                        // mul/imul: rdx:rax = rax * r/m. CF=OF is set when the
+                        // upper half is significant (mul) or the product is not
+                        // the sign-extension of the lower half (imul).
+                        let bits = size as u32 * 8;
+                        let (prod, ovf): (u128, bool) = if sub & 7 == 4 {
+                            let p = (self.regs[RAX] as u128 & mask128(size)) * (a as u128 & mask128(size));
+                            (p, p >> bits != 0)
                         } else {
                             let x = sign_ext(self.regs[RAX], size) as i128;
                             let y = sign_ext(a, size) as i128;
-                            (x * y) as u128
+                            let full = x * y;
+                            let lo = sign_ext((full as u128 & mask128(size)) as u64, size) as i128;
+                            (full as u128, full != lo)
                         };
                         if size == 4 {
                             self.regs[RAX] = (prod as u64) & 0xFFFF_FFFF;
@@ -1167,6 +1185,8 @@ impl Cpu {
                             self.regs[RAX] = prod as u64;
                             self.regs[RDX] = (prod >> 64) as u64;
                         }
+                        self.set_flag(CF, ovf);
+                        self.set_flag(OF, ovf);
                     }
                     6 | 7 => {
                         // div/idiv: dividend is (RDX:RAX) at the operand width
@@ -2097,8 +2117,14 @@ impl Cpu {
                         };
                         let a = sign_ext(self.regs[reg], size) as i128;
                         let bb = sign_ext(src, size) as i128;
-                        let prod = (a * bb) as u64;
+                        let full = a * bb;
+                        let prod = full as u64;
                         self.regs[reg] = if size == 4 { prod & 0xFFFF_FFFF } else { prod };
+                        // CF=OF when the true product does not fit in the result.
+                        let lo = sign_ext((full as u128 & mask128(size)) as u64, size) as i128;
+                        let ovf = full != lo;
+                        self.set_flag(CF, ovf);
+                        self.set_flag(OF, ovf);
                         self.rip = pc as u64;
                         StepResult::Ok
                     }

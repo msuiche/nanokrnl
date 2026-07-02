@@ -17,11 +17,28 @@ cp target/wasm32-unknown-unknown/release/nanox.wasm "$OUT/nanox.wasm"
 ls -lh "$OUT/nanox.wasm"
 
 # Stage the kernel ELF so the page can boot it directly (no BIOS image needed).
-KERNEL=../target/x86_64-unknown-none/debug/kernel
+# Prefer the release build: it is smaller and reaches the prompt in far fewer
+# guest instructions, so the interpreter boots much faster.
+#   cargo build -p kernel --features interactive --release --target x86_64-unknown-none
+KERNEL=../target/x86_64-unknown-none/release/kernel
+[ -f "$KERNEL" ] || KERNEL=../target/x86_64-unknown-none/debug/kernel
 if [ -f "$KERNEL" ]; then
   cp "$KERNEL" "$OUT/kernel.bin"
+  echo "staged kernel: $KERNEL"
   ls -lh "$OUT/kernel.bin"
+
+  # Capture a boot-to-prompt snapshot so the page can resume at C:\> instantly
+  # instead of interpreting the whole boot. Gzip it (the page gunzips via
+  # DecompressionStream). Falls back to a normal boot if this step is skipped.
+  echo "generating boot snapshot..."
+  if cargo run --release --example snapshot -- "$KERNEL" "$OUT/snapshot.bin"; then
+    gzip -9 -f "$OUT/snapshot.bin"
+    ls -lh "$OUT/snapshot.bin.gz"
+  else
+    echo "note: snapshot generation failed; the page will boot normally"
+    rm -f "$OUT/snapshot.bin" "$OUT/snapshot.bin.gz"
+  fi
 else
-  echo "note: kernel ELF not found ($KERNEL); build it to enable in-browser boot"
+  echo "note: kernel ELF not found; build it first (see the command above)"
 fi
 echo "staged $OUT — serve web/nanox/ and open it"

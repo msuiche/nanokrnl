@@ -366,6 +366,112 @@ impl Machine {
         RunStop::MaxSteps
     }
 
+    /// Serialize the whole machine (CPU + devices + non-zero RAM pages) into a
+    /// self-describing blob. Booting the kernel to the prompt takes millions of
+    /// interpreted instructions; capturing the state once and shipping it lets
+    /// the page resume at `C:\>` instantly. Zero RAM pages are omitted, so the
+    /// blob is roughly "touched memory" plus a few hundred bytes of registers.
+    pub fn snapshot(&self) -> Vec<u8> {
+        let mut o = Vec::new();
+        let c = &self.cpu;
+        o.extend_from_slice(b"NXS1");
+        let p8 = |o: &mut Vec<u8>, v: u8| o.push(v);
+        let p16 = |o: &mut Vec<u8>, v: u16| o.extend_from_slice(&v.to_le_bytes());
+        let p32 = |o: &mut Vec<u8>, v: u32| o.extend_from_slice(&v.to_le_bytes());
+        let p64 = |o: &mut Vec<u8>, v: u64| o.extend_from_slice(&v.to_le_bytes());
+        let p128 = |o: &mut Vec<u8>, v: u128| o.extend_from_slice(&v.to_le_bytes());
+        let pq = |o: &mut Vec<u8>, q: &alloc::collections::VecDeque<u8>| {
+            o.extend_from_slice(&(q.len() as u32).to_le_bytes());
+            for &b in q { o.push(b); }
+        };
+        p32(&mut o, self.ram.len() as u32);
+        for &r in &c.regs { p64(&mut o, r); }
+        p64(&mut o, c.rip); p64(&mut o, c.rflags);
+        p64(&mut o, c.gs_base); p64(&mut o, c.fs_base);
+        for &x in &c.xmm { p128(&mut o, x); }
+        p64(&mut o, c.paging.cr0); p64(&mut o, c.paging.cr3);
+        p64(&mut o, c.paging.cr4); p64(&mut o, c.paging.efer);
+        p64(&mut o, c.cr2); p64(&mut o, c.cr8); p8(&mut o, c.cpl);
+        p64(&mut o, c.idtr_base); p16(&mut o, c.idtr_limit);
+        p64(&mut o, c.gdtr_base); p16(&mut o, c.gdtr_limit);
+        p64(&mut o, c.star); p64(&mut o, c.lstar); p64(&mut o, c.sfmask);
+        p64(&mut o, c.kernel_gs_base); p64(&mut o, c.tss_rsp0);
+        p64(&mut o, c.tr_base); p64(&mut o, c.icount);
+        // devices
+        pq(&mut o, &c.dev.uart.tx); pq(&mut o, &c.dev.uart.rx);
+        p8(&mut o, c.dev.uart.ier); p8(&mut o, c.dev.uart.lcr); p8(&mut o, c.dev.uart.mcr);
+        let a = &c.dev.apic;
+        for v in [a.id, a.svr, a.tpr, a.lvt_timer, a.initial_count, a.current_count, a.divide_config] {
+            p32(&mut o, v);
+        }
+        for &v in &a.irr { p64(&mut o, v); }
+        pq(&mut o, &c.dev.ps2.queue);
+        // non-zero RAM pages: count, then (index, 4096 bytes) each.
+        let pages = self.ram.len() / 4096;
+        let mut count = 0u32;
+        let count_pos = o.len();
+        p32(&mut o, 0);
+        for i in 0..pages {
+            let page = &self.ram[i * 4096..(i + 1) * 4096];
+            if page.iter().any(|&b| b != 0) {
+                p32(&mut o, i as u32);
+                o.extend_from_slice(page);
+                count += 1;
+            }
+        }
+        o[count_pos..count_pos + 4].copy_from_slice(&count.to_le_bytes());
+        o
+    }
+
+    /// Restore a machine from a `snapshot()` blob. Returns false on a bad blob or
+    /// a RAM-size mismatch. The device queues, registers, paging, and touched
+    /// RAM are reinstated; the machine is left in `machine_mode`, ready to `run`.
+    pub fn restore(&mut self, blob: &[u8]) -> bool {
+        if blob.len() < 8 || &blob[0..4] != b"NXS1" { return false; }
+        let mut c = &blob[4..];
+        let g8 = |c: &mut &[u8]| -> u8 { let v = c[0]; *c = &c[1..]; v };
+        let g16 = |c: &mut &[u8]| -> u16 { let (a, b) = c.split_at(2); *c = b; u16::from_le_bytes(a.try_into().unwrap()) };
+        let g32 = |c: &mut &[u8]| -> u32 { let (a, b) = c.split_at(4); *c = b; u32::from_le_bytes(a.try_into().unwrap()) };
+        let g64 = |c: &mut &[u8]| -> u64 { let (a, b) = c.split_at(8); *c = b; u64::from_le_bytes(a.try_into().unwrap()) };
+        let g128 = |c: &mut &[u8]| -> u128 { let (a, b) = c.split_at(16); *c = b; u128::from_le_bytes(a.try_into().unwrap()) };
+        let gq = |c: &mut &[u8], q: &mut alloc::collections::VecDeque<u8>| {
+            q.clear();
+            let n = g32(c) as usize;
+            for _ in 0..n { q.push_back(g8(c)); }
+        };
+        let ram_len = g32(&mut c) as usize;
+        if ram_len != self.ram.len() { return false; }
+        for i in 0..16 { self.cpu.regs[i] = g64(&mut c); }
+        self.cpu.rip = g64(&mut c); self.cpu.rflags = g64(&mut c);
+        self.cpu.gs_base = g64(&mut c); self.cpu.fs_base = g64(&mut c);
+        for i in 0..16 { self.cpu.xmm[i] = g128(&mut c); }
+        self.cpu.paging.cr0 = g64(&mut c); self.cpu.paging.cr3 = g64(&mut c);
+        self.cpu.paging.cr4 = g64(&mut c); self.cpu.paging.efer = g64(&mut c);
+        self.cpu.cr2 = g64(&mut c); self.cpu.cr8 = g64(&mut c); self.cpu.cpl = g8(&mut c);
+        self.cpu.idtr_base = g64(&mut c); self.cpu.idtr_limit = g16(&mut c);
+        self.cpu.gdtr_base = g64(&mut c); self.cpu.gdtr_limit = g16(&mut c);
+        self.cpu.star = g64(&mut c); self.cpu.lstar = g64(&mut c); self.cpu.sfmask = g64(&mut c);
+        self.cpu.kernel_gs_base = g64(&mut c); self.cpu.tss_rsp0 = g64(&mut c);
+        self.cpu.tr_base = g64(&mut c); self.cpu.icount = g64(&mut c);
+        gq(&mut c, &mut self.cpu.dev.uart.tx); gq(&mut c, &mut self.cpu.dev.uart.rx);
+        self.cpu.dev.uart.ier = g8(&mut c); self.cpu.dev.uart.lcr = g8(&mut c); self.cpu.dev.uart.mcr = g8(&mut c);
+        let a = &mut self.cpu.dev.apic;
+        a.id = g32(&mut c); a.svr = g32(&mut c); a.tpr = g32(&mut c); a.lvt_timer = g32(&mut c);
+        a.initial_count = g32(&mut c); a.current_count = g32(&mut c); a.divide_config = g32(&mut c);
+        for i in 0..4 { a.irr[i] = g64(&mut c); }
+        gq(&mut c, &mut self.cpu.dev.ps2.queue);
+        for b in self.ram.iter_mut() { *b = 0; }
+        let count = g32(&mut c);
+        for _ in 0..count {
+            let idx = g32(&mut c) as usize * 4096;
+            if idx + 4096 > self.ram.len() { return false; }
+            self.ram[idx..idx + 4096].copy_from_slice(&c[..4096]);
+            c = &c[4096..];
+        }
+        self.cpu.machine_mode = true;
+        true
+    }
+
     /// Inject the highest-priority pending APIC interrupt if interrupts are
     /// enabled (RFLAGS.IF) and its priority class outranks the current IRQL
     /// (`v >> 4 > CR8`) — the x86-64 hardware delivery rule. Returns whether one
