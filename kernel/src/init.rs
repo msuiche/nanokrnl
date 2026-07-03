@@ -369,6 +369,50 @@ fn set_cmdline(t: *mut ps::Ethread, cmdline: &'static str) {
     }
 }
 
+/// The bare executable name inside a command line: the first whitespace-delimited
+/// token, then the path component after the last `\` or `/`. `C:\cmd.exe /c dir`
+/// -> `cmd.exe`.
+fn exe_basename(cmdline: &[u8]) -> &[u8] {
+    let end = cmdline.iter().position(|&b| b == b' ').unwrap_or(cmdline.len());
+    let token = &cmdline[..end];
+    let start = token
+        .iter()
+        .rposition(|&b| b == b'\\' || b == b'/')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    &token[start..]
+}
+
+/// Publish the kernel-debugger view of the system: the loaded-module list and
+/// the active-process list, plus `KdDebuggerDataBlock`. Called just before a
+/// crash dump so the core carries a coherent snapshot a Windows debugger can
+/// walk (`lm`, `!process 0 0`). See [`crate::kd`].
+pub fn kd_snapshot() {
+    use crate::kd;
+    kd::begin();
+    // The kernel itself first — its base becomes KernBase and a debugger loads
+    // ntoskrnl's (our DWARF) symbols against it. ~0x290000 covers the image.
+    kd::push_module(kd::KERNEL_VIRT_BASE, 0x0029_0000, b"ntoskrnl.exe");
+    // The user-mode modules the debug tracker knows about (kernel32/msvcrt/… and
+    // the running program image).
+    crate::ke::debug::for_each_module(|name, base, size| {
+        kd::push_module(base, size, name.as_bytes());
+    });
+    // Active processes, from the process table.
+    let tbl = PROC_TABLE.lock();
+    let mut pid = 4u64;
+    for e in tbl.iter() {
+        if !e.in_use || e.ethread == 0 {
+            continue;
+        }
+        let cr3 = unsafe { (*(e.ethread as *const ps::Ethread)).tcb.cr3 };
+        kd::push_process(pid, cr3, 0, exe_basename(&e.cmdline[..e.cmdline_len]));
+        pid += 4;
+    }
+    drop(tbl);
+    kd::commit();
+}
+
 // ---------------------------------------------------------------------------
 // Process creation (the CreateProcess primitive).
 //

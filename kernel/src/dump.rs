@@ -188,6 +188,10 @@ fn note(out: &mut Vec<u8>, name: &str, ntype: u32, desc: &[u8]) {
 /// success, or `None` if the host 9P server is absent/failed. Safe to call at
 /// bugcheck IRQL: it only does port I/O + reads of physical memory.
 pub fn write_core(bugcheck: u32, params: &[u64; 4]) -> Option<u64> {
+    // Publish the kernel-debugger data (module + process lists +
+    // KdDebuggerDataBlock) so the captured image carries a coherent snapshot a
+    // Windows debugger can walk. Must run before we snapshot memory below.
+    crate::init::kd_snapshot();
     let g = capture();
 
     // Note segment: NT_PRSTATUS + VMCOREINFO.
@@ -197,6 +201,16 @@ pub fn write_core(bugcheck: u32, params: &[u64; 4]) -> Option<u64> {
     let _ = bugcheck;
     vci.extend_from_slice(b"OSRELEASE=nanokrnl-0.1.0\n");
     vci.extend_from_slice(b"PAGESIZE=4096\n");
+    // Record the debugger-data anchors so a tool can find them without symbols
+    // (the way a Windows debugger uses KdDebuggerDataBlock, but symbol-free).
+    let kdbg = &raw const crate::kd::KdDebuggerDataBlock as u64;
+    let mut anchors = alloc::format!(
+        "SYMBOL(KdDebuggerDataBlock)={:#x}\nSYMBOL(PsLoadedModuleList)={:#x}\nSYMBOL(PsActiveProcessHead)={:#x}\n",
+        kdbg,
+        &raw const crate::kd::PsLoadedModuleList as u64,
+        &raw const crate::kd::PsActiveProcessHead as u64,
+    );
+    vci.append(unsafe { anchors.as_mut_vec() });
     // Record the bugcheck for context (nanokrnl-specific keys).
     let mut line = alloc::format!(
         "BUGCHECK={:#010x}\nBUGCHECK_P1={:#x}\nBUGCHECK_P2={:#x}\nBUGCHECK_P3={:#x}\nBUGCHECK_P4={:#x}\n",

@@ -670,3 +670,37 @@ process exit. That is the same per-process-state root as the pipe blocker
 (per-process handle tables / DLL data), so it is deferred to that same focused
 rework rather than patched piecemeal. Source-only; deployed kernel.bin unchanged
 (readme is the only web change).
+
+### 2026-07-03 - Part IV: KDBG - real KDDEBUGGER_DATA64 + Ps*List for lm / !process
+
+Built the kernel-debugger view a Windows debugger expects, so `lm` and
+`!process 0 0` light up against nanokrnl's crash dump (new `kernel/src/kd.rs`):
+
+- A real `KDDEBUGGER_DATA64` (`KdDebuggerDataBlock`) with the `'KDBG'` tag,
+  `KernBase`, and pointers to the two lists.
+- `PsLoadedModuleList`: a circular `InLoadOrderLinks` ring of
+  `KLDR_DATA_TABLE_ENTRY` (DllBase / SizeOfImage / BaseDllName UNICODE_STRING),
+  built from the live module table (kernel first as `ntoskrnl.exe`, then
+  kernel32 / msvcrt / ntdll / the running image).
+- `PsActiveProcessHead`: a ring of `EPROCESS` (UniqueProcessId /
+  ActiveProcessLinks / DirectoryTableBase / ImageFileName) built from the process
+  table.
+
+Every field sits at its genuine NT offset. The block is populated by
+`init::kd_snapshot()` just before the ELF core is written, so the core carries a
+coherent snapshot; `write_core` also records `SYMBOL(KdDebuggerDataBlock)=...`
+(and the two list heads) in `VMCOREINFO` so a tool can anchor without symbols.
+The kernel is linked at 0 but mapped at `0xffff800000000000`, so a debugger
+loads `kernel.bin`'s DWARF at that base and the symbols resolve into the dump.
+
+Verified (no WinDbg on macOS) with a symbol-free WinDbg-equivalent walker,
+`tools/kdbg_check.py`, which reads the core, finds `KdDebuggerDataBlock`, checks
+the `'KDBG'` tag, and walks both rings. Output on a real crash core:
+
+    lm:        ntoskrnl.exe, cmd.exe, kernel32, msvcrt, ntdll (base..end each)
+    !process:  4 processes with Cid, DirBase, and ImageFileName
+
+Stack walks and symbols were already in place from Part III (the crash register
+set is in the `NT_PRSTATUS` note; `.debug_frame` CFI + `.debug_info` are in
+`kernel.bin`). 67/67 self-tests pass; the crash-dump path is unchanged in shape.
+This is the natural closer for the series; blog post next.

@@ -173,6 +173,17 @@ pub fn add_module(name: &'static str, base: u64, size: u64, is_lib: bool) {
     }
 }
 
+/// Invoke `f(name, base, size)` for each registered user-mode module (the shim
+/// libraries and the running program image). Used to publish `PsLoadedModuleList`
+/// for the kernel debugger.
+pub fn for_each_module(mut f: impl FnMut(&'static str, u64, u64)) {
+    let d = DBG.lock();
+    for i in 0..d.nmod {
+        let m = d.modules[i];
+        f(m.name, m.base, m.size);
+    }
+}
+
 /// Clear the module table (between debug sessions).
 pub fn clear_modules() {
     let mut d = DBG.lock();
