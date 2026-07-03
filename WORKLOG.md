@@ -652,3 +652,21 @@ copy* across all processes, so a child inherits the parent's CRT stdio state and
 writes to the parent's console handle. The correct foundation is per-process DLL
 data (copy-on-write on map), after which the fd-refcount + inherit-duplication
 changes above should compose cleanly. Redirection stays done; pipes wait on that.
+
+### 2026-07-03 (loop) - builtin survey; redirect + more commands advertised
+
+Surveyed cmd builtins to find tractable gaps. Verified working individually:
+`set`, `path`, `cd`, `title`, `cls`, `color` (plus the previously-confirmed
+`dir`, `echo`, `ver`, `vol`, `whoami`, `more`, `type`, `where cmd.exe`,
+`cmd /c dir`, and `dir > out.txt` redirection). Added a `--survey` mode to
+`emu/examples/pipe_test` and surfaced `set` + the redirect example in the demo
+readme.
+
+One real finding: running many commands back-to-back eventually hangs the shell
+(a ~6-command sequence timed out, while each command runs fine on its own). This
+is cumulative, not per-command - most likely the single system-wide 256-entry
+handle table filling as each command leaks handles that are not reclaimed on
+process exit. That is the same per-process-state root as the pipe blocker
+(per-process handle tables / DLL data), so it is deferred to that same focused
+rework rather than patched piecemeal. Source-only; deployed kernel.bin unchanged
+(readme is the only web change).

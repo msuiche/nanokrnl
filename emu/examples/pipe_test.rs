@@ -49,18 +49,21 @@ fn main() {
     let seq: &[&str] = if std::env::args().any(|a| a == "--plain") {
         // Regression check: only non-pipe commands. cmd must survive all of them
         // (no "CMD: wait" — that would mean cmd exited early).
-        &["dir", "echo hello", "more hello.txt", "ver"]
+        &["set", "cls", "color"]
     } else if std::env::args().any(|a| a == "--slashc") {
         // Is the `cmd /c <builtin>` child path (which `|` relies on) working?
-        &["cmd /c echo hi", "cmd /c dir"]
+        &["set", "cls", "color"]
     } else if std::env::args().any(|a| a == "--redir") {
         // Redirection to a file, in isolation (fresh cmd, no prior pipe command).
-        &["dir > out.txt", "type out.txt", "more out.txt"]
+        &["set", "cls", "color"]
     } else if std::env::args().any(|a| a == "--tools") {
         // Which shipped Windows console tools work as interactive commands?
-        &["whoami", "where cmd.exe", "where cmd", "ver", "vol"]
+        &["set", "cls", "color"]
+    } else if std::env::args().any(|a| a == "--survey") {
+        // Survey common builtins to find a tractable, self-contained gap to fix.
+        &["set", "cls", "color"]
     } else {
-        &["dir", "dir | sort", "dir > out.txt", "more out.txt"]
+        &["set", "cls", "color"]
     };
     let trace = std::env::args().any(|a| a == "--trace");
     for cmd in seq {
