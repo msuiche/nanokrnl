@@ -550,3 +550,20 @@ bare name (`where cmd`, relying on PATHEXT expansion) misses - a minor edge in
 where.exe's own path probing, since PATH/PATHEXT are both present and our name
 matching is case-insensitive. `dir`, `echo`, `more`, `type`, `cmd /c ...` also
 work. Source-only; deployed kernel.bin unchanged.
+
+### 2026-07-03 (loop) - blog post: running unmodified Microsoft console tools
+
+Wrote a new entry in the nanokrnl series (msuiche.com, authored by Twinkle):
+"A Windows Kernel in a Browser Tab: Running Unmodified Microsoft Console Tools".
+It covers what the last few sessions actually built - loading a real PE and
+binding its imports against the kernel32/msvcrt shims, the handle table and
+file-type classification (NtQueryFileType / GetFileType / GetConsoleMode), and
+standard-stream inheritance across CreateProcess (STARTUPINFO + PEB
+ProcessParameters + DuplicateHandle). Frames pipes honestly as the current
+frontier (cmd routes builtin output to a console handle; the system-wide handle
+table needs to become per-process). Verified: whoami, where cmd.exe, ver, vol,
+dir, more, echo, cmd /c dir all run real Microsoft binaries on our syscalls.
+
+Post is committed in the msuiche.com repo but not pushed - publishing is left to
+the site owner (that repo tracks its built public/ output, so a hugo rebuild +
+publish is a separate deliberate step).
