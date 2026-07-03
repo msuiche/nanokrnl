@@ -206,6 +206,10 @@ pub struct LoadedProcess {
     /// patch process-parameter fields (e.g. the real command line) after load,
     /// via the physical window, without switching into the process address space.
     pub block_phys: crate::mm::PhysAddr,
+    /// The process's distinct standard-stream console handles (stdin, stdout,
+    /// stderr). The spawner installs these as the thread's std handles unless the
+    /// parent staged a redirection (a pipe/file) for a given stream.
+    pub std_console: [u64; 3],
 }
 
 /// Top of the per-process user stack (low canonical half).
@@ -347,7 +351,7 @@ pub fn load_user_process(data: &[u8]) -> Result<LoadedProcess, NtStatus> {
     // (PEB) chained from it; the CRT and many APIs read standard handles, the
     // current directory, the loaded-module list and thread-local storage from
     // these. Lay them all out below the stack.
-    let block_phys = setup_user_blocks(SetupBlocks {
+    let (block_phys, std_console) = setup_user_blocks(SetupBlocks {
         cr3,
         preferred_base,
         stk_base,
@@ -375,6 +379,7 @@ pub fn load_user_process(data: &[u8]) -> Result<LoadedProcess, NtStatus> {
         image_base: preferred_base,
         image_size: size_of_image as u64,
         block_phys,
+        std_console,
     })
 }
 
@@ -413,13 +418,19 @@ fn next_client_id() -> (u64, u64) {
 /// static-TLS array, and an environment block for a freshly loaded image.
 /// Offsets follow the x64 NT layout. Best-effort: a field we can't fill yet
 /// (e.g. the real command line, set later per-thread) gets a sane placeholder.
-fn setup_user_blocks(s: SetupBlocks) -> Result<crate::mm::PhysAddr, NtStatus> {
+fn setup_user_blocks(s: SetupBlocks) -> Result<(crate::mm::PhysAddr, [u64; 3]), NtStatus> {
     let blk = crate::mm::phys::mm_allocate_contiguous_pages(USER_BLOCK_PAGES)
         .ok_or(NtStatus::INSUFFICIENT_RESOURCES)?;
     unsafe {
         crate::mm::virt::mm_map_user_range(s.cr3, TEB_BASE, blk, USER_BLOCK_PAGES, true, false)
     };
-    let console = open_console_handle();
+    // Distinct console handles for stdin/stdout/stderr (as on Windows), so a
+    // program that closes one standard stream - cmd closes its stdout handle
+    // when tearing down `dir > file`, sort closes stdin after reading - does not
+    // invalidate the others. A single shared handle made cmd's stdout-close kill
+    // its stdin, so the shell hit EOF and exited after every redirect.
+    let std_console = [open_console_handle(), open_console_handle(), open_console_handle()];
+    let console = std_console[0];
     let (pid, tid) = next_client_id();
 
     // Region offsets within the mapped block (VA == TEB_BASE + offset).
@@ -485,9 +496,9 @@ fn setup_user_blocks(s: SetupBlocks) -> Result<crate::mm::PhysAddr, NtStatus> {
         w32(PARAMS_OFF, (USER_BLOCK_PAGES * 0x1000) as u32); // MaximumLength
         w32(PARAMS_OFF + 0x04, (USER_BLOCK_PAGES * 0x1000) as u32); // Length
         w64(PARAMS_OFF + 0x10, console); // ConsoleHandle
-        w64(PARAMS_OFF + 0x20, console); // StandardInput
-        w64(PARAMS_OFF + 0x28, console); // StandardOutput
-        w64(PARAMS_OFF + 0x30, console); // StandardError
+        w64(PARAMS_OFF + 0x20, std_console[0]); // StandardInput
+        w64(PARAMS_OFF + 0x28, std_console[1]); // StandardOutput
+        w64(PARAMS_OFF + 0x30, std_console[2]); // StandardError
         // CurrentDirectory: CURDIR { UNICODE_STRING DosPath @0x38; HANDLE @0x48 }
         wstr(PARAMS_OFF + 0x38, TEB_BASE + cd_off as u64, cd_n);
         wstr(PARAMS_OFF + 0x60, TEB_BASE + (ip_off) as u64, ip_n); // ImagePathName
@@ -579,7 +590,7 @@ fn setup_user_blocks(s: SetupBlocks) -> Result<crate::mm::PhysAddr, NtStatus> {
         }
         *(b.add(eo) as *mut u16) = 0; // block terminator (extra NUL)
     }
-    Ok(blk)
+    Ok((blk, std_console))
 }
 
 /// Offset of the command-line buffer within the process-parameters region. It

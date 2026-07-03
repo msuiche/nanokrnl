@@ -446,10 +446,6 @@ pub(crate) fn create_user_process(image: &[u8], cmdline: &[u8], std_handles: [u6
     // arguments. The per-thread cmdline (for the GetCommandLine syscall) is set
     // below; this covers the PEB-reading path.
     crate::ldr::pe::set_command_line(&proc, cmdline);
-    // Inherit the parent's staged standard handles (pipe/file redirection) into
-    // the child's PEB.ProcessParameters, which cmd reads directly for its own
-    // stdout/stdin (the tcb copy below serves the GetStdHandle syscall path).
-    crate::ldr::pe::set_std_handles(&proc, std_handles);
     let t = match spawn_process_thread(proc.entry_va, proc.user_rsp, proc.cr3.0, proc.teb) {
         Ok(t) => t,
         Err(_) => return 0,
@@ -465,9 +461,20 @@ pub(crate) fn create_user_process(image: &[u8], cmdline: &[u8], std_handles: [u6
             (*t).tcb.mui_len = mui.len() as u32;
         }
     }
-    // Inherit the standard handles the parent staged (pipe/file for redirection),
-    // so the child's GetStdHandle returns them instead of the console default.
-    unsafe { (*t).tcb.std_handles = std_handles };
+    // Standard handles: a stream the parent redirected (a pipe/file, nonzero)
+    // is inherited; otherwise the child uses its own distinct console handle for
+    // that stream. Distinct per-stream handles matter because a program that
+    // closes one standard stream (cmd closing stdout after `> file`) must not
+    // invalidate another (its stdin). Set both the thread state (GetStdHandle
+    // syscall path) and the PEB (programs that read the handles directly).
+    let mut std = std_handles;
+    for i in 0..3 {
+        if std[i] == 0 {
+            std[i] = proc.std_console[i];
+        }
+    }
+    unsafe { (*t).tcb.std_handles = std };
+    crate::ldr::pe::set_std_handles(&proc, std);
     let mut tbl = PROC_TABLE.lock();
     let Some(i) = (0..MAX_PROCS).find(|&i| !tbl[i].in_use) else {
         return 0;
@@ -1517,6 +1524,10 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
                 match spawn_process_thread(proc.entry_va, proc.user_rsp, proc.cr3.0, proc.teb) {
                     Ok(t) => {
                         set_cmdline(t, "cmd.exe");
+                        // Give cmd its distinct stdin/stdout/stderr console handles
+                        // (the GetStdHandle syscall path), so closing one stream's
+                        // handle during a redirect does not invalidate another.
+                        unsafe { (*t).tcb.std_handles = proc.std_console };
                         #[cfg(not(feature = "interactive"))]
                         let st = unsafe {
                             scheduler::ki_wait_for_object(&raw mut (*t).tcb.header, Some(8000))

@@ -29,6 +29,7 @@ const NT_GET_COMMAND_LINE: u32 = 19;
 const NT_CREATE_PIPE: u32 = 36;
 const NT_GET_STD_HANDLE: u32 = 37;
 const NT_SET_STD_HANDLE: u32 = 39;
+const NT_DUPLICATE_OBJECT: u32 = 40;
 
 #[inline(always)]
 unsafe fn syscall3(number: u32, a1: u64, a2: u64, a3: u64) -> u64 {
@@ -1249,19 +1250,38 @@ pub unsafe extern "C" fn _pipe(fds: *mut i32, _size: u32, _textmode: i32) -> i32
     0
 }
 
-/// `_dup(fd)` — a second fd naming the same OS handle. Returns the new fd.
+/// Duplicate an OS handle, returning a *distinct* handle to the same object (0
+/// on failure). Each CRT fd must own its own OS handle: closing one fd's handle
+/// must not invalidate another fd that was `_dup`'d from it. Sharing the handle
+/// value instead breaks cmd's redirect save/restore (`saved = _dup(1); ...;
+/// _dup2(saved, 1); _close(saved)`), where closing `saved` would otherwise close
+/// the console handle that fd 1 still needs.
+unsafe fn dup_handle(h: u64) -> u64 {
+    if h == 0 {
+        return 0;
+    }
+    syscall3(NT_DUPLICATE_OBJECT, h, 0, 0)
+}
+
+/// `_dup(fd)` — a new fd with its own duplicated OS handle to the same object.
 #[no_mangle]
 pub unsafe extern "C" fn _dup(fd: i32) -> i32 {
     fd_init();
     if fd < 0 || (fd as usize) >= FD_MAX || FD_TABLE[fd as usize] == 0 {
         return -1;
     }
-    fd_alloc(FD_TABLE[fd as usize])
+    let dup = dup_handle(FD_TABLE[fd as usize]);
+    if dup == 0 {
+        return -1;
+    }
+    fd_alloc(dup)
 }
 
-/// `_dup2(src, dst)` — point `dst` at `src`'s OS handle. When `dst` is a std
-/// stream (0/1/2) we also update the kernel std handle, so a child spawned
-/// afterwards inherits the redirection (cmd's `dir | sort` model). Returns 0.
+/// `_dup2(src, dst)` — make `dst` refer to `src`'s object via its own duplicated
+/// handle. `dst`'s previous handle is closed first (as the CRT does). When `dst`
+/// is a std stream (0/1/2) the kernel std handle is updated too, so a child
+/// spawned afterwards inherits the redirection (cmd's `dir | sort` model), and
+/// so this process's own GetStdHandle sees the change. Returns 0, -1 on error.
 #[no_mangle]
 pub unsafe extern "C" fn _dup2(src: i32, dst: i32) -> i32 {
     fd_init();
@@ -1271,10 +1291,19 @@ pub unsafe extern "C" fn _dup2(src: i32, dst: i32) -> i32 {
     if dst < 0 || (dst as usize) >= FD_MAX {
         return -1;
     }
-    let h = FD_TABLE[src as usize];
-    FD_TABLE[dst as usize] = h;
+    let dup = dup_handle(FD_TABLE[src as usize]);
+    if dup == 0 {
+        return -1;
+    }
+    // Close dst's current handle (unless it is a std stream we want to keep the
+    // object alive for, or the same slot as src).
+    let old = FD_TABLE[dst as usize];
+    if old != 0 && old != FD_TABLE[src as usize] {
+        syscall3(NT_CLOSE, old, 0, 0);
+    }
+    FD_TABLE[dst as usize] = dup;
     if dst <= 2 {
-        syscall3(NT_SET_STD_HANDLE, dst as u64, h, 0);
+        syscall3(NT_SET_STD_HANDLE, dst as u64, dup, 0);
     }
     0
 }

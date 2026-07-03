@@ -567,3 +567,33 @@ dir, more, echo, cmd /c dir all run real Microsoft binaries on our syscalls.
 Post is committed in the msuiche.com repo but not pushed - publishing is left to
 the site owner (that repo tracks its built public/ output, so a hugo rebuild +
 publish is a separate deliberate step).
+
+### 2026-07-03 - redirection to a file works (distinct std handles + CRT dup)
+
+`dir > out.txt` now writes a byte-perfect file and `type out.txt` / `more out.txt`
+read it back correctly, with cmd staying alive across the command. Traced the
+whole path end to end. Two root fixes:
+
+- **Distinct standard-stream handles per process.** setup_user_blocks now opens
+  three separate `\Device\Console` handles for stdin/stdout/stderr (was one shared
+  handle) and returns them in `LoadedProcess.std_console`; the spawner installs
+  them as the thread's std handles (inherited pipe/file overrides win). cmd's `>`
+  teardown closes its stdout handle; when stdin and stdout were the same handle,
+  that also killed stdin, so cmd's next read hit EOF and the shell exited after
+  every redirect. Distinct handles fix that.
+- **`_dup`/`_dup2` duplicate the OS handle** (via NtDuplicateObject) instead of
+  sharing the value, so cmd's `saved = _dup(1); _dup2(saved,1); _close(saved)`
+  save/restore dance no longer closes the console handle fd 1 still needs.
+
+Verified: 67/67 self-tests pass; `dir`, `echo`, `more`, `ver`, `whoami`,
+`where cmd.exe`, `cmd /c dir`, and `dir > out.txt` + `type out.txt` all work.
+
+Pipes (`dir | sort`) still not end to end: cmd creates the pipe and spawns
+`cmd /c dir` with the pipe as stdout, but the child writes its `dir` output to a
+console handle rather than the inherited pipe (0 pipe writes observed), and the
+CRT dup/fd juggling scrambles which pipe end each stage gets (dir stdout and sort
+stdin both resolve to a write-end dup). The cross-process pipe handoff needs a
+CRT-fd rework that matches cmd's exact dup/close sequence; redirection is the
+verified milestone here. Earlier "garbled output" was a debug-logging artifact
+(kd_println interleaving with the stream), not real corruption. Source-only;
+deployed kernel.bin unchanged.
