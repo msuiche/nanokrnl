@@ -128,7 +128,7 @@
   .status.stop .led { background: #c00000; }
   @keyframes pulse { 50% { opacity: .35; } }
   /* readme.txt usage dialog, floating top-right */
-  #readme { position: fixed; top: 18px; right: 18px; width: 234px; z-index: 5; }
+  #readme { position: fixed; top: 18px; right: 18px; width: 234px; min-width: 160px; z-index: 5; resize: both; overflow: auto; }
   #dbgpanel { position: fixed; top: 70px; left: 50%; transform: translateX(-50%);
     width: min(560px, 92vw); z-index: 60; }
   #dbgpanel > .tb { cursor: move; }
@@ -233,7 +233,8 @@
   #winamp.hidden { display: none; }
 
   /* --- Resource Monitor (Win95 mini Task Manager, left side) --- */
-  #resmon { position: fixed; left: 18px; top: calc(50% - 96px); width: 190px; z-index: 5;
+  #resmon { position: fixed; left: 18px; top: calc(50% - 150px); width: 190px; min-width: 150px; z-index: 5;
+    resize: horizontal; overflow: hidden;
     background: #c0c0c0; padding: 3px; font: 11px Tahoma, "MS Sans Serif", sans-serif;
     box-shadow: inset 1px 1px #fff, inset -1px -1px #404040, inset 2px 2px #dfdfdf, inset -2px -2px #808080, 5px 5px 0 rgba(0,0,0,.4); }
   #resmon .rm-title { display: flex; align-items: center; padding: 2px 3px 3px 5px; cursor: move;
@@ -251,7 +252,8 @@
   #resmon .rm-row b { color: #0a3d14; font-variant-numeric: tabular-nums; }
   #resmon.hidden { display: none; }
   /* H:\ Explorer, docked under the Resource Monitor (same Win95 chrome). */
-  #explorer { position: fixed; left: 18px; top: calc(50% + 108px); width: 250px; z-index: 5;
+  #explorer { position: fixed; left: 18px; top: calc(50% + 90px); width: 250px; min-width: 160px; z-index: 5;
+    resize: both; overflow: hidden;
     background: #c0c0c0; padding: 3px; font: 11px Tahoma, "MS Sans Serif", sans-serif;
     box-shadow: inset 1px 1px #fff, inset -1px -1px #404040, inset 2px 2px #dfdfdf, inset -2px -2px #808080, 5px 5px 0 rgba(0,0,0,.4); }
   #explorer .rm-title { display: flex; align-items: center; padding: 2px 3px 3px 5px; cursor: move;
@@ -272,7 +274,8 @@
   #explorer.hidden { display: none; }
 
   /* --- Resources / links (Win95 mini window, top-left) --- */
-  #links { position: fixed; left: 18px; top: 18px; width: 184px; z-index: 5; background: #c0c0c0; padding: 3px;
+  #links { position: fixed; left: 18px; top: 18px; width: 236px; min-width: 150px; z-index: 5; background: #c0c0c0; padding: 3px;
+    resize: horizontal; overflow: hidden;
     font: 11px Tahoma, "MS Sans Serif", sans-serif;
     box-shadow: inset 1px 1px #fff, inset -1px -1px #404040, inset 2px 2px #dfdfdf, inset -2px -2px #808080, 5px 5px 0 rgba(0,0,0,.4); }
   #links .lk-title { display: flex; align-items: center; padding: 2px 3px 3px 5px; cursor: move;
@@ -283,7 +286,7 @@
   #links .lk-title .x:hover { background: #d65a43; color: #fff; }
   #links .lk-body { margin-top: 3px; padding: 5px; display: flex; flex-direction: column; gap: 3px;
     box-shadow: inset 1px 1px #808080, inset -1px -1px #fff; }
-  #links .lk-body a { color: #001ca8; font-size: 12px; text-decoration: none; padding: 3px 5px; white-space: nowrap; }
+  #links .lk-body a { color: #001ca8; font-size: 12px; text-decoration: none; padding: 3px 5px; white-space: normal; line-height: 1.35; }
   #links .lk-body a:hover { background: #000082; color: #fff; }
   #links.hidden { display: none; }
 
