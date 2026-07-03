@@ -448,6 +448,7 @@
       <pre id="dbg-src" style="max-height:140px;overflow:auto;background:#000;color:#15e637;padding:6px;font-size:11px;line-height:1.35;margin:0;white-space:pre">loading bridge.py ...</pre>
     </details>
     <p style="margin:6px 0 0;font-size:11px;color:#4a4a4a">Keep this page open. lldb attaches automatically; try <code>register read</code>, <code>breakpoint set -a $pc</code>, <code>c</code>.</p>
+    <p id="dbg-note" style="margin:6px 0 0;font-size:11px;color:#a03030;display:none"></p>
   </div>
 </div>
 
@@ -1090,6 +1091,17 @@ function toggleDebug() {
   wantDebug = true; dbgPanel.style.display = "";
   document.getElementById("dbg-oneliner").textContent = debugOneLiner();
   loadBridgeSrc();
+  // On the live https site, a page cannot open ws://localhost in Safari (mixed
+  // content); Chrome allows the loopback exception. Warn up front so a silent
+  // "waiting..." isn't mistaken for a broken bridge.
+  const note = document.getElementById("dbg-note");
+  const safari = /^((?!chrome|chromium|android).)*safari/i.test(navigator.userAgent);
+  if (location.protocol === "https:" && safari) {
+    note.textContent = "Safari blocks ws://localhost from an https page. Use Chrome, or run the page over http://localhost.";
+    note.style.display = "";
+  } else {
+    note.style.display = "none";
+  }
   dbgSetStatus("waiting for the bridge (run the one-liner) ...");
   connectDebug();
 }
