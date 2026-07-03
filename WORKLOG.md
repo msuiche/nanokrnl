@@ -521,3 +521,32 @@ StandardOutput/pipe - so cmd's internal output routine is picking the console
 regardless. Cracking that needs the API tracer armed on the child cmd to see how
 it selects its output handle (likely a CreateFile("CONOUT$") or a cached console
 handle path). A focused next step. Source-only; deployed kernel.bin unchanged.
+
+### 2026-07-03 (loop) - pipes paused with root cause; shipped-tool audit
+
+Kept tracing `dir | sort`. cmd wires the pipe correctly (left `cmd /c dir`
+stdout -> pipe write, right `sort` stdin -> pipe read) and, with the earlier
+GetFileType / PEB-std-handle / GetConsoleMode fixes, gets further, but the
+producer child still routes its `dir` output to a console handle rather than the
+inherited pipe. Two compounding roots, both bigger than a quick patch:
+
+1. The handle table is **system-wide**, not per-process, so a child's freshly
+   opened console handle can take the same numeric value as a pipe end the parent
+   just created (observed the left child's PEB ConsoleHandle aliasing the pipe
+   write handle). Cross-process pipe handoff needs per-process handle tables (or
+   careful lifetime handling) to be reliable.
+2. cmd selects its builtin (`dir`) output handle internally in a way that lands
+   on the console handle even when StandardOutput is redirected; pinning that down
+   needs the API tracer armed on the child cmd.
+
+Pausing pipes here rather than yak-shave further; the five fidelity fixes from the
+last two sessions (CRT fd layer, DuplicateHandle, GetFileType, PEB std handles,
+GetConsoleMode) all stand and are regression-free.
+
+Silver lining from auditing the shipped Microsoft tools as interactive commands
+(new `pipe_test --tools` mode): **`whoami` (-> `nanokrnl\user`), `where cmd.exe`
+(-> `C:\cmd.exe`), `ver`, and `vol` all work** unmodified. Only `where` with a
+bare name (`where cmd`, relying on PATHEXT expansion) misses - a minor edge in
+where.exe's own path probing, since PATH/PATHEXT are both present and our name
+matching is case-insensitive. `dir`, `echo`, `more`, `type`, `cmd /c ...` also
+work. Source-only; deployed kernel.bin unchanged.

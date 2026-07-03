@@ -53,6 +53,9 @@ fn main() {
     } else if std::env::args().any(|a| a == "--slashc") {
         // Is the `cmd /c <builtin>` child path (which `|` relies on) working?
         &["cmd /c echo hi", "cmd /c dir"]
+    } else if std::env::args().any(|a| a == "--tools") {
+        // Which shipped Windows console tools work as interactive commands?
+        &["whoami", "where cmd.exe", "where cmd", "ver", "vol"]
     } else {
         &["dir", "dir | sort", "dir > out.txt", "more out.txt"]
     };
