@@ -50,6 +50,9 @@ fn main() {
         // Regression check: only non-pipe commands. cmd must survive all of them
         // (no "CMD: wait" — that would mean cmd exited early).
         &["dir", "echo hello", "more hello.txt", "ver"]
+    } else if std::env::args().any(|a| a == "--slashc") {
+        // Is the `cmd /c <builtin>` child path (which `|` relies on) working?
+        &["cmd /c echo hi", "cmd /c dir"]
     } else {
         &["dir", "dir | sort", "dir > out.txt", "more out.txt"]
     };

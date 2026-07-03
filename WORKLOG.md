@@ -489,3 +489,35 @@ cmd exits its command loop afterward. Resolving it means matching cmd's exact
 fd/handle juggling (likely the ucrt STARTUPINFO fd-inheritance block), a focused
 next step. This is source-only; the deployed web kernel.bin is unchanged, so the
 live demo is unaffected.
+
+### 2026-07-03 (loop) - pipes: handle classification + PEB std handles
+
+Traced `dir | sort` through the kernel (temporary syscall logging, since removed)
+and fixed three real fidelity gaps between cmd and our surface. cmd wires the
+pipe correctly - left child `cmd /S /D /c "dir"` with stdout = pipe write end,
+right child `sort` with stdin = pipe read end - so the setup is sound; the gaps
+were downstream:
+
+- **GetFileType** returned FILE_TYPE_UNKNOWN for a pipe or file. Added an
+  `NT_QUERY_FILE_TYPE` syscall that classifies a handle by object type
+  (pipe -> PIPE, ram/writable file -> DISK, else CHAR); GetFileType now reports
+  it. The CRT and cmd branch on this at startup.
+- **PEB standard handles**: a child's `ProcessParameters.Standard{Input,Output,
+  Error}` were all seeded to the console. Added `pe::set_std_handles`, called from
+  create_user_process, so a child inherits the pipe/file the parent staged (cmd
+  reads these straight from the PEB, not via GetStdHandle).
+- **GetConsoleMode** used to succeed for any handle, so cmd thought a pipe stdout
+  was a console. It now fails for non-CHAR handles (via NT_QUERY_FILE_TYPE), the
+  standard "is this redirected?" probe.
+
+All three are correct regardless of pipes and carry no regression: 67/67 self
+tests pass, and interactive `dir`, `echo`, `more`, `ver`, `cmd /c dir`,
+`cmd /c echo` all still work with cmd staying alive. `emu/examples/pipe_test`
+gained `--plain` / `--slashc` / `--trace` modes for this.
+
+Still not producing `dir | sort` output: even with the above, the child cmd
+writes its `dir` builtin output to its **console handle**, not to the inherited
+StandardOutput/pipe - so cmd's internal output routine is picking the console
+regardless. Cracking that needs the API tracer armed on the child cmd to see how
+it selects its output handle (likely a CreateFile("CONOUT$") or a cached console
+handle path). A focused next step. Source-only; deployed kernel.bin unchanged.

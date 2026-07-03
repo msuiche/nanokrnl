@@ -55,6 +55,7 @@ const NT_GET_STD_HANDLE: u32 = 37;
 const NT_SET_STARTUP_HANDLES: u32 = 38;
 const NT_SET_STD_HANDLE: u32 = 39;
 const NT_DUPLICATE_OBJECT: u32 = 40;
+const NT_QUERY_FILE_TYPE: u32 = 41;
 
 // A couple of Win32 error codes used by the shim.
 const ERROR_SUCCESS: u32 = 0;
@@ -253,18 +254,22 @@ pub unsafe extern "C" fn WideCharToMultiByte(
     count as i32
 }
 
-/// `GetFileType(hFile)` — classify a handle. The C runtime calls this on its
-/// standard handles at startup to decide buffering. Our standard handles all
-/// refer to the console device, so the console handle is `FILE_TYPE_CHAR`
-/// (a character device); anything else is `FILE_TYPE_UNKNOWN`.
+/// `GetFileType(hFile)` — classify a handle (`FILE_TYPE_DISK`/`CHAR`/`PIPE`).
+/// The C runtime calls this on its standard handles at startup to decide
+/// buffering, and cmd checks it when wiring `dir | sort` — a pipe stdout must
+/// report `FILE_TYPE_PIPE`, not `UNKNOWN`, or cmd treats it as unusable and
+/// writes nothing. The kernel classifies by object type; a cached console
+/// handle we opened is the `CHAR` fallback if the kernel can't place it.
 #[no_mangle]
 pub unsafe extern "C" fn GetFileType(handle: u64) -> u32 {
-    const FILE_TYPE_UNKNOWN: u32 = 0x0000;
     const FILE_TYPE_CHAR: u32 = 0x0002;
-    if is_std_console_handle(handle) {
+    let t = syscall3(NT_QUERY_FILE_TYPE, handle, 0, 0) as u32;
+    if t != 0 {
+        t
+    } else if is_std_console_handle(handle) {
         FILE_TYPE_CHAR
     } else {
-        FILE_TYPE_UNKNOWN
+        0 // FILE_TYPE_UNKNOWN
     }
 }
 
@@ -1058,6 +1063,14 @@ pub unsafe extern "C" fn GetModuleHandleExA(_flags: u32, name: *const u8, out: *
 #[no_mangle]
 pub unsafe extern "C" fn GetConsoleMode(handle: u64, mode: *mut u32) -> i32 {
     if mode.is_null() {
+        return 0;
+    }
+    // Only a real console (character-device) handle has a console mode. A pipe or
+    // file must fail here so cmd/tools treat that stream as redirected and drive
+    // it with WriteFile/ReadFile on the standard handle rather than the console
+    // path - this is what makes `dir | sort` route the builtin's output into the
+    // pipe. FILE_TYPE_CHAR == 2.
+    if syscall3(NT_QUERY_FILE_TYPE, handle, 0, 0) != 2 {
         return 0;
     }
     *mode = if is_input_handle(handle) { INPUT_MODE } else { OUTPUT_MODE };

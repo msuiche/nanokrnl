@@ -613,6 +613,26 @@ pub fn set_command_line(proc: &LoadedProcess, cmdline: &[u8]) {
     }
 }
 
+/// Patch a freshly loaded process's PEB standard handles (`StandardInput` /
+/// `StandardOutput` / `StandardError`) with the handles the parent inherited to
+/// it - a pipe end or a redirected file. cmd reads these straight from
+/// `PEB.ProcessParameters` (not the `GetStdHandle` syscall), so `dir | sort` and
+/// `> file` depend on them being set here. A zero entry keeps the console
+/// default the block was seeded with. Must be called before the process runs.
+pub fn set_std_handles(proc: &LoadedProcess, std_handles: [u64; 3]) {
+    const PARAMS_OFF: usize = (PARAMS_BASE - TEB_BASE) as usize;
+    // StandardInput @ +0x20, StandardOutput @ +0x28, StandardError @ +0x30.
+    const STD_OFF: [usize; 3] = [0x20, 0x28, 0x30];
+    unsafe {
+        let b = crate::mm::phys_to_virt(proc.block_phys);
+        for (i, &off) in STD_OFF.iter().enumerate() {
+            if std_handles[i] != 0 {
+                *(b.add(PARAMS_OFF + off) as *mut u64) = std_handles[i];
+            }
+        }
+    }
+}
+
 /// Parse, allocate, copy sections, and apply base relocations. Shared by
 /// [`load`] and [`load_user`].
 fn map_and_relocate(data: &[u8]) -> Result<Mapped, NtStatus> {

@@ -446,6 +446,10 @@ pub(crate) fn create_user_process(image: &[u8], cmdline: &[u8], std_handles: [u6
     // arguments. The per-thread cmdline (for the GetCommandLine syscall) is set
     // below; this covers the PEB-reading path.
     crate::ldr::pe::set_command_line(&proc, cmdline);
+    // Inherit the parent's staged standard handles (pipe/file redirection) into
+    // the child's PEB.ProcessParameters, which cmd reads directly for its own
+    // stdout/stdin (the tcb copy below serves the GetStdHandle syscall path).
+    crate::ldr::pe::set_std_handles(&proc, std_handles);
     let t = match spawn_process_thread(proc.entry_va, proc.user_rsp, proc.cr3.0, proc.teb) {
         Ok(t) => t,
         Err(_) => return 0,

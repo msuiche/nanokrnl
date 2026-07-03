@@ -73,6 +73,9 @@ pub const SVC_SET_STD_HANDLE: usize = 39;
 /// `DuplicateHandle` - a second handle to the same object (cmd duplicates a
 /// pipe end so a child inherits it while cmd closes its own copy).
 pub const SVC_DUPLICATE_OBJECT: usize = 40;
+/// `GetFileType` - classify a handle as Win32 disk/char/pipe. cmd checks this on
+/// its stdout at startup; a pipe must report PIPE, not UNKNOWN, or cmd bails.
+pub const SVC_QUERY_FILE_TYPE: usize = 41;
 
 /// A shared kernel counter incremented atomically by [`SVC_INCREMENT_COUNTER`].
 /// Used to prove concurrent ring-3 threads both make progress through the
@@ -143,6 +146,26 @@ pub fn register_all() {
     register_service(SVC_SET_STARTUP_HANDLES, nt_set_startup_handles);
     register_service(SVC_SET_STD_HANDLE, nt_set_std_handle);
     register_service(SVC_DUPLICATE_OBJECT, nt_duplicate_object);
+    register_service(SVC_QUERY_FILE_TYPE, nt_query_file_type);
+}
+
+/// `GetFileType` backend: classify `handle` into a Win32 file type
+/// (1 = DISK, 2 = CHAR, 3 = PIPE, 0 = UNKNOWN). cmd calls GetFileType on its
+/// standard handles at startup; when its stdout is a pipe (`dir | sort`) it must
+/// see PIPE, otherwise it treats the handle as unusable and writes nothing.
+extern "C" fn nt_query_file_type(handle: u64, _a2: u64, _a3: u64, _a4: u64) -> u64 {
+    match handle::ob_reference_object_by_handle(handle) {
+        Ok(obj) => unsafe {
+            if io::pipe::is_read_end(obj) || io::pipe::is_write_end(obj) {
+                3 // FILE_TYPE_PIPE
+            } else if io::ramfs::is_writable_file(obj) || io::ramfs::is_file_object(obj) {
+                1 // FILE_TYPE_DISK
+            } else {
+                2 // FILE_TYPE_CHAR (console / other devices)
+            }
+        },
+        Err(_) => 0, // FILE_TYPE_UNKNOWN
+    }
 }
 
 /// `SetStdHandle(which, handle)` - redirect the calling thread's standard handle
