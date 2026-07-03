@@ -61,6 +61,12 @@ pub const SVC_NT_OPEN_FILE: usize = 34;
 /// Deliberately bugcheck the machine (demo/`crash.exe`, akin to the test hook
 /// behind Windows' manually-initiated crash). Never returns.
 pub const SVC_BUGCHECK: usize = 35;
+/// `CreatePipe` - allocate an anonymous pipe; returns two handles.
+pub const SVC_CREATE_PIPE: usize = 36;
+/// `GetStdHandle` - the current process's standard handle, or 0 (use console).
+pub const SVC_GET_STD_HANDLE: usize = 37;
+/// Stage the standard handles for the next child (from `STARTUPINFO`).
+pub const SVC_SET_STARTUP_HANDLES: usize = 38;
 
 /// A shared kernel counter incremented atomically by [`SVC_INCREMENT_COUNTER`].
 /// Used to prove concurrent ring-3 threads both make progress through the
@@ -126,6 +132,53 @@ pub fn register_all() {
     register_service(SVC_QUERY_ATTRIBUTES, nt_query_attributes);
     register_service(SVC_QUERY_DIRECTORY, nt_query_directory);
     register_service(SVC_BUGCHECK, nt_bugcheck);
+    register_service(SVC_CREATE_PIPE, nt_create_pipe);
+    register_service(SVC_GET_STD_HANDLE, nt_get_std_handle);
+    register_service(SVC_SET_STARTUP_HANDLES, nt_set_startup_handles);
+}
+
+/// `CreatePipe` - create an anonymous pipe and write its two handles (read then
+/// write, each u64) to the user buffer at `out_ptr`. Returns 1 on success.
+extern "C" fn nt_create_pipe(out_ptr: u64, _a2: u64, _a3: u64, _a4: u64) -> u64 {
+    if out_ptr == 0 || crate::mm::virt::probe_for_write(out_ptr, 16, 8).is_err() {
+        return 0;
+    }
+    let Some((r, w)) = io::pipe::create() else {
+        return 0;
+    };
+    let rh = handle::ob_create_handle(r as *mut u8, 0);
+    let wh = handle::ob_create_handle(w as *mut u8, 0);
+    crate::mm::virt::user_access_begin();
+    unsafe {
+        *(out_ptr as *mut u64) = rh;
+        *((out_ptr + 8) as *mut u64) = wh;
+    }
+    crate::mm::virt::user_access_end();
+    1
+}
+
+/// `GetStdHandle(which)` - return the calling thread's standard handle
+/// (0 = stdin, 1 = stdout, 2 = stderr), or 0 if none (caller uses the console).
+extern "C" fn nt_get_std_handle(which: u64, _a2: u64, _a3: u64, _a4: u64) -> u64 {
+    let i = which as usize;
+    if i > 2 {
+        return 0;
+    }
+    let t = crate::ke::pcr::ke_get_current_thread();
+    if t.is_null() {
+        return 0;
+    }
+    unsafe { (*t).std_handles[i] }
+}
+
+/// Stage the standard handles (stdin, stdout, stderr) for the next child this
+/// thread creates. From `STARTUPINFO` when `STARTF_USESTDHANDLES` is set.
+extern "C" fn nt_set_startup_handles(h_in: u64, h_out: u64, h_err: u64, _a4: u64) -> u64 {
+    let t = crate::ke::pcr::ke_get_current_thread();
+    if !t.is_null() {
+        unsafe { (*t).child_std_handles = [h_in, h_out, h_err] };
+    }
+    0
 }
 
 /// Service for `crash.exe`: deliberately bugcheck the machine. The optional
@@ -369,7 +422,21 @@ extern "C" fn nt_create_process(path_ptr: u64, path_len: u64, cmd_ptr: u64, cmd_
         }
     }
     let cmdline: &[u8] = if cn > 0 { &cbuf[..cn] } else { &abuf[..n] };
-    crate::init::create_user_process(image, cmdline)
+    // Consume any standard handles the parent staged for this child (pipe/file
+    // redirection via STARTUPINFO), then clear the staging slot.
+    let std = {
+        let t = crate::ke::pcr::ke_get_current_thread();
+        if t.is_null() {
+            [0u64; 3]
+        } else {
+            unsafe {
+                let s = (*t).child_std_handles;
+                (*t).child_std_handles = [0; 3];
+                s
+            }
+        }
+    };
+    crate::init::create_user_process(image, cmdline, std)
 }
 
 /// `NtWaitForSingleObject` on a process handle (a2 = timeout ms). Returns the
@@ -657,6 +724,14 @@ extern "C" fn nt_write_file(handle: u64, buffer: u64, length: u64, _a4: u64) -> 
     }
     match handle::ob_reference_object_by_handle(handle) {
         Ok(obj) => {
+            // A pipe write end: append to the pipe buffer (unbounded, never blocks).
+            if unsafe { io::pipe::is_write_end(obj) } {
+                let end = obj as *mut io::pipe::PipeEnd;
+                crate::mm::virt::user_access_begin();
+                let _ = unsafe { io::pipe::write(end, buffer as *const u8, length as usize) };
+                crate::mm::virt::user_access_end();
+                return NtStatus::SUCCESS.0 as u64;
+            }
             let device = obj as *mut DeviceObject;
             match unsafe {
                 io::io_synchronous_request(device, IRP_MJ_WRITE, buffer as *mut u8, length as usize)
@@ -843,6 +918,29 @@ extern "C" fn nt_read_file(handle: u64, buffer: u64, length: u64, _a4: u64) -> u
                 let n = unsafe { io::ramfs::read(file, buffer as *mut u8, length as usize) };
                 crate::mm::virt::user_access_end();
                 return n as u64;
+            }
+            // A pipe read end: drain the buffer, blocking (preemptibly) until data
+            // arrives or the last writer closes (EOF). Between checks interrupts
+            // are on, so the timer preempts us and the producer thread runs.
+            if unsafe { io::pipe::is_read_end(obj) } {
+                let end = obj as *mut io::pipe::PipeEnd;
+                let mut spins: u64 = 0;
+                loop {
+                    crate::mm::virt::user_access_begin();
+                    let (n, eof) = unsafe { io::pipe::try_read(end, buffer as *mut u8, length as usize) };
+                    crate::mm::virt::user_access_end();
+                    if n > 0 {
+                        return n as u64;
+                    }
+                    if eof {
+                        return 0; // no data, no writers: end of file
+                    }
+                    spins += 1;
+                    if spins > 2_000_000_000 {
+                        return 0; // producer wedged; give up rather than hang
+                    }
+                    core::hint::spin_loop();
+                }
             }
             let device = obj as *mut DeviceObject;
             match unsafe {

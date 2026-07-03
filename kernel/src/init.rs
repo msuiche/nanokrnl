@@ -430,7 +430,7 @@ fn mui_for_image(image: &[u8]) -> &'static [u8] {
     }
 }
 
-pub(crate) fn create_user_process(image: &[u8], cmdline: &[u8]) -> u64 {
+pub(crate) fn create_user_process(image: &[u8], cmdline: &[u8], std_handles: [u64; 3]) -> u64 {
     // ulib.dll lives once in the shared high half, so its C-runtime data is
     // shared across processes. Reset it to its pristine post-load state so this
     // process's ulib init runs fresh — otherwise a second ulib-based program
@@ -461,6 +461,9 @@ pub(crate) fn create_user_process(image: &[u8], cmdline: &[u8]) -> u64 {
             (*t).tcb.mui_len = mui.len() as u32;
         }
     }
+    // Inherit the standard handles the parent staged (pipe/file for redirection),
+    // so the child's GetStdHandle returns them instead of the console default.
+    unsafe { (*t).tcb.std_handles = std_handles };
     let mut tbl = PROC_TABLE.lock();
     let Some(i) = (0..MAX_PROCS).find(|&i| !tbl[i].in_use) else {
         return 0;
@@ -1003,7 +1006,7 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
     // kernel32!CreateProcessW. Uses the compute app (reports 5050 via the test
     // channel), so a successful wait + that result proves the child truly ran.
     if !USERAPP2_IMAGE.is_empty() {
-        let h = create_user_process(USERAPP2_IMAGE, b"child.exe");
+        let h = create_user_process(USERAPP2_IMAGE, b"child.exe", [0, 0, 0]);
         check!("Ps: CreateProcess returns a handle", h != 0);
         let st = wait_user_process(h, 5000);
         unsafe {

@@ -377,3 +377,37 @@ download.
 Also: the boot banner had two em dashes that rendered as mojibake (the console is
 byte-wise, not UTF-8) - replaced with ASCII, and the banner now carries a fuller
 description + authorship.
+
+### 2026-07-03 (later still) - debug-bridge one-liner, H:\ Explorer, and pipes (WIP)
+
+**Debugging, packaged.** The lldb bridge is now a copy-paste one-liner: the page's
+Debug panel shows `python3 <(curl -sL https://nanokrnl.ai/bridge.py)`, and
+`bridge.py` (stdlib-only, ~90 lines) is staged into `web/nanox/` by `build-wasm.sh`
+so the live site serves it. Process substitution (not a pipe) keeps the terminal
+TTY so lldb stays interactive. One caveat we now warn about in the panel: a page
+served over https can only open `ws://localhost` in Chrome (loopback
+mixed-content exception), not Safari; serve the page over http://localhost to use
+Safari.
+
+**H:\ Explorer.** A small Win95-style window (under Resource Monitor) lists the 9P
+share - readme.txt, hello.txt, and `nanokrnl.core` after a crash - click to
+download. All the floating windows are now resizable, and the layout was tidied
+(Resource Monitor and Explorer spaced apart; Resources links wrap instead of
+cropping; the epilogue folded into the header; the "20 or 30 years" reflection
+rides on the tagline).
+
+**Pipes and redirection (in progress).** Groundwork for `dir | sort` and
+`echo > H:\out.txt`. The handle table is system-wide, which makes inheritance
+trivial (a handle value is valid in any process). Landed kernel-side:
+`io::pipe` (an unbounded buffer with a writer count; closing the write end runs a
+delete procedure that drops the count, so a read sees EOF when the last writer
+goes), `NtCreatePipe`, per-process standard handles (`NtGetStdHandle` +
+staged-for-child handles consumed by the create-process path), and
+`NtReadFile`/`NtWriteFile` routing to pipes with a preemptible blocking read (the
+reader spins with interrupts on, so the timer preempts it and the producer runs;
+the unbounded buffer means the producer never blocks). A neat consequence: for
+`dir | sort`, `dir` is a cmd builtin, so cmd itself is the producer and closes the
+write end, which sidesteps cross-process writer-EOF entirely. Still to do: the
+kernel32 side (`CreatePipe`, `GetStdHandle` asking the kernel, `CreateProcessW`
+reading `STARTUPINFO` std handles), the `kernel32.dll` rebuild, and end-to-end
+testing; file redirection also needs a writable file sink.

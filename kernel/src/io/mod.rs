@@ -22,6 +22,7 @@ pub mod console;
 pub mod namespace;
 pub mod null;
 pub mod p9;
+pub mod pipe;
 pub mod ramfs;
 
 use crate::ke::dispatcher::{ke_wait_for_single_object, DispatcherObjectType, Kevent};

@@ -163,6 +163,14 @@ pub struct Kthread {
     /// own GS — letting multiple TEB processes (e.g. a CreateProcess parent and
     /// its child) coexist.
     pub gs_base: u64,
+    /// This thread's standard handles (stdin/stdout/stderr), behind
+    /// `GetStdHandle`. 0 means "not redirected - use the console default". Set
+    /// from the parent's `STARTUPINFO` at process creation so `dir | sort` and
+    /// `> file` route the child's streams to a pipe or file.
+    pub std_handles: [u64; 3],
+    /// Standard handles staged for the *next* child this thread creates
+    /// (`SetStartupHandles`, consumed by the create-process path). 0 = default.
+    pub child_std_handles: [u64; 3],
 }
 
 /// Default quantum in clock ticks (~ms at our tick rate). NT's default on
@@ -200,6 +208,8 @@ impl Kthread {
             mui_len: 0,
             exit_code: 0,
             gs_base: 0,
+            std_handles: [0; 3],
+            child_std_handles: [0; 3],
         }
     }
 
