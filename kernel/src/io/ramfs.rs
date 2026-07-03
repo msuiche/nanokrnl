@@ -267,6 +267,23 @@ pub fn open(path: &str) -> Option<*mut FileObject> {
     .ok()
 }
 
+/// Open an in-memory blob (bytes fetched from the host over 9P) as a read-only
+/// `FileObject`, so a `H:\` host file reaches the normal read/close path. The
+/// bytes are leaked to `'static` because `FileObject` borrows them for the life
+/// of the handle; acceptable for the demo's occasional host reads.
+pub fn open_bytes(data: alloc::vec::Vec<u8>) -> Option<*mut FileObject> {
+    let leaked: &'static [u8] = alloc::boxed::Box::leak(data.into_boxed_slice());
+    ob::ob_create_object(
+        &FILE_TYPE,
+        FileObject {
+            data: leaked.as_ptr(),
+            len: leaked.len(),
+            pos: AtomicUsize::new(0),
+        },
+    )
+    .ok()
+}
+
 /// Whether a body pointer is a `FileObject` (vs a device).
 ///
 /// # Safety

@@ -246,3 +246,44 @@ right next to the APIC, and the host drives it through a new
 `nanox_p9_read`/`nanox_p9_write` wasm ABI (the same shape as the UART). Two tests
 cover it: a device-level loopback and a CPU-path MMIO round trip. Next milestones:
 the JS 9P2000.L server, then the kernel client `io/p9.rs`.
+
+### 2026-07-02 (later) - 9P milestones 2+3: `more H:\file` reads a real host file
+
+Finished the 9P stack end to end. `more H:\readme.txt` at the prompt now reads a
+file that lives on the *host* (the browser page, or a test server), not in kernel
+memory.
+
+- **Kernel client** (`kernel/src/io/p9.rs`): a minimal 9P2000.L client over the
+  transport — version, attach, walk, lopen, read-loop, clunk. `p9::read(path)`
+  returns the file bytes or `None`.
+- **The `H:` drive**: `nt_create_file`, `nt_open_file`, *and* `nt_query_directory`
+  now recognize an `H:\` prefix and route to `p9::read`, with `ramfs::open_bytes`
+  wrapping the fetched bytes in a normal read-only `FileObject`. The third hook is
+  the subtle one: ulib tools `stat` a file with `FindFirstFile`
+  (`NtQueryDirectory`) *before* opening it, so without an `H:` case there the
+  file "doesn't exist" and the open is never attempted — the symptom was a bare
+  "Unknown error" with zero 9P traffic. Found by diffing the syscall trace of
+  `more C:\readme.txt` (works) against `more H:\readme.txt` (fails): they were
+  identical up to the `NtQueryDirectory` that returned 1 vs 0.
+- **JS server** (`web/nanox/p9-server.js`): the browser-side 9P2000.L server,
+  pumped once per run-slice from the page's main loop. It serves a small in-page
+  file tree (edit the object in `index.html`; no rebuild needed). The kernel's
+  client spins on the transport (bounded), so a reply produced between run-slices
+  is picked up on the next slice.
+- Tests: `emu/examples/p9_host.rs` (native, in-process Rust 9P server) and a
+  headless Node harness driving the shipped `nanox.wasm` + snapshot + the real
+  `p9-server.js`. Both read the host file; 12 messages served per `more` (a stat
+  round then an open round).
+
+**nanox was missing `BSWAP`.** Wiring the client in exposed it: at `-O`, the
+compiler turns the `"\??\"` 4-byte prefix compare in `nt_create_file` into
+`mov`/`bswap`/`cmp`-against-immediate, and nanox had never implemented `0F C8+rd`.
+So the *release* kernel wedged on an undecoded opcode partway through boot (debug,
+which does a byte-by-byte compare, was fine). Adding my module shifted codegen
+just enough to trip it. Implemented `bswap r32/r64` (32-bit form zero-extends) in
+the two-byte-opcode path with a unit test. Why it slipped through: nanox's ISA is
+built demand-driven and validated against Unicorn/iced *for the instructions the
+programs actually execute* — `BSWAP` is rare in `-O0` and only emitted by the
+optimizer for byte-swap / prefix-compare idioms, so it never appeared in the
+stream until now. A decode-only sweep of the release `.text` against iced would
+catch this class statically; worth adding.

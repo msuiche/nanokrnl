@@ -1478,6 +1478,20 @@ impl Cpu {
                         self.rip = pc as u64;
                         StepResult::Ok
                     }
+                    // bswap r32/r64 (0F C8+rd): reverse the byte order of the
+                    // register. Operand size picks the width (REX.W = 64-bit,
+                    // else 32-bit, which zero-extends). No flags. The optimizer
+                    // emits this for 4-byte string-prefix compares.
+                    0xc8..=0xcf => {
+                        let reg = (b2 - 0xc8) as usize + if rex_b { 8 } else { 0 };
+                        self.regs[reg] = if size == 8 {
+                            self.regs[reg].swap_bytes()
+                        } else {
+                            (self.regs[reg] as u32).swap_bytes() as u64
+                        };
+                        self.rip = (pc + 2) as u64;
+                        StepResult::Ok
+                    }
                     // cmpxchg r/m, reg (0F B1): compare RAX with r/m; if equal,
                     // store reg into r/m and set ZF; else load r/m into RAX.
                     0xb1 => {
@@ -2842,6 +2856,24 @@ mod tests {
     fn self_run(mem: &mut [u8]) -> StepResult {
         let mut cpu = Cpu::new();
         cpu.run_program(mem, 0, 240, 1000)
+    }
+
+    #[test]
+    fn bswap() {
+        // mov ecx,0x11223344 ; bswap ecx (0F C9) ; mov rbx,0x1122334455667788 ;
+        // bswap rbx (REX.W 0F CB) ; ret. The 32-bit form zero-extends.
+        let mut mem = vec![0u8; 256];
+        let mut c = vec![];
+        c.extend_from_slice(&[0xb9, 0x44, 0x33, 0x22, 0x11]); // mov ecx,0x11223344
+        c.extend_from_slice(&[0x0f, 0xc9]); // bswap ecx
+        c.extend_from_slice(&[0x48, 0xbb, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11]); // mov rbx,...
+        c.extend_from_slice(&[0x48, 0x0f, 0xcb]); // bswap rbx
+        c.push(0xc3); // ret
+        mem[..c.len()].copy_from_slice(&c);
+        let mut cpu = Cpu::new();
+        assert_eq!(cpu.run_program(&mut mem, 0, 240, 1000), StepResult::Halt);
+        assert_eq!(cpu.regs[RCX], 0x4433_2211); // byte-reversed, zero-extended
+        assert_eq!(cpu.regs[RBX], 0x8877_6655_4433_2211);
     }
 
     #[test]

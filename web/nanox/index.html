@@ -103,6 +103,7 @@
   @keyframes blink { 50% { opacity: 0; } }
 
   .toolbar { display: flex; gap: 6px; align-items: center; padding: 5px 2px 3px; flex-wrap: wrap; }
+  .toolbar .hint { color: #4a4a4a; font-size: 11px; font-style: italic; margin-left: 2px; }
   button { font-family: Tahoma, "MS Sans Serif", sans-serif; font-size: 12px; color: #000;
     background: #c0c0c0; border: none; padding: 4px 12px; cursor: pointer;
     box-shadow: inset 1px 1px #fff, inset -1px -1px #404040, inset 2px 2px #dfdfdf, inset -2px -2px #808080; }
@@ -296,8 +297,10 @@
     <pre id="screen" tabindex="0"></pre>
     <div class="toolbar">
       <button class="primary" id="boot">Boot</button>
+      <button id="fastboot">Fast Boot</button>
       <button id="restart" disabled>Restart</button>
       <button id="shutdown" disabled>Shut Down</button>
+      <span class="hint" id="bootHint">Boot runs the real cold boot; Fast Boot resumes a saved snapshot instantly.</span>
     </div>
     <div class="statusbar">
       <span class="status stop" id="status"><span class="led"></span><span id="statusText">idle</span></span>
@@ -628,11 +631,13 @@
 </script>
 
 <script type="module">
+import { P9Server } from "./p9-server.js";
 const screen = document.getElementById("screen");
 const statusEl = document.getElementById("status");
 const statusText = document.getElementById("statusText");
 const statsEl = document.getElementById("statsText");
 const btnBoot = document.getElementById("boot");
+const btnFast = document.getElementById("fastboot");
 const btnRestart = document.getElementById("restart");
 const btnShutdown = document.getElementById("shutdown");
 const dec = new TextDecoder();
@@ -661,6 +666,20 @@ try {
     snapshotBytes = new Uint8Array(await new Response(stream).arrayBuffer());
   }
 } catch {}
+
+// The host filesystem behind the "H:" drive. `more H:\readme.txt` at the prompt
+// walks, opens, and reads these files live over 9P (see p9-server.js). Edit the
+// contents here and they show up in the guest without rebuilding anything.
+const p9 = new P9Server({
+  "readme.txt":
+    "This file is served from your browser over 9P, not from kernel memory.\r\n" +
+    "nanokrnl's H: drive is backed by p9-server.js running on this page: the\r\n" +
+    "kernel walked, opened, and read it a byte at a time over the transport.\r\n" +
+    "Try: more H:\\hello.txt\r\n",
+  "hello.txt":
+    "Hello from the host filesystem. These bytes crossed the 9P wire from\r\n" +
+    "JavaScript into the emulated kernel and back out to your console.\r\n",
+});
 
 let e = null, running = false, raf = 0;
 let term = "";          // the console text buffer
@@ -781,6 +800,10 @@ function loop() {
   do {
     code = e.nanox_run(perFrame);
     insAccum += perFrame;
+    // Service the H: drive: drain any 9P request the guest wrote this chunk and
+    // push its reply, so the kernel's client (spinning on the transport) sees an
+    // answer on the next chunk instead of timing out.
+    p9.pump(e);
     if (code !== 1) break;
   } while (performance.now() - t0 < FRAME_MS);
   drainUart();
@@ -806,7 +829,7 @@ async function boot(image) {
   stop();
   term = ""; col = 0; screen.textContent = ""; perFrame = 2_000_000;
   insAccum = 0; statsT0 = performance.now();
-  setStatus("boot", "booting…");
+  setStatus("boot", "cold boot · interpreting the full boot…");
   const inst = (await WebAssembly.instantiate(wasmBytes, {})).instance;
   e = inst.exports;
   e.nanox_new(128);
@@ -818,39 +841,55 @@ async function boot(image) {
 }
 
 // Resume from a boot-to-prompt snapshot: no interpreted boot, straight to C:\>.
+// A banner makes clear this is a restored state, not the machine's real boot —
+// click Restart to watch nanokrnl actually boot from scratch.
 async function resume(snap) {
   stop();
-  term = ""; col = 0; screen.textContent = ""; perFrame = 500_000;  // interactive at once
+  screen.textContent = ""; perFrame = 500_000;  // interactive at once
   insAccum = 0; statsT0 = performance.now();
-  setStatus("boot", "restoring…");
+  setStatus("boot", "restoring snapshot…");
   const inst = (await WebAssembly.instantiate(wasmBytes, {})).instance;
   e = inst.exports;
   e.nanox_new(128);
   const ptr = e.nanox_image_alloc(snap.length);
   new Uint8Array(e.memory.buffer, ptr, snap.length).set(snap);
   if (e.nanox_restore() !== 1) { setStatus("stop", "snapshot restore failed"); return; }
+  term =
+    "[Fast Boot] Resumed from a saved boot-to-prompt snapshot.\n" +
+    "The real cold boot -- memory setup, the full self-test suite, PE driver load,\n" +
+    "and user-mode bring-up -- was captured earlier and restored here instantly.\n" +
+    "Click Restart to watch nanokrnl boot for real.\n\n";
+  col = 0;
   running = true; refreshButtons(); screen.focus();
-  setStatus("run", "running · interactive");
+  setStatus("run", "running · resumed from snapshot");
   e.nanox_uart_write(13);   // nudge the shell to redraw its C:\> prompt
   loop();
 }
 
-// Boot the machine: resume the snapshot if present (instant), else interpret
-// the full boot from the kernel image.
-function start() {
-  if (snapshotBytes) { resume(snapshotBytes); return; }
+// A real cold boot: interpret the whole boot from the kernel image so the
+// self-test log scrolls by like a machine powering on. Boot and Restart both
+// use this — the point of the demo is that this is a genuine boot, not a
+// state restore.
+function coldBoot() {
   if (kernelBytes) { boot(kernelBytes); return; }
   setStatus("stop", kernelErr ? ("kernel fetch failed: " + kernelErr) : "kernel image not found; run emu/build-wasm.sh");
+}
+// Fast Boot: skip the interpreted boot and resume the saved snapshot instantly.
+function fastBoot() {
+  if (snapshotBytes) { resume(snapshotBytes); return; }
+  coldBoot(); // no snapshot staged — fall back to the real boot
 }
 function stop() { running = false; if (raf) cancelAnimationFrame(raf); raf = 0; }
 function refreshButtons() {
   btnBoot.disabled = running;
+  btnFast.disabled = running || !snapshotBytes;
   btnRestart.disabled = !e;
   btnShutdown.disabled = !running;
 }
 
-btnBoot.onclick = start;
-btnRestart.onclick = start;
+btnBoot.onclick = coldBoot;
+btnFast.onclick = fastBoot;
+btnRestart.onclick = coldBoot; // Restart is always a full cold boot
 btnShutdown.onclick = () => { stop(); setStatus("stop", "halted by user"); refreshButtons(); term += "\n[machine powered off]\n"; render(); };
 document.getElementById("winclose").onclick = () => { if (running) btnShutdown.click(); };
 
@@ -865,7 +904,12 @@ screen.addEventListener("keydown", (ev) => {
   if (s !== null) { for (const ch of s) e.nanox_uart_write(ch.charCodeAt(0)); ev.preventDefault(); }
 });
 
-setStatus("stop", snapshotBytes ? "ready, click Boot (instant resume)" : kernelBytes ? "ready, click Boot" : "no kernel image staged");
+btnFast.disabled = !snapshotBytes;
+setStatus("stop",
+  kernelBytes && snapshotBytes ? "ready · Boot for the real boot, Fast Boot to resume a snapshot"
+  : kernelBytes ? "ready, click Boot"
+  : snapshotBytes ? "ready, click Fast Boot"
+  : "no kernel image staged");
 </script>
 </body>
 </html>

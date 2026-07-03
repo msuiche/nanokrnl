@@ -291,6 +291,10 @@ impl Devices {
             0x3F8..=0x3FF => self.uart.read(port - COM1_BASE) as u64,
             0x60 => self.ps2.read_data() as u64,
             0x64 => self.ps2.read_status() as u64,
+            // P9 transport, port-mapped alias (needs no guest page mapping): 0x9F0
+            // pops a response byte, 0x9F1 reports whether one is ready.
+            0x9F0 => self.p9.rx.pop_front().unwrap_or(0) as u64,
+            0x9F1 => u64::from(!self.p9.rx.is_empty()),
             _ => {
                 let bits = size as u64 * 8;
                 if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 }
@@ -301,6 +305,7 @@ impl Devices {
     pub fn port_out(&mut self, port: u16, val: u64, _size: u8) {
         match port {
             0x3F8..=0x3FF => self.uart.write(port - COM1_BASE, val as u8),
+            0x9F0 => self.p9.tx.push_back(val as u8), // P9 transport DATA (request byte)
             // 0x60/0x64 keyboard writes (commands/LED): accept and ignore.
             _ => {}
         }

@@ -144,6 +144,41 @@ extern "C" fn nt_query_directory(pat_ptr: u64, pat_len: u64, index: u64, out_ptr
     let Ok(pattern) = core::str::from_utf8(&abuf[..n]) else {
         return 0;
     };
+    // The virtual "H:" drive is served by the host 9P server. ulib tools stat a
+    // file via FindFirstFile before opening it, so a host path has to resolve
+    // here too: fetch it to confirm existence and learn its size (only index 0
+    // yields the single named file). Without this a `more H:\file` reports
+    // "file not found" and never reaches NtCreateFile.
+    let host = pattern.strip_prefix("\\??\\").unwrap_or(pattern);
+    if let Some(rest) = strip_host_drive(host) {
+        if index != 0 {
+            return 0;
+        }
+        let Some(bytes) = io::p9::read(rest) else {
+            return 0;
+        };
+        let fname = rest.rsplit(['\\', '/']).next().unwrap_or(rest);
+        const FIND_DATA_SIZE: usize = 592;
+        if out_ptr == 0 || crate::mm::virt::probe_for_write(out_ptr, FIND_DATA_SIZE, 2).is_err() {
+            return 0;
+        }
+        crate::mm::virt::user_access_begin();
+        unsafe {
+            core::ptr::write_bytes(out_ptr as *mut u8, 0, FIND_DATA_SIZE);
+            *(out_ptr as *mut u32) = 0x80; // FILE_ATTRIBUTE_NORMAL
+            *((out_ptr + 28) as *mut u32) = ((bytes.len() as u64) >> 32) as u32;
+            *((out_ptr + 32) as *mut u32) = bytes.len() as u32;
+            let name = out_ptr + 44; // cFileName
+            let nb = fname.as_bytes();
+            let cch = nb.len().min(259);
+            for i in 0..cch {
+                *((name + (i as u64) * 2) as *mut u16) = nb[i] as u16;
+            }
+            *((name + (cch as u64) * 2) as *mut u16) = 0;
+        }
+        crate::mm::virt::user_access_end();
+        return 1;
+    }
     let Some(entry) = io::ramfs::find(pattern, index as usize) else {
         return 0;
     };
@@ -613,13 +648,35 @@ extern "C" fn nt_create_file(name_ptr: u64, name_len: u64, _a3: u64, _a4: u64) -
     if let Ok(device) = io::namespace::lookup_device(&name) {
         return handle::ob_create_handle(device as *mut u8, 0);
     }
-    // Otherwise treat the name as a RAM-filesystem path.
+    // Otherwise treat the name as a filesystem path.
     if let Ok(path) = core::str::from_utf8(ascii) {
+        // The virtual "H:" drive is served by a host 9P server: `H:\readme.txt`
+        // reads readme.txt from the host over the p9 transport (see io::p9).
+        let bare = path.strip_prefix("\\??\\").unwrap_or(path);
+        if let Some(rest) = strip_host_drive(bare) {
+            return match io::p9::read(rest) {
+                Some(bytes) => io::ramfs::open_bytes(bytes)
+                    .map_or(0, |f| handle::ob_create_handle(f as *mut u8, 0)),
+                None => 0,
+            };
+        }
+        // Otherwise a RAM-filesystem path.
         if let Some(file) = io::ramfs::open(path) {
             return handle::ob_create_handle(file as *mut u8, 0);
         }
     }
     0
+}
+
+/// Strip a leading `H:\` (case-insensitive) host-drive prefix, returning the
+/// path relative to the host root, or `None` if it is not a host path.
+fn strip_host_drive(p: &str) -> Option<&str> {
+    let b = p.as_bytes();
+    if b.len() >= 3 && b[0].eq_ignore_ascii_case(&b'h') && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/') {
+        Some(&p[3..])
+    } else {
+        None
+    }
 }
 
 /// `NtOpenFile(FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock, …)`
@@ -683,7 +740,13 @@ extern "C" fn nt_open_file(
     if let Some(rest) = path.strip_prefix("\\??\\") {
         path = rest;
     }
-    let Some(file) = io::ramfs::open(path) else {
+    // The virtual "H:" drive is served by a host 9P server (see io::p9).
+    let opened = if let Some(rest) = strip_host_drive(path) {
+        io::p9::read(rest).and_then(io::ramfs::open_bytes)
+    } else {
+        io::ramfs::open(path)
+    };
+    let Some(file) = opened else {
         return STATUS_OBJECT_NAME_NOT_FOUND;
     };
     let h = handle::ob_create_handle(file as *mut u8, 0);
