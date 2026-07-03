@@ -41,6 +41,9 @@ pub enum RunStop {
     UnhandledFault { addr: u64 },
     /// `syscall` reached the host trap (only in non-machine mode).
     Syscall,
+    /// Execution reached an address in `breakpoints` (GDB stub). The instruction
+    /// at `rip` has NOT been executed yet.
+    Breakpoint { rip: u64 },
 }
 
 /// Physical-frame address mask (bits 51:12).
@@ -60,6 +63,12 @@ pub struct Machine {
     /// Debug watchpoints: rips to flag the first time they execute.
     pub watch: Vec<u64>,
     pub watch_hits: Vec<u64>,
+    /// GDB software breakpoints: run stops (before executing) when rip matches.
+    pub breakpoints: Vec<u64>,
+    /// When set, do not break on the very next instruction even if it sits on a
+    /// breakpoint — so `continue` from a hit breakpoint makes progress instead of
+    /// re-triggering immediately.
+    pub bp_skip_once: bool,
     /// Details of the last stop (for surfacing to the host on a fault/unknown):
     /// the RIP at the stop, a relevant address (CR2 for a fault), and the
     /// offending opcode byte for an unknown instruction.
@@ -83,6 +92,8 @@ impl Machine {
             hlts: 0,
             watch: Vec::new(),
             watch_hits: Vec::new(),
+            breakpoints: Vec::new(),
+            bp_skip_once: false,
             last_rip: 0,
             last_addr: 0,
             last_byte: 0,
@@ -326,9 +337,19 @@ impl Machine {
                     self.watch_hits.push(r);
                 }
             }
+            // GDB software breakpoint: stop before executing. `bp_skip_once`
+            // lets a resume step off the breakpoint it is sitting on.
+            if !self.breakpoints.is_empty() {
+                let skip = self.bp_skip_once;
+                self.bp_skip_once = false;
+                if !skip && self.breakpoints.contains(&self.cpu.rip) {
+                    return RunStop::Breakpoint { rip: self.cpu.rip };
+                }
+            }
 
             match self.cpu.step(&mut self.ram) {
                 StepResult::Ok => continue,
+                StepResult::DebugBreak => return RunStop::Breakpoint { rip: self.cpu.rip },
                 StepResult::Hlt => {
                     self.hlts += 1;
                     // Idle. Deliver an eligible pending interrupt, or fast-forward

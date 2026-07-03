@@ -98,7 +98,11 @@ pub fn ki_system_startup(boot_info: &'static mut BootInfo) -> ! {
     // ---- Phase 0 -------------------------------------------------------
     hal::serial::init();
     kd_println!();
-    kd_println!("ntoskrnl-rs 0.1.0 (x86_64) — NT-compatible kernel in Rust");
+    kd_println!("nanokrnl 0.1.0 (x86_64) - a Windows NT-compatible kernel, written from scratch in Rust.");
+    kd_println!("Boots in the browser under nanox, runs unmodified Windows console binaries on its own");
+    kd_println!("NT syscalls, with a 9P host filesystem, an lldb/gdb debug stub, and crash-dump support.");
+    kd_println!("By Matt Suiche (@msuiche), Fable 5, and Opus 4.8. Shout out to Fabrice Bellard.");
+    kd_println!();
     kd_println!("KiSystemStartup: phase 0");
 
     let phys_offset = boot_info
@@ -185,7 +189,7 @@ fn report_and_idle() -> ! {
         kd_println!("*** SELF TESTS FAILED ***");
         unsafe { hal::port::outl(0xF4, 0x01) }; // qemu exit code 3
     } else {
-        kd_println!("ALL SELF TESTS PASSED — system idle");
+        kd_println!("ALL SELF TESTS PASSED - system idle");
         unsafe { hal::port::outl(0xF4, 0x10) }; // qemu exit code 33
     }
     loop {
@@ -1583,6 +1587,11 @@ static WHOAMI_MUI: &[u8] = include_bytes!(env!("NTOS_WHOAMI_MUI_IMAGE"));
 /// A second, independent console app — proves the loader runs arbitrary
 /// programs. Empty when not built (see `scripts/build-userapp2.sh`).
 pub(crate) const USERAPP2_IMAGE: &[u8] = include_bytes!(env!("NTOS_USERAPP2_IMAGE"));
+
+/// `crash.exe` — a ring-3 program that deliberately bugchecks the machine, so a
+/// visitor can trigger a blue screen from the shell. Empty when not built (see
+/// `scripts/build-crash.sh`).
+pub(crate) const CRASH_IMAGE: &[u8] = include_bytes!(env!("NTOS_CRASH_IMAGE"));
 
 /// The worker app — run by two concurrent threads to demonstrate preemptive
 /// user-mode multitasking. Empty when not built (`scripts/build-worker.sh`).

@@ -143,7 +143,8 @@ pub extern "C" fn nanox_boot(entry: u64, rsp: u64) {
 }
 
 /// Run up to `steps` instructions. Returns a status code:
-/// 0 halted, 1 max-steps, 2 unknown opcode, 3 unhandled fault, 4 syscall trap.
+/// 0 halted, 1 max-steps, 2 unknown opcode, 3 unhandled fault, 4 syscall trap,
+/// 5 breakpoint (GDB stub).
 #[no_mangle]
 pub extern "C" fn nanox_run(steps: u32) -> u32 {
     unsafe {
@@ -154,6 +155,7 @@ pub extern "C" fn nanox_run(steps: u32) -> u32 {
             RunStop::Unknown { .. } => 2,
             RunStop::UnhandledFault { .. } => 3,
             RunStop::Syscall => 4,
+            RunStop::Breakpoint { .. } => 5,
         }
     }
 }
@@ -172,6 +174,29 @@ pub extern "C" fn nanox_fault_addr() -> u64 {
 #[no_mangle]
 pub extern "C" fn nanox_fault_byte() -> u32 {
     unsafe { MACHINE.as_ref().map_or(0, |m| m.last_byte as u32) }
+}
+
+// --- crash-dump acquisition ----------------------------------------------
+// The page reads guest physical RAM directly out of wasm memory and assembles a
+// Windows-format MEMORY.DMP (host-side acquisition, like a hypervisor snapshot).
+// These expose the RAM window and the metadata the dump header needs.
+
+/// Byte offset of guest physical RAM within this module's linear memory. The
+/// page builds a Uint8Array view at [ptr, ptr+len) to read all of physical
+/// memory. Stable for the machine's lifetime (the RAM buffer is never resized).
+#[no_mangle]
+pub extern "C" fn nanox_ram_ptr() -> u32 {
+    unsafe { MACHINE.as_ref().map_or(0, |m| m.ram.as_ptr() as u32) }
+}
+/// Size of guest physical RAM in bytes.
+#[no_mangle]
+pub extern "C" fn nanox_ram_len() -> u32 {
+    unsafe { MACHINE.as_ref().map_or(0, |m| m.ram.len() as u32) }
+}
+/// CR3 (DirectoryTableBase) — lets WinDbg translate virtual addresses in the dump.
+#[no_mangle]
+pub extern "C" fn nanox_cr3() -> u64 {
+    unsafe { MACHINE.as_ref().map_or(0, |m| m.cpu.paging.cr3) }
 }
 
 /// Pop one byte the guest wrote to the UART, or -1 if none.
@@ -214,6 +239,82 @@ pub extern "C" fn nanox_p9_write(byte: u8) {
     unsafe {
         if let Some(m) = MACHINE.as_mut() {
             m.cpu.dev.p9.rx.push_back(byte);
+        }
+    }
+}
+
+// --- GDB remote debugging bridge -----------------------------------------
+// The page relays bytes between a debugger (lldb/gdb, via a TCP<->WebSocket
+// bridge) and this stub. While `nanox_gdb_running()` is 0 the page must NOT
+// call `nanox_run` — the target is halted under debugger control.
+
+static mut GDB: Option<crate::gdb::GdbStub> = None;
+
+/// Attach the GDB stub (idempotent). After this the page should route debugger
+/// bytes through `nanox_gdb_write` and stop calling `nanox_run` unless
+/// `nanox_gdb_running()` returns 1.
+#[no_mangle]
+pub extern "C" fn nanox_gdb_attach() {
+    unsafe {
+        if GDB.is_none() {
+            GDB = Some(crate::gdb::GdbStub::new());
+        }
+        if let Some(m) = MACHINE.as_mut() {
+            m.cpu.debug_break = true; // int3 (e.g. a bugcheck) now traps to the debugger
+        }
+    }
+}
+
+/// Detach the stub and let the machine run freely again.
+#[no_mangle]
+pub extern "C" fn nanox_gdb_detach() {
+    unsafe {
+        GDB = None;
+        if let Some(m) = MACHINE.as_mut() {
+            m.breakpoints.clear();
+            m.cpu.debug_break = false;
+        }
+    }
+}
+
+/// Feed one byte received from the debugger. Complete packets are dispatched
+/// immediately against the machine (may set/clear breakpoints, single-step,
+/// resume, etc.).
+#[no_mangle]
+pub extern "C" fn nanox_gdb_write(byte: u8) {
+    unsafe {
+        if let (Some(g), Some(m)) = (GDB.as_mut(), MACHINE.as_mut()) {
+            g.on_input(m, &[byte]);
+        }
+    }
+}
+
+/// Pop one byte to send back to the debugger, or -1 if none.
+#[no_mangle]
+pub extern "C" fn nanox_gdb_read() -> i32 {
+    unsafe {
+        match GDB.as_mut().and_then(|g| g.out.pop_front()) {
+            Some(b) => b as i32,
+            None => -1,
+        }
+    }
+}
+
+/// Whether the debugger has the target running (1) or halted (0). The page runs
+/// the machine only while this is 1.
+#[no_mangle]
+pub extern "C" fn nanox_gdb_running() -> u32 {
+    unsafe { GDB.as_ref().map_or(1, |g| g.running as u32) }
+}
+
+/// Tell the stub the machine just stopped (breakpoint/fault); it sends the
+/// debugger a stop reply and halts. Call after `nanox_run` returns a non-running
+/// code while attached.
+#[no_mangle]
+pub extern "C" fn nanox_gdb_notify_stop(signal: u32) {
+    unsafe {
+        if let Some(g) = GDB.as_mut() {
+            g.report_stop(signal as u8);
         }
     }
 }

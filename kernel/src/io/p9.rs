@@ -32,6 +32,10 @@ const TREAD: u8 = 116;
 const RREAD: u8 = 117;
 const TREADDIR: u8 = 40;
 const RREADDIR: u8 = 41;
+const TLCREATE: u8 = 14;
+const RLCREATE: u8 = 15;
+const TWRITE: u8 = 118;
+const RWRITE: u8 = 119;
 const TCLUNK: u8 = 120;
 
 const NOTAG: u16 = 0xFFFF;
@@ -40,6 +44,7 @@ const ROOT_FID: u32 = 0;
 const FILE_FID: u32 = 1;
 const MSIZE: u32 = 8192;
 const READ_CHUNK: u32 = 4096;
+const WRITE_CHUNK: usize = 4096; // stay within MSIZE (header + data)
 
 /// Spin until the transport has a response byte, then read it. Bounded so a
 /// missing/wedged host server cannot hang the kernel forever.
@@ -57,11 +62,15 @@ fn read_byte() -> Option<u8> {
     }
 }
 
-/// Send a framed T-message and read the framed R-message it produces.
-fn rpc(req: &[u8]) -> Option<Vec<u8>> {
+/// Write a framed T-message to the transport (no wait for a reply).
+fn send(req: &[u8]) {
     for &b in req {
         unsafe { outb(DATA, b) };
     }
+}
+
+/// Read one framed R-message from the transport.
+fn recv() -> Option<Vec<u8>> {
     let mut hdr = [0u8; 4];
     for h in hdr.iter_mut() {
         *h = read_byte()?;
@@ -76,6 +85,12 @@ fn rpc(req: &[u8]) -> Option<Vec<u8>> {
         buf.push(read_byte()?);
     }
     Some(buf)
+}
+
+/// Send a framed T-message and read the framed R-message it produces.
+fn rpc(req: &[u8]) -> Option<Vec<u8>> {
+    send(req);
+    recv()
 }
 
 // --- message builders (little-endian, no padding) ------------------------
@@ -153,9 +168,102 @@ fn tclunk() -> Vec<u8> {
     v.extend_from_slice(&FILE_FID.to_le_bytes());
     finish(v)
 }
-
+fn tlcreate(name: &str) -> Vec<u8> {
+    // Create `name` inside the directory FILE_FID refers to; on success FILE_FID
+    // becomes the newly created, open-for-write file.
+    let mut v = Vec::new();
+    begin(&mut v, TLCREATE, 0);
+    v.extend_from_slice(&FILE_FID.to_le_bytes());
+    pstr(&mut v, name);
+    v.extend_from_slice(&0x241u32.to_le_bytes()); // flags: O_WRONLY|O_CREAT|O_TRUNC
+    v.extend_from_slice(&0o644u32.to_le_bytes()); // mode
+    v.extend_from_slice(&0u32.to_le_bytes()); // gid
+    finish(v)
+}
 fn is_type(reply: &Option<Vec<u8>>, typ: u8) -> bool {
     matches!(reply, Some(r) if r.len() >= 5 && r[4] == typ)
+}
+
+/// A streaming write handle to a host file created over 9P. Built by
+/// [`create`]; append with [`Writer::write`] and finish with [`Writer::close`].
+/// Used by the crash path to stream a (multi-megabyte) ELF core to `H:\` without
+/// buffering the whole thing in kernel memory.
+pub struct Writer {
+    off: u64,
+}
+
+impl Writer {
+    /// Append `data` at the current offset, chunked to the negotiated msize.
+    /// Returns false on any transport/protocol failure.
+    ///
+    /// Writes are *pipelined*: a batch of Twrites is sent before reading any
+    /// reply, so the host services many per run-slice instead of one (the
+    /// transport otherwise turns over roughly one request per slice, which makes
+    /// a multi-megabyte dump crawl).
+    pub fn write(&mut self, data: &[u8]) -> bool {
+        const BATCH: usize = 32; // 32 * 4 KiB = 128 KiB in flight
+        let mut off = self.off;
+        let mut pending = 0usize;
+        for c in data.chunks(WRITE_CHUNK) {
+            // Build the Twrite header on the stack and stream the payload straight
+            // from `c`. No allocation and no payload copy in this loop: the data
+            // being dumped can be the very memory the dumper would allocate into,
+            // so a copy could alias itself.
+            let mut h = [0u8; 23]; // size[4] type[1] tag[2] fid[4] offset[8] count[4]
+            h[4] = TWRITE;
+            h[7..11].copy_from_slice(&FILE_FID.to_le_bytes());
+            h[11..19].copy_from_slice(&off.to_le_bytes());
+            h[19..23].copy_from_slice(&(c.len() as u32).to_le_bytes());
+            h[0..4].copy_from_slice(&((23 + c.len()) as u32).to_le_bytes());
+            send(&h);
+            send(c);
+            off += c.len() as u64;
+            pending += 1;
+            if pending == BATCH {
+                for _ in 0..pending {
+                    if !is_type(&recv(), RWRITE) {
+                        return false;
+                    }
+                }
+                pending = 0;
+            }
+        }
+        for _ in 0..pending {
+            if !is_type(&recv(), RWRITE) {
+                return false;
+            }
+        }
+        self.off = off;
+        true
+    }
+    /// Bytes written so far.
+    pub fn offset(&self) -> u64 {
+        self.off
+    }
+    /// Release the fid (Tclunk); the host finalizes the file.
+    pub fn close(self) {
+        let _ = rpc(&tclunk());
+    }
+}
+
+/// Create `name` in the host root over 9P and return a [`Writer`] positioned at
+/// offset 0, or `None` on failure. `name` is a single root-level component
+/// (e.g. `nanokrnl.core`).
+pub fn create(name: &str) -> Option<Writer> {
+    if !is_type(&rpc(&tversion()), RVERSION) {
+        return None;
+    }
+    if !is_type(&rpc(&tattach()), RATTACH) {
+        return None;
+    }
+    // Clone the root fid onto FILE_FID (a directory), then create the file in it.
+    if !is_type(&rpc(&twalk("")), RWALK) {
+        return None;
+    }
+    if !is_type(&rpc(&tlcreate(name)), RLCREATE) {
+        return None;
+    }
+    Some(Writer { off: 0 })
 }
 
 /// Read a whole host file by path (e.g. "readme.txt") over 9P. Returns the file

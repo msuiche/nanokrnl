@@ -314,3 +314,66 @@ Tested headless against the shipped `nanox.wasm` + snapshot + the real
 `p9-server.js`: `dir H:\` lists readme.txt and hello.txt with correct sizes and
 the usual "N File(s)" footer; `more H:\file` still reads a named file (no
 regression).
+
+### 2026-07-03 (later) - lldb/gdb debugging, a BSOD, and a kernel-authored ELF core
+
+Turned nanokrnl into something you can actually debug and post-mortem, in the
+browser.
+
+**A GDB stub in nanox.** `emu/src/gdb.rs` is a transport-agnostic GDB Remote
+Serial Protocol stub: read/write registers and memory (translated through the
+guest page tables), software breakpoints, single-step, continue, and a
+`target.xml` so lldb enumerates x86-64 registers. `emu/examples/gdb_server.rs`
+serves it over TCP; the browser reaches it through `nanox_gdb_*` wasm exports and
+a dependency-free Python bridge (`tools/gdb-bridge.py`, also served at
+`/bridge.py`) that relays TCP <-> WebSocket and launches lldb. Verified with real
+lldb (native and through the full browser bridge chain): breakpoint set +
+continue + hit, register and memory reads, disassembly.
+
+**Bugcheck breaks into the debugger.** nanox intercepts `int3` (0xCC): with a
+debugger attached (`Cpu::debug_break`) it traps to the stub; with none it is a
+no-op. The manual-crash path issues `int3` after writing the dump, so a bugcheck
+breaks into lldb like KdBreak on a real kernel.
+
+**A blue screen.** `crash.exe` (a tiny ring-3 program) issues `SVC_BUGCHECK` ->
+`KeBugCheckEx(MANUALLY_INITIATED_CRASH)`. The page recolors the console window
+blue and clears the scrollback so only the `*** STOP: 0x000000E2` banner shows.
+
+**nanokrnl writes its own crash dump, as an ELF core, over writable 9P.** This
+is the interesting one. First we tried a Windows `MEMORY.DMP` built by the page
+from guest RAM, but that is neither faithful (the kernel should author its own
+dump) nor analyzable (a `DUMP_HEADER64` needs a `KDDEBUGGER_DATA64` and a PDB,
+and nanokrnl is an ELF). The realization: nanokrnl is an ELF with DWARF, and
+modern WinDbg (and gdb, and `crash`) read ELF + DWARF directly. So the faithful
+format is a Linux-style **ELF core** (`ET_CORE`), and the kernel's own
+`kernel.bin` is the symbol file - no synthetic PDB, nothing built in JavaScript.
+
+- Writable 9P: `Tlcreate` + `Twrite` on both the kernel client (`io::p9`, with a
+  streaming, no-allocation, pipelined `Writer`) and the JS/test servers.
+- `kernel/src/dump.rs`: on a bugcheck the kernel walks its higher-half page
+  tables, emits one `PT_LOAD` per mapping (so code and stacks are readable at
+  their real virtual addresses), a `PT_NOTE` with `NT_PRSTATUS` (the crash
+  registers) and `VMCOREINFO` (kdump metadata + the bugcheck), dumps the low
+  physical window once, and streams the whole `nanokrnl.core` to `H:\` over 9P.
+- The page only *receives* it (`p9.onFinalize`) and offers Download; the JS dump
+  builder is gone.
+
+Two transport lessons: the byte-wise 9P port turns over roughly one request per
+run-slice, so a naive multi-MB dump crawled - fixed by pipelining a batch of
+`Twrite`s before reading replies. And the payload must be streamed straight from
+the dumped region (no intermediate copy): copying it into a freshly allocated
+buffer can alias the very memory being dumped, which the emulator flags as UB.
+
+Tested headless (native + the shipped wasm + real `p9-server.js`): `crash`
+produces a 33 MB `ET_CORE` whose `NT_PRSTATUS` RIP/RSP both fall inside
+`PT_LOAD` segments and whose `VMCOREINFO` records `BUGCHECK=0x000000e2`. A
+structural validator checks the header, notes, run list, and file extents;
+`gdb kernel.bin nanokrnl.core` on a real machine is the final check.
+
+**H:\ Explorer.** A small Win95-style window under the Resource Monitor lists the
+9P share (readme.txt, hello.txt, and nanokrnl.core after a crash); click to
+download.
+
+Also: the boot banner had two em dashes that rendered as mojibake (the console is
+byte-wise, not UTF-8) - replaced with ASCII, and the banner now carries a fuller
+description + authorship.

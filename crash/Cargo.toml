@@ -1,0 +1,21 @@
+# crash — a ring-3 program that deliberately bugchecks the kernel.
+#
+# It prints a line, then issues the SVC_BUGCHECK syscall directly (no kernel32
+# export needed). The kernel prints the classic *** STOP banner and halts, which
+# the web page renders as a blue screen. The user-mode analog of Windows'
+# manually-initiated crash. Built by scripts/build-crash.sh.
+[package]
+name = "crash"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "crash"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"

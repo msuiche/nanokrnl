@@ -39,6 +39,8 @@ pub static FILES: &[RamFile] = &[
     },
     // A compute app, so CreateProcessW("C:\\child.exe") can load + launch it.
     RamFile { path: "C:\\child.exe", data: crate::init::USERAPP2_IMAGE },
+    // Deliberately bugchecks the machine: type `crash` at the prompt for a BSOD.
+    RamFile { path: "C:\\crash.exe", data: crate::init::CRASH_IMAGE },
     // The real Windows console programs we run against our shims.
     RamFile { path: "C:\\sort.exe", data: crate::init::SORT_IMAGE },
     RamFile { path: "C:\\choice.exe", data: crate::init::CHOICE_IMAGE },

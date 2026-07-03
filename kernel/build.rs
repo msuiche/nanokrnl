@@ -68,6 +68,11 @@ fn main() {
         "NTOS_WORKER_IMAGE",
     );
     resolve(
+        workspace.join("crash").join("crash.exe"),
+        "no_crash.bin",
+        "NTOS_CRASH_IMAGE",
+    );
+    resolve(
         workspace.join("msvcrt").join("msvcrt.dll"),
         "no_msvcrt.bin",
         "NTOS_MSVCRT_IMAGE",

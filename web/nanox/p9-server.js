@@ -16,7 +16,9 @@ const T = {
   ATTACH: 104, RATTACH: 105,
   WALK: 110, RWALK: 111,
   LOPEN: 12, RLOPEN: 13,
+  LCREATE: 14, RLCREATE: 15,
   READ: 116, RREAD: 117,
+  WRITE: 118, RWRITE: 119,
   READDIR: 40, RREADDIR: 41,
   CLUNK: 120, RCLUNK: 121,
   LERROR: 7,
@@ -32,7 +34,9 @@ export class P9Server {
     }
     this.inbuf = [];               // request bytes not yet framed into a message
     this.fids = new Map();         // fid -> Uint8Array (file) or null (directory)
+    this.wfids = new Map();        // fid -> { name, data:Uint8Array, len } for writes
     this.served = 0;
+    this.onFinalize = null;        // (name, Uint8Array) => void, when a written file is clunked
   }
 
   // Drain pending request bytes from the guest, serve any complete messages,
@@ -131,8 +135,42 @@ export class P9Server {
         r.u32(ents.b.length); r.bytes(ents.b);
         return r.done();
       }
-      case T.CLUNK:
+      case T.LCREATE: {                       // Tlcreate fid name flags mode gid
+        const fid = u32(0);
+        const l = body[4] | (body[5] << 8);
+        const name = new TextDecoder().decode(new Uint8Array(body.slice(6, 6 + l)));
+        this.wfids.set(fid, { name, data: new Uint8Array(1 << 16), len: 0 });
+        const r = new Reply(T.RLCREATE, tag); r.qid(0); r.u32(0); return r.done();
+      }
+      case T.WRITE: {                         // Twrite fid offset count data
+        const fid = u32(0);
+        const offset = u32(4) + u32(8) * 0x100000000;
+        const count = u32(12);
+        const w = this.wfids.get(fid);
+        if (w) {
+          const need = offset + count;
+          if (need > w.data.length) {
+            const grown = new Uint8Array(Math.max(w.data.length * 2, need));
+            grown.set(w.data.subarray(0, w.len));
+            w.data = grown;
+          }
+          w.data.set(new Uint8Array(body.slice(16, 16 + count)), offset);
+          if (need > w.len) w.len = need;
+        }
+        const r = new Reply(T.RWRITE, tag); r.u32(count); return r.done();
+      }
+      case T.CLUNK: {
+        // A written file is finalized here: hand the bytes to the page (it is
+        // NOT added to `files`, so the guest's `dir H:\` never tries to read a
+        // 30 MB core byte-wise over the port).
+        const fid = u32(0);
+        const w = this.wfids.get(fid);
+        if (w) {
+          this.wfids.delete(fid);
+          if (this.onFinalize) this.onFinalize(w.name, w.data.subarray(0, w.len));
+        }
         return new Reply(T.RCLUNK, tag).done();
+      }
       default:
         return rlerror(tag, 22); // EINVAL
     }

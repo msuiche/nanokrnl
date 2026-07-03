@@ -58,6 +58,9 @@ pub const SVC_LOAD_MESSAGE: usize = 31;
 pub const SVC_QUERY_ATTRIBUTES: usize = 32;
 pub const SVC_QUERY_DIRECTORY: usize = 33;
 pub const SVC_NT_OPEN_FILE: usize = 34;
+/// Deliberately bugcheck the machine (demo/`crash.exe`, akin to the test hook
+/// behind Windows' manually-initiated crash). Never returns.
+pub const SVC_BUGCHECK: usize = 35;
 
 /// A shared kernel counter incremented atomically by [`SVC_INCREMENT_COUNTER`].
 /// Used to prove concurrent ring-3 threads both make progress through the
@@ -122,6 +125,31 @@ pub fn register_all() {
     register_service(SVC_LOAD_MESSAGE, nt_load_message);
     register_service(SVC_QUERY_ATTRIBUTES, nt_query_attributes);
     register_service(SVC_QUERY_DIRECTORY, nt_query_directory);
+    register_service(SVC_BUGCHECK, nt_bugcheck);
+}
+
+/// Service for `crash.exe`: deliberately bugcheck the machine. The optional
+/// stop code arrives in arg1 (r10); 0 defaults to `MANUALLY_INITIATED_CRASH`,
+/// the code Windows uses for a user-forced crash. Never returns — the machine
+/// prints the stop banner and halts.
+extern "C" fn nt_bugcheck(code: u64, _a2: u64, _a3: u64, _a4: u64) -> u64 {
+    let stop = if code == 0 {
+        crate::ke::bugcheck::MANUALLY_INITIATED_CRASH
+    } else {
+        code as u32
+    };
+    // Author a crash dump to the host (H:\nanokrnl.core) BEFORE the STOP banner,
+    // while the machine is still running so the host 9P server can service the
+    // write. Best-effort: a no-op if no host server is attached.
+    let params = [0u64; 4];
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = crate::dump::write_core(stop, &params);
+        // Break into an attached kernel debugger (lldb/gdb), like KdBreak on a
+        // real bugcheck. A no-op in nanox when nothing is attached.
+        unsafe { core::arch::asm!("int3") };
+    }
+    crate::ke::bugcheck::ke_bug_check_ex(stop, params[0], params[1], params[2], params[3])
 }
 
 /// `FindFirstFile`/`FindNextFile` backend (a1 = UTF-16 wildcard pattern ptr,

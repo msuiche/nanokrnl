@@ -28,6 +28,7 @@ pub mod devices;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
 pub mod elf;
+pub mod gdb;
 pub mod machine;
 pub mod mmu;
 pub mod pe;
@@ -131,6 +132,9 @@ pub struct Cpu {
     /// the syscall/return sequence.
     pub trace_sys: bool,
     pub sys_log: alloc::vec::Vec<(u32, u64)>,
+    /// When set (a GDB stub is attached), an `int3` traps to the debugger
+    /// instead of being ignored — so a kernel bugcheck breaks into it.
+    pub debug_break: bool,
 }
 
 /// Low-`size`-bytes mask as a u128 (size 8 -> full 64-bit mask).
@@ -173,6 +177,9 @@ pub enum StepResult {
     /// Executed `hlt`: the CPU idles until the next interrupt. The machine run
     /// loop services pending device interrupts and resumes.
     Hlt,
+    /// Executed `int3` while a debugger is attached (`Cpu::debug_break`): the run
+    /// loop stops so the GDB stub can report a trap.
+    DebugBreak,
 }
 
 /// A decoded ModRM r/m: a register index or an effective memory address.
@@ -211,6 +218,7 @@ impl Default for Cpu {
             icount: 0,
             trace_sys: false,
             sys_log: alloc::vec::Vec::new(),
+            debug_break: false,
         }
     }
 }
@@ -2334,6 +2342,18 @@ impl Cpu {
             0xf4 => {
                 self.rip = (pc + 1) as u64;
                 StepResult::Hlt
+            }
+            // int3 (CC): a debugger breakpoint. rip is advanced past it (trap
+            // semantics). With a GDB stub attached, trap to the debugger; with
+            // none, it is a no-op — so a kernel bugcheck's break-in is harmless
+            // when nobody is debugging.
+            0xcc => {
+                self.rip = (pc + 1) as u64;
+                if self.debug_break {
+                    StepResult::DebugBreak
+                } else {
+                    StepResult::Ok
+                }
             }
             // int imm8 (CD): software interrupt through the IDT.
             0xcd => {

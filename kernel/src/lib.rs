@@ -61,6 +61,8 @@ pub mod cm;
 #[cfg(target_arch = "x86_64")]
 pub mod io;
 #[cfg(target_arch = "x86_64")]
+pub mod dump;
+#[cfg(target_arch = "x86_64")]
 pub mod ldr;
 #[cfg(target_arch = "x86_64")]
 pub mod ob;

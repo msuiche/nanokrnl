@@ -41,4 +41,9 @@ if [ -f "$KERNEL" ]; then
 else
   echo "note: kernel ELF not found; build it first (see the command above)"
 fi
+# Stage the copy-paste debugger bridge so the live site can serve it at
+# /bridge.py (the page's Debug panel offers a curl one-liner to run it).
+cp ../tools/gdb-bridge.py "$OUT/bridge.py"
+echo "staged bridge: $OUT/bridge.py"
+
 echo "staged $OUT — serve web/nanox/ and open it"

@@ -21,6 +21,10 @@ worker/target
 worker/worker.exe
 worker/kernel32.def
 worker/kernel32.lib
+crash/target
+crash/crash.exe
+crash/kernel32.def
+crash/kernel32.lib
 msvcrt/target
 msvcrt/msvcrt.dll
 msvcrt/msvcrt.def
@@ -47,3 +51,7 @@ drivers/*.sys
 # The browser demo is served from web/nanox/, so everything there — index.html,
 # background.js, the chiptune decoder, nanox.wasm, the kernel image, and the
 # tracks — is committed on purpose (GitHub Pages serves it as-is).
+
+# Python caches
+__pycache__/
+*.pyc

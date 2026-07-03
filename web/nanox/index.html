@@ -98,6 +98,9 @@
     font-size: 12px; line-height: 1.4;
     box-shadow: inset 1px 1px #808080, inset -1px -1px #fff, inset 2px 2px #404040; }
   #screen:focus { color: #dcdcdc; }
+  /* Kernel bugcheck: the classic blue screen. */
+  #screen.bsod { background: #0000aa; color: #fff; box-shadow: none; }
+  #screen.bsod .cursor { background: #fff; }
   #screen .cursor { display: inline-block; width: 8px; height: 13px; background: #c4c4c4;
     vertical-align: text-bottom; animation: blink 1.05s steps(1) infinite; }
   @keyframes blink { 50% { opacity: 0; } }
@@ -126,6 +129,14 @@
   @keyframes pulse { 50% { opacity: .35; } }
   /* readme.txt usage dialog, floating top-right */
   #readme { position: fixed; top: 18px; right: 18px; width: 234px; z-index: 5; }
+  #dbgpanel { position: fixed; top: 70px; left: 50%; transform: translateX(-50%);
+    width: min(560px, 92vw); z-index: 60; }
+  #dbgpanel > .tb { cursor: move; }
+  #dbgpanel > .tb .x { margin-left: auto; width: 16px; height: 14px; line-height: 11px; text-align: center; font-size: 11px;
+    color: #000; background: #c0c0c0; cursor: pointer;
+    box-shadow: inset 1px 1px #fff, inset -1px -1px #404040, inset 2px 2px #dfdfdf, inset -2px -2px #808080; }
+  #dbgpanel > .tb .x:hover { background: #d65a43; color: #fff; }
+  #dbgpanel .wb { color: #1f1f1f; }
   #readme > .tb { cursor: move; }
   #readme > .tb .x { margin-left: auto; width: 16px; height: 14px; line-height: 11px; text-align: center; font-size: 11px;
     color: #000; background: #c0c0c0; cursor: pointer;
@@ -239,6 +250,26 @@
     font: 11px ui-monospace, "Consolas", monospace; color: #1c1c1c; }
   #resmon .rm-row b { color: #0a3d14; font-variant-numeric: tabular-nums; }
   #resmon.hidden { display: none; }
+  /* H:\ Explorer, docked under the Resource Monitor (same Win95 chrome). */
+  #explorer { position: fixed; left: 18px; top: calc(50% + 108px); width: 190px; z-index: 5;
+    background: #c0c0c0; padding: 3px; font: 11px Tahoma, "MS Sans Serif", sans-serif;
+    box-shadow: inset 1px 1px #fff, inset -1px -1px #404040, inset 2px 2px #dfdfdf, inset -2px -2px #808080, 5px 5px 0 rgba(0,0,0,.4); }
+  #explorer .rm-title { display: flex; align-items: center; padding: 2px 3px 3px 5px; cursor: move;
+    background: linear-gradient(90deg, #000082 0%, #1083d2 100%); color: #fff; font-size: 12px; font-weight: 700; }
+  #explorer .rm-title .x { margin-left: auto; width: 16px; height: 14px; line-height: 11px; text-align: center;
+    font-size: 11px; color: #000; background: #c0c0c0; cursor: pointer;
+    box-shadow: inset 1px 1px #fff, inset -1px -1px #404040, inset 2px 2px #dfdfdf, inset -2px -2px #808080; }
+  #explorer .rm-title .x:hover { background: #d65a43; color: #fff; }
+  #explorer .ex-body { margin-top: 3px; padding: 5px 6px; background: #fff;
+    box-shadow: inset 1px 1px #808080, inset -1px -1px #fff; }
+  #explorer .ex-path { font-size: 10px; color: #555; margin-bottom: 4px; }
+  #explorer ul { list-style: none; margin: 0; padding: 0; }
+  #explorer li { display: flex; justify-content: space-between; gap: 8px; padding: 2px 3px; cursor: pointer;
+    font: 11px ui-monospace, "Consolas", monospace; color: #14210f; }
+  #explorer li:hover { background: #000082; color: #fff; }
+  #explorer li .sz { color: #666; }
+  #explorer li:hover .sz { color: #cfe0ff; }
+  #explorer.hidden { display: none; }
 
   /* --- Resources / links (Win95 mini window, top-left) --- */
   #links { position: fixed; left: 18px; top: 18px; width: 184px; z-index: 5; background: #c0c0c0; padding: 3px;
@@ -300,6 +331,8 @@
       <button id="fastboot">Fast Boot</button>
       <button id="restart" disabled>Restart</button>
       <button id="shutdown" disabled>Shut Down</button>
+      <button id="debug" disabled title="Attach lldb/gdb via tools/gdb-bridge.py">Debug</button>
+      <button id="bsod-dump" style="display:none" title="Save the ELF core nanokrnl wrote to H:\ (open with gdb kernel.bin nanokrnl.core)">Download nanokrnl.core</button>
       <span class="hint" id="bootHint">Boot runs the real cold boot; Fast Boot resumes a saved snapshot instantly.</span>
     </div>
     <div class="statusbar">
@@ -376,6 +409,16 @@
   </div>
 </div>
 
+<!-- A tiny Explorer view of the H:\ share (the 9P host filesystem). Lists the
+     files the browser serves, plus nanokrnl.core once a crash writes one. -->
+<div id="explorer">
+  <div class="rm-title" id="ex-drag">Explorer: H:\<span class="x" id="ex-close" title="Close">&times;</span></div>
+  <div class="ex-body">
+    <div class="ex-path">H:\ (host shared folder, 9P)</div>
+    <ul id="ex-list"></ul>
+  </div>
+</div>
+
 <!-- Resources / links, as a small desktop window -->
 <div id="links">
   <div class="lk-title" id="lk-drag">Resources<span class="x" id="lk-close" title="Close">&times;</span></div>
@@ -392,6 +435,27 @@
   <div class="wb">Type directly into the console once you see <code>C:\&gt;</code>. Try <b>ver</b>, <b>echo hi</b>, or <b>exit</b>.
      <kbd>Enter</kbd> sends the line. The kernel runs its self-tests first, so the prompt takes a few seconds.</div>
 </div>
+
+<!-- Debugger bridge: shown when you click Debug. A copy-paste Python bridge lets
+     lldb (which speaks TCP) attach to this kernel (which speaks WebSocket). -->
+<div id="dbgpanel" class="win95" style="display:none">
+  <div class="tb" id="dbg-drag">Attach lldb / gdb<span class="x" id="dbg-close" title="Close">&times;</span></div>
+  <div class="wb">
+    <p style="margin:0 0 6px">lldb speaks TCP; a browser tab speaks WebSocket. Paste this into a terminal (macOS/Linux, needs Python 3): it downloads a tiny bridge and launches lldb attached to <b>this</b> kernel.</p>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
+      <code id="dbg-oneliner" style="flex:1;background:#000;color:#15e637;padding:5px 7px;font-size:12px;overflow:auto;white-space:nowrap">python3 &lt;(curl -sL /bridge.py)</code>
+      <button id="dbg-copy-cmd">Copy</button>
+    </div>
+    <span id="dbg-status" style="font-size:11px;color:#4a4a4a">not connected</span>
+    <details style="margin-top:6px">
+      <summary style="font-size:11px;color:#4a4a4a;cursor:pointer">or copy the bridge script itself (no curl)</summary>
+      <button id="dbg-copy" style="margin:5px 0">Copy bridge.py (Python 3)</button>
+      <pre id="dbg-src" style="max-height:140px;overflow:auto;background:#000;color:#15e637;padding:6px;font-size:11px;line-height:1.35;margin:0;white-space:pre">loading bridge.py ...</pre>
+    </details>
+    <p style="margin:6px 0 0;font-size:11px;color:#4a4a4a">Keep this page open. lldb attaches automatically; try <code>register read</code>, <code>breakpoint set -a $pc</code>, <code>c</code>.</p>
+  </div>
+</div>
+
 <script>
 (() => {
   const $ = (id) => document.getElementById(id);
@@ -639,6 +703,8 @@ const statsEl = document.getElementById("statsText");
 const btnBoot = document.getElementById("boot");
 const btnFast = document.getElementById("fastboot");
 const btnRestart = document.getElementById("restart");
+const btnDebug = document.getElementById("debug");
+const btnDump = document.getElementById("bsod-dump");
 const btnShutdown = document.getElementById("shutdown");
 const dec = new TextDecoder();
 
@@ -680,8 +746,26 @@ const p9 = new P9Server({
     "Hello from the host filesystem. These bytes crossed the 9P wire from\r\n" +
     "JavaScript into the emulated kernel and back out to your console.\r\n",
 });
+// When nanokrnl writes a file to H:\ (a crash writes nanokrnl.core), the server
+// hands us the bytes here - the page only transports/serves them, it never
+// builds the dump itself.
+p9.onFinalize = (name, bytes) => {
+  if (name === "nanokrnl.core") {
+    dumpBytes = bytes.slice();          // copy out of the server's growable buffer
+    btnDump.style.display = "";
+    if (bsod) setStatus("stop", `bugcheck · ${(dumpBytes.length / 1048576).toFixed(0)} MB core on H:\\`);
+  } else {
+    p9.files[name] = bytes.slice();     // small host-written files show up in H:\
+  }
+  if (typeof renderExplorer === "function") renderExplorer();
+};
 
 let e = null, running = false, raf = 0;
+let dumpBytes = null;   // the ELF core nanokrnl wrote to H:\ (received via p9.onFinalize)
+// GDB remote debugging: bytes flow page <-> ws bridge <-> lldb/gdb. `gdbIn`
+// buffers debugger bytes for the run loop to feed into the wasm stub.
+let gdbAttached = false, gdbWs = null;
+const gdbIn = [];
 let term = "";          // the console text buffer
 let col = 0;            // cursor column on the current (last) line, for \r overwrite
 // We run the emulator in chunks within a wall-clock budget per animation frame
@@ -745,7 +829,11 @@ document.getElementById("rm-close").onclick = () => document.getElementById("res
 function dragWindow(win, handle) {
   handle.onmousedown = (e) => {
     if (e.target.closest(".x")) return;
-    const r = win.getBoundingClientRect(); win.style.right = "auto";
+    const r = win.getBoundingClientRect();
+    // Pin to the current visual position, dropping any centering transform so
+    // the first drag doesn't jump.
+    win.style.right = "auto"; win.style.transform = "none";
+    win.style.left = r.left + "px"; win.style.top = r.top + "px";
     const ox = e.clientX - r.left, oy = e.clientY - r.top;
     const mv = (ev) => { win.style.left = Math.max(0, ev.clientX - ox) + "px"; win.style.top = Math.max(0, ev.clientY - oy) + "px"; };
     const up = () => { document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up); };
@@ -758,6 +846,36 @@ dragWindow(document.getElementById("links"), document.getElementById("lk-drag"))
 // readme.txt usage dialog
 document.getElementById("readme-close").onclick = () => document.getElementById("readme").classList.add("hidden");
 dragWindow(document.getElementById("readme"), document.getElementById("readme-drag"));
+
+// H:\ Explorer: a live view of the 9P host share. Lists the files the page
+// serves, plus nanokrnl.core once a crash writes one. Click a row to download.
+function renderExplorer() {
+  const ul = document.getElementById("ex-list");
+  if (!ul) return;
+  ul.innerHTML = "";
+  const rows = Object.entries(p9.files).map(([n, d]) => [n, d]);
+  if (dumpBytes) rows.push(["nanokrnl.core", dumpBytes]);
+  for (const [name, data] of rows) {
+    const size = data.length;
+    const kb = size >= 1024 ? (size / 1024).toFixed(0) + " KB" : size + " B";
+    const li = document.createElement("li");
+    const label = document.createElement("span"); label.textContent = "📄 " + name;
+    const sz = document.createElement("span"); sz.className = "sz"; sz.textContent = kb;
+    li.append(label, sz);
+    li.title = "Download " + name;
+    li.onclick = () => {
+      const url = URL.createObjectURL(new Blob([data], { type: "application/octet-stream" }));
+      const a = document.createElement("a"); a.href = url; a.download = name; a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+    };
+    ul.appendChild(li);
+  }
+}
+renderExplorer();
+document.getElementById("ex-close").onclick = () => document.getElementById("explorer").classList.add("hidden");
+dragWindow(document.getElementById("explorer"), document.getElementById("ex-drag"));
+// The debugger-bridge panel is draggable too; its × (dbg-close) closes it.
+dragWindow(document.getElementById("dbgpanel"), document.getElementById("dbg-drag"));
 function render() {
   screen.textContent = term;
   const c = document.createElement("span"); c.className = "cursor"; screen.appendChild(c);
@@ -782,30 +900,67 @@ function putChar(c) {
   else term += String.fromCharCode(c);
   col++;
 }
+let bsod = false;
 function drainUart() {
   let b, changed = false;
   while ((b = e.nanox_uart_read()) >= 0) { changed = true; putChar(b); }
   if (changed) {
     if (term.length > 200000) { term = term.slice(-150000); col = Math.min(col, term.length - term.lastIndexOf("\n") - 1); }
     render();
+    // A kernel bugcheck ("*** STOP:") turns the console into a blue screen and
+    // ends the session: the machine has halted itself.
+    if (!bsod && term.includes("*** STOP:")) {
+      bsod = true;
+      const name = (term.match(/\*\*\* ([A-Z0-9_]+)\s*$/m) || [])[1];
+      // Clear the Command Prompt scrollback so the blue screen shows only the
+      // bugcheck banner, like a real BSOD.
+      const i = term.indexOf("*** STOP:");
+      if (i >= 0) term = term.slice(i);
+      col = 0;
+      screen.classList.add("bsod");                          // the console window goes blue
+      render();
+      // nanokrnl writes the core to H:\ itself (over 9P); the button appears
+      // once the server hands us the bytes, which usually happened already since
+      // the kernel dumps before printing STOP.
+      btnDump.style.display = dumpBytes ? "" : "none";
+      setStatus("stop", "bugcheck" + (name ? " · " + name : "") + (dumpBytes ? " · core on H:\\" : ""));
+      running = false; refreshButtons();
+    }
   }
+}
+
+// Relay bytes between the WebSocket bridge and the wasm GDB stub: feed queued
+// debugger input, then drain the stub's replies back to the bridge.
+function gdbPump() {
+  if (!gdbAttached) return;
+  while (gdbIn.length) e.nanox_gdb_write(gdbIn.shift());
+  const out = [];
+  let b;
+  while ((b = e.nanox_gdb_read()) >= 0) out.push(b);
+  if (out.length && gdbWs && gdbWs.readyState === 1) gdbWs.send(new Uint8Array(out));
 }
 
 function loop() {
   if (!running) return;
   const t0 = performance.now();
   let code = 1;
+  gdbPump(); // process any debugger commands (breakpoints, step, resume) first
   // Run sub-chunks until the frame's time budget is spent, then yield to the
   // browser so rendering/input stay smooth instead of freezing on one big call.
   do {
+    // While a debugger holds the target halted, don't advance the machine.
+    if (gdbAttached && !e.nanox_gdb_running()) { code = 1; break; }
     code = e.nanox_run(perFrame);
     insAccum += perFrame;
     // Service the H: drive: drain any 9P request the guest wrote this chunk and
     // push its reply, so the kernel's client (spinning on the transport) sees an
     // answer on the next chunk instead of timing out.
     p9.pump(e);
+    // A stop under the debugger (breakpoint/fault) is reported to it, not fatal.
+    if (gdbAttached && code >= 2) { e.nanox_gdb_notify_stop(5); code = 1; break; }
     if (code !== 1) break;
   } while (performance.now() - t0 < FRAME_MS);
+  gdbPump(); // flush replies produced this frame
   drainUart();
   if (code === 1 || code === 0) {
     raf = requestAnimationFrame(loop);
@@ -828,6 +983,7 @@ function loop() {
 async function boot(image) {
   stop();
   term = ""; col = 0; screen.textContent = ""; perFrame = 2_000_000;
+  bsod = false; screen.classList.remove("bsod"); btnDump.style.display = "none";
   insAccum = 0; statsT0 = performance.now();
   setStatus("boot", "cold boot · interpreting the full boot…");
   const inst = (await WebAssembly.instantiate(wasmBytes, {})).instance;
@@ -841,11 +997,12 @@ async function boot(image) {
 }
 
 // Resume from a boot-to-prompt snapshot: no interpreted boot, straight to C:\>.
-// A banner makes clear this is a restored state, not the machine's real boot —
+// A banner makes clear this is a restored state, not the machine's real boot -
 // click Restart to watch nanokrnl actually boot from scratch.
 async function resume(snap) {
   stop();
   screen.textContent = ""; perFrame = 500_000;  // interactive at once
+  bsod = false; screen.classList.remove("bsod"); btnDump.style.display = "none";
   insAccum = 0; statsT0 = performance.now();
   setStatus("boot", "restoring snapshot…");
   const inst = (await WebAssembly.instantiate(wasmBytes, {})).instance;
@@ -868,7 +1025,7 @@ async function resume(snap) {
 
 // A real cold boot: interpret the whole boot from the kernel image so the
 // self-test log scrolls by like a machine powering on. Boot and Restart both
-// use this — the point of the demo is that this is a genuine boot, not a
+// use this - the point of the demo is that this is a genuine boot, not a
 // state restore.
 function coldBoot() {
   if (kernelBytes) { boot(kernelBytes); return; }
@@ -877,7 +1034,7 @@ function coldBoot() {
 // Fast Boot: skip the interpreted boot and resume the saved snapshot instantly.
 function fastBoot() {
   if (snapshotBytes) { resume(snapshotBytes); return; }
-  coldBoot(); // no snapshot staged — fall back to the real boot
+  coldBoot(); // no snapshot staged - fall back to the real boot
 }
 function stop() { running = false; if (raf) cancelAnimationFrame(raf); raf = 0; }
 function refreshButtons() {
@@ -885,12 +1042,88 @@ function refreshButtons() {
   btnFast.disabled = running || !snapshotBytes;
   btnRestart.disabled = !e;
   btnShutdown.disabled = !running;
+  btnDebug.disabled = !running; // attach to a live kernel
 }
+
+// Attach lldb/gdb via a tiny copy-paste Python bridge (served as bridge.py).
+// Clicking Debug opens a panel with the bridge to run; the page then connects to
+// it over WebSocket (retrying until it is up). On attach the target halts under
+// debugger control; the run loop advances the machine only while the debugger
+// continues it. The bridge launches lldb pointed at this kernel.
+const dbgPanel = document.getElementById("dbgpanel");
+let wantDebug = false, dbgSrc = "";
+function dbgSetStatus(t) { document.getElementById("dbg-status").textContent = t; }
+async function loadBridgeSrc() {
+  if (dbgSrc) return dbgSrc;
+  try { dbgSrc = await (await fetch("bridge.py", { cache: "no-store" })).text(); }
+  catch { dbgSrc = "# could not fetch bridge.py; grab tools/gdb-bridge.py from the repo"; }
+  document.getElementById("dbg-src").textContent = dbgSrc;
+  return dbgSrc;
+}
+// The one-liner uses this page's own origin, so it works live (nanokrnl.ai) and
+// on a local dev server alike.
+function debugOneLiner() { return `python3 <(curl -sL ${location.origin}/bridge.py)`; }
+function connectDebug() {
+  if (!wantDebug || gdbAttached || !e) return;
+  let ws;
+  // The bridge runs on the visitor's own machine, so always localhost - never
+  // this page's hostname (which on the live site is nanokrnl.ai). Browsers allow
+  // ws://localhost even from an https page (loopback mixed-content exception).
+  try { ws = new WebSocket("ws://localhost:3334"); }
+  catch { dbgSetStatus("bridge not running; run the one-liner"); return; }
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => {
+    gdbWs = ws; gdbAttached = true; e.nanox_gdb_attach();
+    btnDebug.textContent = "Debugging…";
+    dbgSetStatus("connected · lldb is attaching in your terminal");
+  };
+  ws.onmessage = (ev) => { const a = new Uint8Array(ev.data); for (const b of a) gdbIn.push(b); };
+  ws.onclose = () => {
+    gdbAttached = false; gdbWs = null; if (e) e.nanox_gdb_detach();
+    btnDebug.textContent = "Debug";
+    if (wantDebug) { dbgSetStatus("waiting for the bridge (run the one-liner) ..."); setTimeout(connectDebug, 1200); }
+  };
+  ws.onerror = () => {}; // onclose drives the retry
+}
+function closeDebug() {
+  wantDebug = false; if (gdbWs) gdbWs.close();
+  dbgPanel.style.display = "none"; btnDebug.textContent = "Debug";
+}
+function toggleDebug() {
+  if (gdbAttached || wantDebug) { closeDebug(); return; }
+  if (!e) return;
+  wantDebug = true; dbgPanel.style.display = "";
+  document.getElementById("dbg-oneliner").textContent = debugOneLiner();
+  loadBridgeSrc();
+  dbgSetStatus("waiting for the bridge (run the one-liner) ...");
+  connectDebug();
+}
+document.getElementById("dbg-close").onclick = closeDebug;
+document.getElementById("dbg-copy-cmd").onclick = async () => {
+  try { await navigator.clipboard.writeText(debugOneLiner()); dbgSetStatus("copied; paste into a terminal and run it"); }
+  catch { dbgSetStatus("copy failed; select the command and copy it"); }
+};
+document.getElementById("dbg-copy").onclick = async () => {
+  const src = await loadBridgeSrc();
+  try { await navigator.clipboard.writeText(src); dbgSetStatus("script copied; save as bridge.py and run it"); }
+  catch { dbgSetStatus("copy failed; select the script below and copy it"); }
+};
 
 btnBoot.onclick = coldBoot;
 btnFast.onclick = fastBoot;
 btnRestart.onclick = coldBoot; // Restart is always a full cold boot
-btnShutdown.onclick = () => { stop(); setStatus("stop", "halted by user"); refreshButtons(); term += "\n[machine powered off]\n"; render(); };
+btnDebug.onclick = toggleDebug;
+
+// The crash dump is authored by nanokrnl and written to H:\ over 9P; the page
+// only receives it (via p9.onFinalize) and offers it for download. It is never
+// built in JavaScript.
+btnDump.onclick = () => {
+  if (!dumpBytes) return;
+  const url = URL.createObjectURL(new Blob([dumpBytes], { type: "application/octet-stream" }));
+  const a = document.createElement("a"); a.href = url; a.download = "nanokrnl.core"; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+};
+btnShutdown.onclick = () => { stop(); if (gdbWs) gdbWs.close(); setStatus("stop", "halted by user"); refreshButtons(); term += "\n[machine powered off]\n"; render(); };
 document.getElementById("winclose").onclick = () => { if (running) btnShutdown.click(); };
 
 // Keyboard → COM1: the shell reads typed bytes from the UART. Enter → CR,
