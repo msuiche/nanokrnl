@@ -54,6 +54,7 @@ const NT_CREATE_PIPE: u32 = 36;
 const NT_GET_STD_HANDLE: u32 = 37;
 const NT_SET_STARTUP_HANDLES: u32 = 38;
 const NT_SET_STD_HANDLE: u32 = 39;
+const NT_DUPLICATE_OBJECT: u32 = 40;
 
 // A couple of Win32 error codes used by the shim.
 const ERROR_SUCCESS: u32 = 0;
@@ -360,6 +361,36 @@ pub unsafe extern "C" fn ExitProcess(_exit_code: u32) -> ! {
     loop {
         core::hint::spin_loop();
     }
+}
+
+/// `DuplicateHandle(hSrcProc, hSrc, hTgtProc, lpTarget, access, inherit, opts)`
+/// — create a second handle to the same object as `hSrc` and store it in
+/// `*lpTarget`. cmd duplicates a pipe end (making it inheritable) for a child,
+/// then closes its own copy; a single global handle table means the duplicate
+/// is just another handle to the same object. `DUPLICATE_CLOSE_SOURCE` (0x1)
+/// closes the source; access/inherit/`DUPLICATE_SAME_ACCESS` are no-ops here.
+#[no_mangle]
+pub unsafe extern "C" fn DuplicateHandle(
+    _src_proc: u64,
+    src_handle: u64,
+    _tgt_proc: u64,
+    target: *mut u64,
+    _desired_access: u32,
+    _inherit: i32,
+    options: u32,
+) -> i32 {
+    let dup = syscall3(NT_DUPLICATE_OBJECT, src_handle, 0, 0);
+    if dup == 0 {
+        return 0; // FALSE
+    }
+    if !target.is_null() {
+        *target = dup;
+    }
+    if options & 0x1 != 0 {
+        // DUPLICATE_CLOSE_SOURCE
+        syscall3(NT_CLOSE, src_handle, 0, 0);
+    }
+    1 // TRUE
 }
 
 /// `CloseHandle(hObject)`.
@@ -2115,20 +2146,35 @@ pub unsafe extern "C" fn CreateProcessW(
         } else {
             (path, len)
         };
-    // Handle redirection: if STARTUPINFO carries standard handles (a pipe or
-    // file for `dir | sort` / `> file`), stage them so the child inherits them.
+    // Stage the child's standard handles. If STARTUPINFO provides them
+    // (STARTF_USESTDHANDLES), use those; otherwise the child inherits this
+    // process's *current* std handles, so a redirection the parent applied with
+    // SetStdHandle / the CRT `_dup2` before spawning (as cmd does for
+    // `dir | sort` and `dir > file`) carries into the child. When a stream is
+    // not redirected the handle is 0 (the child then defaults to the console).
     // STARTUPINFOW (x64): dwFlags@60, hStdInput@80, hStdOutput@88, hStdError@96.
+    let mut h_in = syscall3(NT_GET_STD_HANDLE, 0, 0, 0);
+    let mut h_out = syscall3(NT_GET_STD_HANDLE, 1, 0, 0);
+    let mut h_err = syscall3(NT_GET_STD_HANDLE, 2, 0, 0);
     if !startup_info.is_null() {
         let si = startup_info as *const u8;
         let dwflags = core::ptr::read_unaligned(si.add(60) as *const u32);
         if dwflags & 0x100 != 0 {
-            // STARTF_USESTDHANDLES
-            let h_in = core::ptr::read_unaligned(si.add(80) as *const u64);
-            let h_out = core::ptr::read_unaligned(si.add(88) as *const u64);
-            let h_err = core::ptr::read_unaligned(si.add(96) as *const u64);
-            syscall3(NT_SET_STARTUP_HANDLES, h_in, h_out, h_err);
+            let s_in = core::ptr::read_unaligned(si.add(80) as *const u64);
+            let s_out = core::ptr::read_unaligned(si.add(88) as *const u64);
+            let s_err = core::ptr::read_unaligned(si.add(96) as *const u64);
+            if s_in != 0 {
+                h_in = s_in;
+            }
+            if s_out != 0 {
+                h_out = s_out;
+            }
+            if s_err != 0 {
+                h_err = s_err;
+            }
         }
     }
+    syscall3(NT_SET_STARTUP_HANDLES, h_in, h_out, h_err);
     let handle = syscall4(
         NT_CREATE_PROCESS,
         path as u64,

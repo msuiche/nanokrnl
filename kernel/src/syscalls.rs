@@ -70,6 +70,9 @@ pub const SVC_SET_STARTUP_HANDLES: usize = 38;
 /// `SetStdHandle` - redirect one of the calling process's standard handles
 /// (cmd points its own stdout at a pipe/file while running a builtin).
 pub const SVC_SET_STD_HANDLE: usize = 39;
+/// `DuplicateHandle` - a second handle to the same object (cmd duplicates a
+/// pipe end so a child inherits it while cmd closes its own copy).
+pub const SVC_DUPLICATE_OBJECT: usize = 40;
 
 /// A shared kernel counter incremented atomically by [`SVC_INCREMENT_COUNTER`].
 /// Used to prove concurrent ring-3 threads both make progress through the
@@ -139,6 +142,7 @@ pub fn register_all() {
     register_service(SVC_GET_STD_HANDLE, nt_get_std_handle);
     register_service(SVC_SET_STARTUP_HANDLES, nt_set_startup_handles);
     register_service(SVC_SET_STD_HANDLE, nt_set_std_handle);
+    register_service(SVC_DUPLICATE_OBJECT, nt_duplicate_object);
 }
 
 /// `SetStdHandle(which, handle)` - redirect the calling thread's standard handle
@@ -154,6 +158,18 @@ extern "C" fn nt_set_std_handle(which: u64, new_handle: u64, _a3: u64, _a4: u64)
         unsafe { (*t).std_handles[i] = new_handle };
     }
     1
+}
+
+/// `DuplicateHandle` - create a second handle referring to the same object as
+/// `src_handle`, returning the new handle (0 on failure). Each handle owns its
+/// own reference, so closing the source keeps the object alive for the copy —
+/// exactly what cmd relies on when it hands a pipe end to a child and then
+/// closes its own copy (the pipe stays open until the child is done).
+extern "C" fn nt_duplicate_object(src_handle: u64, _a2: u64, _a3: u64, _a4: u64) -> u64 {
+    match handle::ob_reference_object_by_handle(src_handle) {
+        Ok(obj) => handle::ob_create_handle(obj, 0),
+        Err(_) => 0,
+    }
 }
 
 /// `CreatePipe` - create an anonymous pipe and write its two handles (read then

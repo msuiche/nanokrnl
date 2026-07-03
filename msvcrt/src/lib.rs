@@ -24,7 +24,11 @@ use core::ffi::c_void;
 const NT_TERMINATE_THREAD: u32 = 0;
 const NT_WRITE_FILE: u32 = 2;
 const NT_CREATE_FILE: u32 = 3;
+const NT_CLOSE: u32 = 4;
 const NT_GET_COMMAND_LINE: u32 = 19;
+const NT_CREATE_PIPE: u32 = 36;
+const NT_GET_STD_HANDLE: u32 = 37;
+const NT_SET_STD_HANDLE: u32 = 39;
 
 #[inline(always)]
 unsafe fn syscall3(number: u32, a1: u64, a2: u64, a3: u64) -> u64 {
@@ -1166,11 +1170,125 @@ pub unsafe extern "C" fn _fileno(stream: *mut File) -> i32 {
     }
 }
 
-/// `_get_osfhandle(fd)` — map a CRT fd (0/1/2 = std streams) to the OS handle
-/// by opening the console (all our std streams are the console device).
+// --- CRT low-level file descriptors ---------------------------------------
+// cmd.exe drives `dir | sort` and `dir > file` through the classic CRT fd API:
+// `_pipe` makes a pipe, `_get_osfhandle`/`_open_osfhandle` bridge fds <-> OS
+// handles, and `_dup2` redirects a std stream. Each fd simply names an OS
+// handle (the kernel's global handle value); fds 0/1/2 are stdin/stdout/stderr.
+// This lets cmd hand a pipe/file handle to CreateProcess (via STARTUPINFO or by
+// redirecting its own std handle) so the spawned stage inherits it.
+const FD_MAX: usize = 40;
+static mut FD_TABLE: [u64; FD_MAX] = [0; FD_MAX];
+static mut FD_READY: bool = false;
+
+/// Seed fds 0/1/2 from this process's standard handles (a redirected pipe/file
+/// set by the parent, else the console device). Idempotent.
+unsafe fn fd_init() {
+    if FD_READY {
+        return;
+    }
+    FD_READY = true;
+    for i in 0..3 {
+        let h = syscall3(NT_GET_STD_HANDLE, i as u64, 0, 0);
+        FD_TABLE[i] = if h != 0 { h } else { console_handle() };
+    }
+}
+
+/// Bind `handle` to the lowest free fd >= 3, returning it (or -1 if the table
+/// is full).
+unsafe fn fd_alloc(handle: u64) -> i32 {
+    fd_init();
+    for i in 3..FD_MAX {
+        if FD_TABLE[i] == 0 {
+            FD_TABLE[i] = handle;
+            return i as i32;
+        }
+    }
+    -1
+}
+
+/// `_get_osfhandle(fd)` — the OS handle backing a CRT fd, or -1
+/// (`INVALID_HANDLE_VALUE`) for an out-of-range/closed fd.
 #[no_mangle]
-pub unsafe extern "C" fn _get_osfhandle(_fd: i32) -> isize {
-    console_handle() as isize
+pub unsafe extern "C" fn _get_osfhandle(fd: i32) -> isize {
+    fd_init();
+    if fd >= 0 && (fd as usize) < FD_MAX && FD_TABLE[fd as usize] != 0 {
+        FD_TABLE[fd as usize] as isize
+    } else {
+        -1
+    }
+}
+
+/// `_open_osfhandle(handle, flags)` — wrap an existing OS handle (e.g. a file
+/// opened via `CreateFile` for `>` redirection) in a CRT fd. Returns the fd.
+#[no_mangle]
+pub unsafe extern "C" fn _open_osfhandle(handle: isize, _flags: i32) -> i32 {
+    fd_alloc(handle as u64)
+}
+
+/// `_pipe(fds, size, textmode)` — create an anonymous pipe and store its read
+/// fd in `fds[0]` and write fd in `fds[1]`. Returns 0 on success, -1 on error.
+/// (msvcrt runs in the caller's address space, so `fds` is written directly.)
+#[no_mangle]
+pub unsafe extern "C" fn _pipe(fds: *mut i32, _size: u32, _textmode: i32) -> i32 {
+    if fds.is_null() {
+        return -1;
+    }
+    fd_init();
+    let mut handles = [0u64; 2];
+    if syscall3(NT_CREATE_PIPE, handles.as_mut_ptr() as u64, 0, 0) == 0 {
+        return -1;
+    }
+    let rfd = fd_alloc(handles[0]);
+    let wfd = fd_alloc(handles[1]);
+    if rfd < 0 || wfd < 0 {
+        return -1;
+    }
+    *fds = rfd;
+    *fds.add(1) = wfd;
+    0
+}
+
+/// `_dup(fd)` — a second fd naming the same OS handle. Returns the new fd.
+#[no_mangle]
+pub unsafe extern "C" fn _dup(fd: i32) -> i32 {
+    fd_init();
+    if fd < 0 || (fd as usize) >= FD_MAX || FD_TABLE[fd as usize] == 0 {
+        return -1;
+    }
+    fd_alloc(FD_TABLE[fd as usize])
+}
+
+/// `_dup2(src, dst)` — point `dst` at `src`'s OS handle. When `dst` is a std
+/// stream (0/1/2) we also update the kernel std handle, so a child spawned
+/// afterwards inherits the redirection (cmd's `dir | sort` model). Returns 0.
+#[no_mangle]
+pub unsafe extern "C" fn _dup2(src: i32, dst: i32) -> i32 {
+    fd_init();
+    if src < 0 || (src as usize) >= FD_MAX || FD_TABLE[src as usize] == 0 {
+        return -1;
+    }
+    if dst < 0 || (dst as usize) >= FD_MAX {
+        return -1;
+    }
+    let h = FD_TABLE[src as usize];
+    FD_TABLE[dst as usize] = h;
+    if dst <= 2 {
+        syscall3(NT_SET_STD_HANDLE, dst as u64, h, 0);
+    }
+    0
+}
+
+/// `_close(fd)` — release a CRT fd, closing its OS handle. The std streams
+/// (0/1/2) keep their console handle open. Returns 0.
+#[no_mangle]
+pub unsafe extern "C" fn _close(fd: i32) -> i32 {
+    fd_init();
+    if fd >= 3 && (fd as usize) < FD_MAX && FD_TABLE[fd as usize] != 0 {
+        syscall3(NT_CLOSE, FD_TABLE[fd as usize], 0, 0);
+        FD_TABLE[fd as usize] = 0;
+    }
+    0
 }
 
 /// `fflush(stream)` — our writes are unbuffered (straight to the device), so

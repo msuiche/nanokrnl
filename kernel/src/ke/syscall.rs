@@ -117,7 +117,7 @@ unsafe extern "C" fn ki_system_call64() {
 }
 
 /// Number of entries in the system service dispatch table.
-pub const SSDT_SIZE: usize = 40;
+pub const SSDT_SIZE: usize = 48;
 
 /// A system service: receives up to four `u64` arguments and returns a
 /// `u64` (an NTSTATUS or a value). Uniform signature keeps the dispatch

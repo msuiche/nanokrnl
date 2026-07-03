@@ -455,3 +455,37 @@ page and it lands in H:\** (added to the JS 9P server's file map, capped at
 `more H:\<name>` it over 9P and it shows in the Explorer. Verified end to end
 (a page-added file reads through the guest). No blog this round - it is a small
 addition on top of the already-published 9P story.
+
+### 2026-07-03 (loop) - pipes/redirection: the CRT fd layer lands
+
+Built the substrate cmd.exe needs to drive `|` and `>`, and got redirection of a
+stage's output into a handle working end to end. What went in:
+
+- **msvcrt fd layer** (`_pipe`, `_dup`, `_dup2`, `_open_osfhandle`, `_get_osfhandle`,
+  `_close`): previously all return-0 stubs, so cmd's `_pipe(fds)` "succeeded" with
+  garbage fds. Now each fd names a real OS handle; fds 0/1/2 seed from the process
+  std handles. `_pipe` issues NtCreatePipe; `_dup2` onto a std fd also updates the
+  kernel std handle so a child spawned afterward inherits the redirection.
+- **DuplicateHandle** (kernel32 export + new `NT_DUPLICATE_OBJECT` syscall, SSDT
+  grown 40 -> 48): a second handle to the same object, refcounted so closing the
+  source keeps the object alive for the copy - exactly cmd's hand-a-pipe-end-to-a-
+  child pattern. Was a return-0 stub before.
+- **CreateProcessW** now inherits the parent's *current* std handles when
+  STARTUPINFO does not override them, so a SetStdHandle / `_dup2` redirect the
+  parent applied before spawning carries into the child.
+
+Verified with a new `emu/examples/pipe_test` harness (boots interactive kernel,
+types commands, can trace syscalls): the `dir` stage's stdout is now redirected
+into the pipe instead of flooding the console, and `dir > file` writes 728 bytes
+to the redirected target. No regression - all 67 self-tests pass (incl. Ps /
+CreateProcessW), and plain interactive commands (`dir`, `echo`, `more`, `ver`)
+work with cmd staying alive.
+
+Not done yet: full `dir | sort`. The syscall trace shows cmd creates the pipe,
+runs `dir` into it, DuplicateHandles the read end (0x2c -> 0x34), closes the
+original, then spawns `sort` staged with stdin = 0x2c (the *closed* original)
+rather than 0x34 (the surviving dup) - so sort reads EOF and prints nothing, and
+cmd exits its command loop afterward. Resolving it means matching cmd's exact
+fd/handle juggling (likely the ucrt STARTUPINFO fd-inheritance block), a focused
+next step. This is source-only; the deployed web kernel.bin is unchanged, so the
+live demo is unaffected.
