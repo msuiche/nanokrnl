@@ -704,3 +704,37 @@ Stack walks and symbols were already in place from Part III (the crash register
 set is in the `NT_PRSTATUS` note; `.debug_frame` CFI + `.debug_info` are in
 `kernel.bin`). 67/67 self-tests pass; the crash-dump path is unchanged in shape.
 This is the natural closer for the series; blog post next.
+
+### 2026-07-03 - pipes: definitive blocker (fd model vs cmd's CRT choreography)
+
+Made another focused, incremental pass at `dir | sort`, testing redirect after
+each step. Traced the whole two-stage handoff with kernel markers (process
+spawn, thread entry, wait, exit, pipe read/write, pipe-end close). Findings:
+
+- The **pipe data path works**: with per-process std-handle resolution
+  (`_get_osfhandle`/`console_write` reading the kernel's per-process std handles
+  instead of the shared DLL fd table) the producer `cmd /c dir` writes its whole
+  listing (26 chunks) into the pipe with the correct end assignment
+  (dir stdout -> pipe write, sort stdin -> pipe read).
+- But it does not complete, and the cause is a genuine conflict in our fd model:
+  - **share-based `_dup2`** (fds name the real pipe-end handles) keeps cmd's
+    end-assignment correct, but cmd closes its own pipe-end handles right after
+    spawning the stages, and in our single *global* handle table that closes the
+    read end before `sort` inherits it -> sort reads an empty console, no output.
+  - **duplicate-based `_dup2`** (each fd owns a distinct handle) keeps the ends
+    alive across cmd's close, but the duplicated handle *values* scramble cmd's
+    own read/write fd bookkeeping -> sort is handed the write end as its stdin.
+  - Worse, the per-process std-handle resolution that makes the producer write
+    into the pipe **regresses redirection** (`dir > out.txt` makes cmd exit),
+    because redirect and pipe drive the same fd/std-handle paths in opposite
+    directions.
+
+Conclusion: `dir | sort` (two concurrent processes sharing a pipe) needs the
+foundation this kept colliding with - **per-process handle tables with Windows
+`bInheritHandles` semantics** (a child gets inheritable-handle *copies* at
+CreateProcess, before the parent closes its own), and/or honoring the CRT's
+STARTUPINFO fd-inheritance block. That is a real VM/loader/object-manager rework,
+not an fd-layer tweak; every incremental fd change either scrambles the ends or
+regresses redirect. Reverted to the known-good state so **redirection stays
+working** and there is no regression. Pipes remain the one shell feature that
+waits on that rework.

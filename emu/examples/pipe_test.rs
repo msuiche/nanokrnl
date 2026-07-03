@@ -43,27 +43,27 @@ fn main() {
             m.cpu.dev.uart.push_rx(b);
         }
         m.cpu.dev.uart.push_rx(b'\r');
-        pump(m, out, 12);
+        pump(m, out, 20);
     };
 
     let seq: &[&str] = if std::env::args().any(|a| a == "--plain") {
         // Regression check: only non-pipe commands. cmd must survive all of them
-        // (no "CMD: wait" — that would mean cmd exited early).
-        &["set", "cls", "color"]
+        // (no "CMD: wait" - that would mean cmd exited early).
+        &["dir", "echo hello", "more hello.txt", "ver"]
     } else if std::env::args().any(|a| a == "--slashc") {
         // Is the `cmd /c <builtin>` child path (which `|` relies on) working?
-        &["set", "cls", "color"]
+        &["cmd /c echo hi", "cmd /c dir"]
     } else if std::env::args().any(|a| a == "--redir") {
         // Redirection to a file, in isolation (fresh cmd, no prior pipe command).
-        &["set", "cls", "color"]
+        &["dir > out.txt", "type out.txt", "more out.txt"]
     } else if std::env::args().any(|a| a == "--tools") {
         // Which shipped Windows console tools work as interactive commands?
-        &["set", "cls", "color"]
+        &["whoami", "where cmd.exe", "ver", "vol"]
     } else if std::env::args().any(|a| a == "--survey") {
-        // Survey common builtins to find a tractable, self-contained gap to fix.
+        // Survey common builtins.
         &["set", "cls", "color"]
     } else {
-        &["set", "cls", "color"]
+        &["dir", "dir | sort", "dir > out.txt", "more out.txt"]
     };
     let trace = std::env::args().any(|a| a == "--trace");
     for cmd in seq {
