@@ -437,3 +437,21 @@ needs the **msvcrt CRT I/O layer** next: `_pipe` backed by our pipe object, an f
 table over `_open_osfhandle`/`_get_osfhandle`, `_dup2` to redirect fd 0/1, and
 fd-based read/write. That CRT layer sits on top of what's already here (its OS
 handles are our pipe/writable-file objects). Next iteration.
+
+### 2026-07-03 (loop) - drag-drop into H:\, and the pipe wall
+
+`dir | sort` is deferred: msvcrt's stdio (`__stdio_common_vfprintf` /
+`console_write`) writes straight to `\Device\Console`, independent of any
+fd/std-handle state, and this cmd.exe drives `|` through the CRT (`_o__pipe` /
+`_dup2` / `_get_osfhandle`), not the Win32 surface. Making it work needs an
+invasive rewrite of the CRT output path to route through an fd table - high risk
+to the working console output for one demo command. The Win32 pipe + writable-
+file + std-handle substrate stays as the correct base for when that CRT layer is
+built.
+
+Shipped instead a clean, low-risk win on the H:\ share: **drag a file onto the
+page and it lands in H:\** (added to the JS 9P server's file map, capped at
+256 KB so the guest's byte-wise reads stay quick). The kernel can then
+`more H:\<name>` it over 9P and it shows in the Explorer. Verified end to end
+(a page-added file reads through the guest). No blog this round - it is a small
+addition on top of the already-published 9P story.

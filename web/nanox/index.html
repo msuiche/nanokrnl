@@ -406,7 +406,7 @@
 <div id="explorer">
   <div class="rm-title" id="ex-drag">Explorer: H:\<span class="x" id="ex-close" title="Close">&times;</span></div>
   <div class="ex-body">
-    <div class="ex-path">H:\ (host shared folder, 9P)</div>
+    <div class="ex-path">H:\ (9P host share) &middot; drag a file onto the page to add it</div>
     <ul id="ex-list"></ul>
   </div>
 </div>
@@ -874,6 +874,25 @@ function renderExplorer() {
 renderExplorer();
 document.getElementById("ex-close").onclick = () => document.getElementById("explorer").classList.add("hidden");
 dragWindow(document.getElementById("explorer"), document.getElementById("ex-drag"));
+
+// Drag a file onto the page to drop it into the H:\ share: the kernel can then
+// `more H:\<name>` it over 9P, and it shows in the Explorer. Capped so a huge
+// file doesn't make the guest's byte-wise dir/read crawl.
+const DROP_MAX = 256 * 1024;
+document.addEventListener("dragover", (ev) => { ev.preventDefault(); });
+document.addEventListener("drop", async (ev) => {
+  ev.preventDefault();
+  const files = ev.dataTransfer && ev.dataTransfer.files;
+  if (!files || !files.length) return;
+  const cls = running ? "run" : "stop";
+  for (const f of files) {
+    if (f.size > DROP_MAX) { setStatus(cls, `${f.name} too big (>256 KB) for H:\\`); continue; }
+    const name = f.name.replace(/[\\/]/g, "_");    // flatten into the H:\ root
+    p9.files[name] = new Uint8Array(await f.arrayBuffer());
+    setStatus(cls, `added ${name} to H:\\ (try: more H:\\${name})`);
+  }
+  renderExplorer();
+});
 // The debugger-bridge panel is draggable too; its × (dbg-close) closes it.
 dragWindow(document.getElementById("dbgpanel"), document.getElementById("dbg-drag"));
 function render() {
