@@ -17,6 +17,7 @@ const T = {
   WALK: 110, RWALK: 111,
   LOPEN: 12, RLOPEN: 13,
   READ: 116, RREAD: 117,
+  READDIR: 40, RREADDIR: 41,
   CLUNK: 120, RCLUNK: 121,
   LERROR: 7,
 };
@@ -69,6 +70,10 @@ export class P9Server {
       case T.WALK: {                          // Twalk fid newfid nwname name*
         const newfid = u32(4);
         const nw = body[8] | (body[9] << 8);
+        if (nw === 0) {                        // clone: newfid points at the root directory
+          this.fids.set(newfid, null);
+          const r = new Reply(T.RWALK, tag); r.u16(0); return r.done();
+        }
         let off = 10, parts = [];
         for (let i = 0; i < nw; i++) {
           const l = body[off] | (body[off + 1] << 8); off += 2;
@@ -99,6 +104,31 @@ export class P9Server {
         } else {
           r.u32(0);
         }
+        return r.done();
+      }
+      case T.READDIR: {                       // Treaddir fid offset count
+        const fid = u32(0);
+        const offset = u32(4) + u32(8) * 0x100000000; // resume index
+        const count = u32(12);
+        const r = new Reply(T.RREADDIR, tag);
+        if (this.fids.get(fid) !== null) { r.u32(0); return r.done(); } // not a directory
+        const names = Object.keys(this.files);
+        // Pack dirents from `offset` onward until the byte budget is spent. Each
+        // dirent is qid[13] offset[8] type[1] name[u16 len + bytes]; the offset
+        // field is the resume point for the next Treaddir.
+        const ents = new Reply(0, 0); ents.b = [];
+        let total = 0;
+        for (let i = offset; i < names.length; i++) {
+          const nb = new TextEncoder().encode(names[i]);
+          const sz = 13 + 8 + 1 + 2 + nb.length;
+          if (total + sz > count) break;
+          ents.qid(0);                                    // 13
+          ents.u32((i + 1) & 0xffffffff); ents.u32(Math.floor((i + 1) / 0x100000000)); // offset 8
+          ents.b.push(0x8);                               // DT_REG
+          ents.u16(nb.length); ents.bytes(nb);
+          total += sz;
+        }
+        r.u32(ents.b.length); r.bytes(ents.b);
         return r.done();
       }
       case T.CLUNK:

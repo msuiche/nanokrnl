@@ -287,3 +287,30 @@ programs actually execute* — `BSWAP` is rare in `-O0` and only emitted by the
 optimizer for byte-swap / prefix-compare idioms, so it never appeared in the
 stream until now. A decode-only sweep of the release `.text` against iced would
 catch this class statically; worth adding.
+
+The 9P direction was Ryan MacArthur's idea (https://x.com/maceip). The Linux
+v9fs documentation is a good starting point:
+https://docs.kernel.org/filesystems/9p.html
+
+### 2026-07-03 - `dir H:\` lists the host directory (Treaddir)
+
+Finished the drive by making enumeration work, not just open-by-name. `dir H:\`
+was reporting "File Not Found" because we only implemented walk/open/read for a
+named file; a wildcard listing had nothing to resolve.
+
+- Kernel client `io::p9::list()`: clone the root fid with a zero-name `Twalk`,
+  `Tlopen` it as a directory, and loop `Treaddir` (9P2000.L type 40/41), parsing
+  the packed dirents (qid, offset, type, name) into a name list.
+- `nt_query_directory` now splits the host case: a wildcard or bare `H:\` calls
+  `list()`, filters by a small glob (`*`/`?`), and returns the index-th match
+  with its real size (fetched once) to drive FindFirstFile/FindNextFile; a
+  concrete name stays the single-file stat path. The `WIN32_FIND_DATAW` writer is
+  factored into one `write_find_data` helper shared by the host and ramfs paths.
+- JS server (`p9-server.js`): handle the zero-name `Twalk` (clone to a directory
+  fid) and `Treaddir` (pack the file map's keys as dirents, resuming from the
+  requested offset).
+
+Tested headless against the shipped `nanox.wasm` + snapshot + the real
+`p9-server.js`: `dir H:\` lists readme.txt and hello.txt with correct sizes and
+the usual "N File(s)" footer; `more H:\file` still reads a named file (no
+regression).

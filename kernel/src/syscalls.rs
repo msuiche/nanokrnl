@@ -144,13 +144,26 @@ extern "C" fn nt_query_directory(pat_ptr: u64, pat_len: u64, index: u64, out_ptr
     let Ok(pattern) = core::str::from_utf8(&abuf[..n]) else {
         return 0;
     };
-    // The virtual "H:" drive is served by the host 9P server. ulib tools stat a
-    // file via FindFirstFile before opening it, so a host path has to resolve
-    // here too: fetch it to confirm existence and learn its size (only index 0
-    // yields the single named file). Without this a `more H:\file` reports
-    // "file not found" and never reaches NtCreateFile.
+    // The virtual "H:" drive is served by the host 9P server. A wildcard or a
+    // bare "H:\" enumerates the host directory (dir); a concrete name is a
+    // single-file stat, which ulib tools do via FindFirstFile before opening a
+    // file to read it. Both must resolve here or the shell reports "not found".
     let host = pattern.strip_prefix("\\??\\").unwrap_or(pattern);
     if let Some(rest) = strip_host_drive(host) {
+        if rest.is_empty() || rest.contains('*') || rest.contains('?') {
+            // Directory enumeration: list the host root, filter by the wildcard,
+            // and return the index-th match (with its real size, fetched once).
+            let Some(names) = io::p9::list() else {
+                return 0;
+            };
+            let Some(name) = names.iter().filter(|n| host_glob(rest, n)).nth(index as usize) else {
+                return 0;
+            };
+            let Some(bytes) = io::p9::read(name.as_str()) else {
+                return 0;
+            };
+            return write_find_data(out_ptr, name.as_str(), 0x80, bytes.len() as u64);
+        }
         if index != 0 {
             return 0;
         }
@@ -158,33 +171,19 @@ extern "C" fn nt_query_directory(pat_ptr: u64, pat_len: u64, index: u64, out_ptr
             return 0;
         };
         let fname = rest.rsplit(['\\', '/']).next().unwrap_or(rest);
-        const FIND_DATA_SIZE: usize = 592;
-        if out_ptr == 0 || crate::mm::virt::probe_for_write(out_ptr, FIND_DATA_SIZE, 2).is_err() {
-            return 0;
-        }
-        crate::mm::virt::user_access_begin();
-        unsafe {
-            core::ptr::write_bytes(out_ptr as *mut u8, 0, FIND_DATA_SIZE);
-            *(out_ptr as *mut u32) = 0x80; // FILE_ATTRIBUTE_NORMAL
-            *((out_ptr + 28) as *mut u32) = ((bytes.len() as u64) >> 32) as u32;
-            *((out_ptr + 32) as *mut u32) = bytes.len() as u32;
-            let name = out_ptr + 44; // cFileName
-            let nb = fname.as_bytes();
-            let cch = nb.len().min(259);
-            for i in 0..cch {
-                *((name + (i as u64) * 2) as *mut u16) = nb[i] as u16;
-            }
-            *((name + (cch as u64) * 2) as *mut u16) = 0;
-        }
-        crate::mm::virt::user_access_end();
-        return 1;
+        return write_find_data(out_ptr, fname, 0x80, bytes.len() as u64);
     }
     let Some(entry) = io::ramfs::find(pattern, index as usize) else {
         return 0;
     };
+    write_find_data(out_ptr, entry.name, entry.attributes, entry.size)
+}
 
-    // WIN32_FIND_DATAW (x64): dwFileAttributes@0, three FILETIMEs@4, sizes@28/32,
-    // two reserved DWORDs@36/40, cFileName[260]@44, cAlternateFileName[14]@564.
+/// Fill a `WIN32_FIND_DATAW` (x64 layout) at `out_ptr` with `name`, `attributes`
+/// and `size`, returning 1, or 0 if the user buffer is unwritable. Layout:
+/// dwFileAttributes@0, three FILETIMEs@4, sizes@28/32, two reserved DWORDs@36/40,
+/// cFileName[260]@44 (UTF-16), cAlternateFileName[14]@564.
+fn write_find_data(out_ptr: u64, name: &str, attributes: u32, size: u64) -> u64 {
     const FIND_DATA_SIZE: usize = 592;
     if out_ptr == 0 || crate::mm::virt::probe_for_write(out_ptr, FIND_DATA_SIZE, 2).is_err() {
         return 0;
@@ -192,19 +191,48 @@ extern "C" fn nt_query_directory(pat_ptr: u64, pat_len: u64, index: u64, out_ptr
     crate::mm::virt::user_access_begin();
     unsafe {
         core::ptr::write_bytes(out_ptr as *mut u8, 0, FIND_DATA_SIZE);
-        *(out_ptr as *mut u32) = entry.attributes;
-        *((out_ptr + 28) as *mut u32) = (entry.size >> 32) as u32;
-        *((out_ptr + 32) as *mut u32) = entry.size as u32;
-        let name = out_ptr + 44; // cFileName
-        let bytes = entry.name.as_bytes();
-        let cch = bytes.len().min(259);
+        *(out_ptr as *mut u32) = attributes;
+        *((out_ptr + 28) as *mut u32) = (size >> 32) as u32;
+        *((out_ptr + 32) as *mut u32) = size as u32;
+        let name_ptr = out_ptr + 44; // cFileName
+        let nb = name.as_bytes();
+        let cch = nb.len().min(259);
         for i in 0..cch {
-            *((name + (i as u64) * 2) as *mut u16) = bytes[i] as u16;
+            *((name_ptr + (i as u64) * 2) as *mut u16) = nb[i] as u16;
         }
-        *((name + (cch as u64) * 2) as *mut u16) = 0;
+        *((name_ptr + (cch as u64) * 2) as *mut u16) = 0;
     }
     crate::mm::virt::user_access_end();
     1
+}
+
+/// Minimal case-insensitive wildcard match for host directory listing: `*`
+/// matches any run (including empty), `?` any one character, everything else
+/// literal. An empty pattern (a bare "H:\") matches everything.
+fn host_glob(pat: &str, name: &str) -> bool {
+    fn glob(pat: &[u8], name: &[u8]) -> bool {
+        match pat.split_first() {
+            None => name.is_empty(),
+            Some((&b'*', rest)) => {
+                let mut tail = name;
+                loop {
+                    if glob(rest, tail) {
+                        return true;
+                    }
+                    match tail.split_first() {
+                        Some((_, t)) => tail = t,
+                        None => return false,
+                    }
+                }
+            }
+            Some((&b'?', rest)) => !name.is_empty() && glob(rest, &name[1..]),
+            Some((&p, rest)) => match name.split_first() {
+                Some((&c, t)) if p.eq_ignore_ascii_case(&c) => glob(rest, t),
+                _ => false,
+            },
+        }
+    }
+    pat.is_empty() || glob(pat.as_bytes(), name.as_bytes())
 }
 
 /// `GetFileAttributesW` backend (a1 = UTF-16 path ptr, a2 = char count).
