@@ -623,3 +623,32 @@ the OS handle when the last fd referencing it goes away (rather than each fd
 owning a distinct dup). That is a real fd-layer rework, not a patch, and it is
 the actionable next step for pipes. Redirection (single process) is done and
 verified; pipes (cross-process) wait on this. Source-only.
+
+### 2026-07-03 - pipe rework attempt: data flows, but reverted (regressed redirect)
+
+Attempted the fd-refcount rework to finish `dir | sort`. Combined four changes:
+share-based `_dup`/`_dup2` (reference-count by scanning the fd table, so `_close`
+frees the OS handle only when the last fd releases it), duplicate inherited
+handles into the child at process creation, route msvcrt's `console_write`
+through the redirected stdout, and resolve `_get_osfhandle(0/1/2)` via the
+kernel's per-process std handles instead of the shared fd table.
+
+Result and the map this produced:
+- **The core pipe data flow started working**: with those changes the child
+  `cmd /c dir` wrote the *entire* listing into the pipe (measured: 26 writes,
+  all `kind=pipe`), and cmd's pipe choreography was correct (stdout->write end
+  for dir, stdin->read end for sort, no scramble). That is the furthest pipes
+  have gotten.
+- **But it regressed redirection into a hang** and `dir | sort` still did not
+  complete: `sort` spawns (stdin = a dup of the read end, stdout = console) yet
+  never runs its startup - a concurrent-child scheduling / pipe-EOF deadlock, on
+  top of the redirect regression. The fd/handle/console paths are too tightly
+  coupled to change piecemeal without breaking the redirection that already
+  works, so this was reverted to keep redirect solid (verified working again).
+
+Root map for a future dedicated effort: the real blocker is that the kernel32 /
+msvcrt DLL `.data` (fd table, cached std/console handles) is a *single shared
+copy* across all processes, so a child inherits the parent's CRT stdio state and
+writes to the parent's console handle. The correct foundation is per-process DLL
+data (copy-on-write on map), after which the fd-refcount + inherit-duplication
+changes above should compose cleanly. Redirection stays done; pipes wait on that.
