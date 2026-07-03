@@ -67,6 +67,9 @@ pub const SVC_CREATE_PIPE: usize = 36;
 pub const SVC_GET_STD_HANDLE: usize = 37;
 /// Stage the standard handles for the next child (from `STARTUPINFO`).
 pub const SVC_SET_STARTUP_HANDLES: usize = 38;
+/// `SetStdHandle` - redirect one of the calling process's standard handles
+/// (cmd points its own stdout at a pipe/file while running a builtin).
+pub const SVC_SET_STD_HANDLE: usize = 39;
 
 /// A shared kernel counter incremented atomically by [`SVC_INCREMENT_COUNTER`].
 /// Used to prove concurrent ring-3 threads both make progress through the
@@ -135,6 +138,22 @@ pub fn register_all() {
     register_service(SVC_CREATE_PIPE, nt_create_pipe);
     register_service(SVC_GET_STD_HANDLE, nt_get_std_handle);
     register_service(SVC_SET_STARTUP_HANDLES, nt_set_startup_handles);
+    register_service(SVC_SET_STD_HANDLE, nt_set_std_handle);
+}
+
+/// `SetStdHandle(which, handle)` - redirect the calling thread's standard handle
+/// (0 = stdin, 1 = stdout, 2 = stderr). cmd uses this to point its own stdout at
+/// a pipe while running a builtin like `dir` on the left of `dir | sort`.
+extern "C" fn nt_set_std_handle(which: u64, new_handle: u64, _a3: u64, _a4: u64) -> u64 {
+    let i = which as usize;
+    if i > 2 {
+        return 0;
+    }
+    let t = crate::ke::pcr::ke_get_current_thread();
+    if !t.is_null() {
+        unsafe { (*t).std_handles[i] = new_handle };
+    }
+    1
 }
 
 /// `CreatePipe` - create an anonymous pipe and write its two handles (read then

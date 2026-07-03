@@ -50,6 +50,10 @@ const NT_SET_CONSOLE_MODE: u32 = 30;
 const NT_LOAD_MESSAGE: u32 = 31;
 const NT_QUERY_ATTRIBUTES: u32 = 32;
 const NT_QUERY_DIRECTORY: u32 = 33;
+const NT_CREATE_PIPE: u32 = 36;
+const NT_GET_STD_HANDLE: u32 = 37;
+const NT_SET_STARTUP_HANDLES: u32 = 38;
+const NT_SET_STD_HANDLE: u32 = 39;
 
 // A couple of Win32 error codes used by the shim.
 const ERROR_SUCCESS: u32 = 0;
@@ -111,6 +115,13 @@ pub unsafe extern "C" fn GetStdHandle(n_std_handle: u32) -> u64 {
         STD_ERROR_HANDLE => 2,
         _ => 1, // default to stdout
     };
+    // A redirected standard handle (a pipe or file the parent set via
+    // STARTUPINFO) takes priority over the console default. The kernel returns 0
+    // when this stream is not redirected.
+    let redirected = syscall3(NT_GET_STD_HANDLE, idx as u64, 0, 0);
+    if redirected != 0 {
+        return redirected;
+    }
     // Re-open if we have no handle yet, or if the cached one is stale — the
     // cache lives in shared kernel32 .data, so a prior process that closed its
     // console handle (e.g. sort closes stdin) leaves a dangling value here.
@@ -123,9 +134,47 @@ pub unsafe extern "C" fn GetStdHandle(n_std_handle: u32) -> u64 {
     STD_HANDLES[idx]
 }
 
+/// `SetStdHandle(nStdHandle, hHandle)` - redirect one of this process's standard
+/// handles. cmd points its own stdout at a pipe/file while running a builtin
+/// (e.g. `dir` in `dir | sort`, or `dir > file`), then restores it.
+#[no_mangle]
+pub unsafe extern "C" fn SetStdHandle(n_std_handle: u32, handle: u64) -> i32 {
+    let idx = match n_std_handle {
+        STD_INPUT_HANDLE => 0,
+        STD_OUTPUT_HANDLE => 1,
+        STD_ERROR_HANDLE => 2,
+        _ => return 0,
+    };
+    syscall3(NT_SET_STD_HANDLE, idx as u64, handle, 0);
+    1
+}
+
 /// Whether `handle` is one of our opened standard-stream console handles.
 unsafe fn is_std_console_handle(handle: u64) -> bool {
     handle != 0 && STD_HANDLES.iter().any(|&h| h == handle)
+}
+
+/// `CreatePipe(hReadPipe, hWritePipe, lpPipeAttributes, nSize)` - create an
+/// anonymous pipe and return its read and write handles. cmd uses this for
+/// `dir | sort`: the write end becomes a child's stdout, the read end another
+/// child's stdin. Security attributes / size hint are ignored.
+#[no_mangle]
+pub unsafe extern "C" fn CreatePipe(
+    read_pipe: *mut u64,
+    write_pipe: *mut u64,
+    _attrs: *const c_void,
+    _size: u32,
+) -> i32 {
+    if read_pipe.is_null() || write_pipe.is_null() {
+        return 0;
+    }
+    let mut handles = [0u64; 2];
+    if syscall3(NT_CREATE_PIPE, handles.as_mut_ptr() as u64, 0, 0) == 0 {
+        return 0;
+    }
+    *read_pipe = handles[0];
+    *write_pipe = handles[1];
+    1
 }
 
 /// `MultiByteToWideChar(CodePage, dwFlags, lpMultiByteStr, cbMultiByte,
@@ -2031,7 +2080,7 @@ pub unsafe extern "C" fn CreateProcessW(
     _flags: u32,
     _environment: *const c_void,
     _cur_dir: *const u16,
-    _startup_info: *const c_void,
+    startup_info: *const c_void,
     process_information: *mut u8,
 ) -> i32 {
     // Choose the image path: prefer lpApplicationName; else the first
@@ -2064,6 +2113,20 @@ pub unsafe extern "C" fn CreateProcessW(
         } else {
             (path, len)
         };
+    // Handle redirection: if STARTUPINFO carries standard handles (a pipe or
+    // file for `dir | sort` / `> file`), stage them so the child inherits them.
+    // STARTUPINFOW (x64): dwFlags@60, hStdInput@80, hStdOutput@88, hStdError@96.
+    if !startup_info.is_null() {
+        let si = startup_info as *const u8;
+        let dwflags = core::ptr::read_unaligned(si.add(60) as *const u32);
+        if dwflags & 0x100 != 0 {
+            // STARTF_USESTDHANDLES
+            let h_in = core::ptr::read_unaligned(si.add(80) as *const u64);
+            let h_out = core::ptr::read_unaligned(si.add(88) as *const u64);
+            let h_err = core::ptr::read_unaligned(si.add(96) as *const u64);
+            syscall3(NT_SET_STARTUP_HANDLES, h_in, h_out, h_err);
+        }
+    }
     let handle = syscall4(
         NT_CREATE_PROCESS,
         path as u64,
