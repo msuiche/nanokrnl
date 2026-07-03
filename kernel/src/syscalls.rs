@@ -751,6 +751,14 @@ extern "C" fn nt_write_file(handle: u64, buffer: u64, length: u64, _a4: u64) -> 
                 crate::mm::virt::user_access_end();
                 return NtStatus::SUCCESS.0 as u64;
             }
+            // A writable RAM file (`> file`, cmd pipe temp file): append.
+            if unsafe { io::ramfs::is_writable_file(obj) } {
+                let file = obj as *mut io::ramfs::WritableFile;
+                crate::mm::virt::user_access_begin();
+                let _ = unsafe { io::ramfs::write(file, buffer as *const u8, length as usize) };
+                crate::mm::virt::user_access_end();
+                return NtStatus::SUCCESS.0 as u64;
+            }
             let device = obj as *mut DeviceObject;
             match unsafe {
                 io::io_synchronous_request(device, IRP_MJ_WRITE, buffer as *mut u8, length as usize)
@@ -768,7 +776,7 @@ extern "C" fn nt_write_file(handle: u64, buffer: u64, length: u64, _a4: u64) -> 
 /// **handle** to the device in RAX (0 on failure). The real NtCreateFile
 /// takes an `OBJECT_ATTRIBUTES`; this is the minimal "open a device by name"
 /// path a console app's startup needs.
-extern "C" fn nt_create_file(name_ptr: u64, name_len: u64, _a3: u64, _a4: u64) -> u64 {
+extern "C" fn nt_create_file(name_ptr: u64, name_len: u64, _access: u64, disposition: u64) -> u64 {
     let (ptr, len) = (name_ptr as *const u8, name_len as usize);
     if ptr.is_null() || len == 0 || len > 128 {
         return 0;
@@ -810,7 +818,22 @@ extern "C" fn nt_create_file(name_ptr: u64, name_len: u64, _a3: u64, _a4: u64) -
                 None => 0,
             };
         }
-        // Otherwise a RAM-filesystem path.
+        // Writable files: cmd implements `dir | sort` by writing dir's output to
+        // a temp file, then reading it into sort; `> file` is the same shape.
+        // CREATE_NEW(1)/CREATE_ALWAYS(2) make a fresh (truncated) writable file;
+        // OPEN_ALWAYS(4) opens or creates; other dispositions open an existing
+        // file. Reads see a previously created writable file before the const FILES.
+        let force_create = disposition == 1 || disposition == 2;
+        if !force_create {
+            if let Some(f) = io::ramfs::open_writable(bare) {
+                return handle::ob_create_handle(f as *mut u8, 0);
+            }
+        }
+        if force_create || disposition == 4 {
+            return io::ramfs::create_writable(bare, force_create)
+                .map_or(0, |f| handle::ob_create_handle(f as *mut u8, 0));
+        }
+        // Otherwise a RAM-filesystem path (read-only const files).
         if let Some(file) = io::ramfs::open(path) {
             return handle::ob_create_handle(file as *mut u8, 0);
         }
@@ -938,6 +961,14 @@ extern "C" fn nt_read_file(handle: u64, buffer: u64, length: u64, _a4: u64) -> u
                 crate::mm::virt::user_access_end();
                 return n as u64;
             }
+            // A writable RAM file (a temp file cmd wrote, `< file`): read it back.
+            if unsafe { io::ramfs::is_writable_file(obj) } {
+                let file = obj as *mut io::ramfs::WritableFile;
+                crate::mm::virt::user_access_begin();
+                let n = unsafe { io::ramfs::read_writable(file, buffer as *mut u8, length as usize) };
+                crate::mm::virt::user_access_end();
+                return n as u64;
+            }
             // A pipe read end: drain the buffer, blocking (preemptibly) until data
             // arrives or the last writer closes (EOF). Between checks interrupts
             // are on, so the timer preempts us and the producer thread runs.
@@ -1059,6 +1090,9 @@ extern "C" fn nt_query_file_size(handle: u64, _a2: u64, _a3: u64, _a4: u64) -> u
     match handle::ob_reference_object_by_handle(handle) {
         Ok(obj) if unsafe { io::ramfs::is_file_object(obj) } => unsafe {
             io::ramfs::size(obj as *mut io::ramfs::FileObject) as u64
+        },
+        Ok(obj) if unsafe { io::ramfs::is_writable_file(obj) } => unsafe {
+            io::ramfs::writable_size(obj as *mut io::ramfs::WritableFile) as u64
         },
         _ => 0xFFFF_FFFF,
     }

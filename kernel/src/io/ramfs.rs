@@ -317,3 +317,128 @@ pub unsafe fn read(file: *mut FileObject, dst: *mut u8, max: usize) -> usize {
 pub unsafe fn size(file: *mut FileObject) -> usize {
     unsafe { (*file).len }
 }
+
+// --- writable files -------------------------------------------------------
+// `CreateFile` with a create disposition makes a growable RAM file: cmd's pipe
+// temp files (it implements `dir | sort` by writing dir's output to a temp file,
+// then feeding it to sort) and `> file` redirection. Files persist by path in a
+// registry, so one written then reopened for read returns its bytes. This is a
+// writable overlay above the read-only FILES table.
+
+use crate::ke::spinlock::SpinLock;
+use alloc::string::String;
+
+/// Shared, growable contents of a writable file (one per path, leaked `'static`).
+struct Shared {
+    data: SpinLock<alloc::vec::Vec<u8>>,
+}
+
+/// An open handle to a writable file: the shared buffer plus this handle's cursor.
+#[repr(C)]
+pub struct WritableFile {
+    shared: *const Shared,
+    pos: AtomicUsize,
+}
+// SAFETY: `shared` is `'static` and internally synchronized.
+unsafe impl Send for WritableFile {}
+unsafe impl Sync for WritableFile {}
+
+pub static WRITABLE_FILE_TYPE: ob::ObjectType = ob::ObjectType {
+    name: UnicodeString::from_units(w!("WritableFile")),
+    delete: None,
+};
+
+/// Registry of created writable files (path -> shared buffer).
+static WRITABLE: SpinLock<alloc::vec::Vec<(String, &'static Shared)>> = SpinLock::new(alloc::vec::Vec::new());
+
+/// Canonical registry key: separator- and case-normalized, `.` segments dropped.
+fn norm_key(path: &str) -> String {
+    let mut out = String::new();
+    for seg in path.split(|c| c == '/' || c == '\\') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\\');
+        }
+        for b in seg.bytes() {
+            out.push(b.to_ascii_lowercase() as char);
+        }
+    }
+    out
+}
+
+fn shared_for(path: &str, truncate: bool) -> &'static Shared {
+    let key = norm_key(path);
+    let mut reg = WRITABLE.lock();
+    if let Some((_, s)) = reg.iter().find(|(k, _)| *k == key) {
+        if truncate {
+            s.data.lock().clear();
+        }
+        return s;
+    }
+    let s: &'static Shared = alloc::boxed::Box::leak(alloc::boxed::Box::new(Shared {
+        data: SpinLock::new(alloc::vec::Vec::new()),
+    }));
+    reg.push((key, s));
+    s
+}
+
+/// Create (or, if it exists and `truncate`, reset) a writable file, returning an
+/// open handle positioned at 0.
+pub fn create_writable(path: &str, truncate: bool) -> Option<*mut WritableFile> {
+    let shared = shared_for(path, truncate);
+    ob::ob_create_object(&WRITABLE_FILE_TYPE, WritableFile { shared, pos: AtomicUsize::new(0) }).ok()
+}
+
+/// Open a previously created writable file for reading, if one exists.
+pub fn open_writable(path: &str) -> Option<*mut WritableFile> {
+    let key = norm_key(path);
+    let shared = *WRITABLE.lock().iter().find(|(k, _)| *k == key).map(|(_, s)| s)?;
+    ob::ob_create_object(&WRITABLE_FILE_TYPE, WritableFile { shared, pos: AtomicUsize::new(0) }).ok()
+}
+
+/// Whether `body` is a writable file.
+///
+/// # Safety
+/// `body` must be a live object-manager object.
+pub unsafe fn is_writable_file(body: *mut u8) -> bool {
+    unsafe { ob::ob_check_type(body, &WRITABLE_FILE_TYPE).is_ok() }
+}
+
+/// Append `src[..len]` to a writable file. Returns bytes written.
+///
+/// # Safety
+/// `file` is a live `WritableFile`; `src` valid for `len` bytes.
+pub unsafe fn write(file: *mut WritableFile, src: *const u8, len: usize) -> usize {
+    let sh = unsafe { &*(*file).shared };
+    let mut d = sh.data.lock();
+    for i in 0..len {
+        d.push(unsafe { *src.add(i) });
+    }
+    len
+}
+
+/// Read up to `max` bytes from a writable file at its cursor. Returns the count.
+///
+/// # Safety
+/// `file` is a live `WritableFile`; `dst` valid for `max` bytes.
+pub unsafe fn read_writable(file: *mut WritableFile, dst: *mut u8, max: usize) -> usize {
+    let sh = unsafe { &*(*file).shared };
+    let d = sh.data.lock();
+    let pos = unsafe { (*file).pos.load(Ordering::Acquire) };
+    let n = d.len().saturating_sub(pos).min(max);
+    for i in 0..n {
+        unsafe { *dst.add(i) = d[pos + i] };
+    }
+    unsafe { (*file).pos.store(pos + n, Ordering::Release) };
+    n
+}
+
+/// Current size of a writable file.
+///
+/// # Safety
+/// `file` is a live `WritableFile`.
+pub unsafe fn writable_size(file: *mut WritableFile) -> usize {
+    unsafe { (&*(*file).shared).data.lock().len() }
+}

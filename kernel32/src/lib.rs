@@ -1945,10 +1945,10 @@ const INVALID_HANDLE_VALUE: u64 = u64::MAX; // (HANDLE)-1
 #[no_mangle]
 pub unsafe extern "C" fn CreateFileA(
     name: *const u8,
-    _access: u32,
+    access: u32,
     _share: u32,
     _sec: *mut c_void,
-    _disp: u32,
+    disp: u32,
     _flags: u32,
     _template: u64,
 ) -> u64 {
@@ -1975,9 +1975,11 @@ pub unsafe extern "C" fn CreateFileA(
         let dev = b"\\Device\\Console";
         return syscall3(NT_CREATE_FILE, dev.as_ptr() as u64, dev.len() as u64, 0);
     }
-    // A regular path: open it from the RAM filesystem via NtCreateFile.
+    // A regular path: open/create it via NtCreateFile, passing the desired
+    // access and create disposition so a write/create makes a writable RAM file
+    // (cmd pipe temp files, `> file`).
     let len = k_strlen(name);
-    let h = syscall3(NT_CREATE_FILE, name as u64, len as u64, 0);
+    let h = syscall4(NT_CREATE_FILE, name as u64, len as u64, access as u64, disp as u64);
     if h == 0 {
         INVALID_HANDLE_VALUE
     } else {

@@ -411,3 +411,29 @@ write end, which sidesteps cross-process writer-EOF entirely. Still to do: the
 kernel32 side (`CreatePipe`, `GetStdHandle` asking the kernel, `CreateProcessW`
 reading `STARTUPINFO` std handles), the `kernel32.dll` rebuild, and end-to-end
 testing; file redirection also needs a writable file sink.
+
+### 2026-07-03 (loop) - writable RAM files, and what cmd actually needs for `|`
+
+Added writable files: `CreateFile` with a create disposition (CREATE_NEW/
+CREATE_ALWAYS/OPEN_ALWAYS) now makes a growable RAM file that persists by path in
+a registry, so a file written then reopened returns its bytes. `NtReadFile`,
+`NtWriteFile`, and `NtQueryFileSize` route to it, and `CreateFileA` now passes the
+desired access + disposition through `NtCreateFile` (previously just the name).
+This gives real `> file` semantics to any program using the Win32 CreateFile/
+WriteFile path, and is inert for existing const-file reads (they use
+OPEN_EXISTING). `more hello.txt` still works.
+
+But testing `dir | sort` (and `> file`) against the real cmd.exe showed the
+demo's pipe/redirection does NOT go through the Win32 surface at all. cmd.exe's
+imports are `_o__pipe` (the msvcrt CRT `_pipe()`), `DuplicateHandle`, and
+`GetEnvironmentVariableW` - not `CreatePipe`/`SetStdHandle`/`GetTempFileName`. So
+this cmd implements `|` and `>` through the **C runtime's fd model** (`_pipe`,
+`_dup2`, `_open_osfhandle`/`_get_osfhandle`), and those are currently stubbed, so
+it silently runs the two commands unpiped.
+
+So the Win32 pipe + std-handle + writable-file work (all committed) is correct and
+reachable by programs that use those APIs, but the specific `dir | sort` demo
+needs the **msvcrt CRT I/O layer** next: `_pipe` backed by our pipe object, an fd
+table over `_open_osfhandle`/`_get_osfhandle`, `_dup2` to redirect fd 0/1, and
+fd-based read/write. That CRT layer sits on top of what's already here (its OS
+handles are our pipe/writable-file objects). Next iteration.
