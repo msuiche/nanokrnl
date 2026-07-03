@@ -851,6 +851,10 @@ function renderExplorer() {
   ul.innerHTML = "";
   const rows = Object.entries(p9.files).map(([n, d]) => [n, d]);
   if (dumpBytes) rows.push(["nanokrnl.core", dumpBytes]);
+  // The kernel image (ELF + DWARF) is the symbol file for the core:
+  //   gdb kernel.bin nanokrnl.core
+  // It is already fetched to boot the machine, so offer it here too.
+  if (kernelBytes) rows.push(["kernel.bin", kernelBytes]);
   for (const [name, data] of rows) {
     const size = data.length;
     const kb = size >= 1024 ? (size / 1024).toFixed(0) + " KB" : size + " B";
