@@ -597,3 +597,29 @@ CRT-fd rework that matches cmd's exact dup/close sequence; redirection is the
 verified milestone here. Earlier "garbled output" was a debug-logging artifact
 (kd_println interleaving with the stream), not real corruption. Source-only;
 deployed kernel.bin unchanged.
+
+### 2026-07-03 - pipes: precise blocker (CRT fd/dup vs our handle model)
+
+Instrumented the full `dir | sort` handoff (unique markers, grepped for, so no
+debug-interleave artifacts). The pipe is created (read=A, write=B) and both
+stages spawn, but the handle assignment comes out scrambled:
+
+- left `cmd /c dir` gets stdout = a *dup of the write end* (good in principle),
+- right `sort` gets stdout = the *read end* (wrong; its stdout should be the
+  console and its stdin the read end), and the listing bytes land on the read-end
+  handle, classified "other" (a read end is not a write end), so nothing flows
+  through the pipe to sort.
+
+Root cause: our msvcrt `_dup`/`_dup2` must duplicate the OS handle (distinct
+handle per fd) for redirection to work - otherwise cmd's `_close` of a saved fd
+kills the console handle another fd still points to. But duplicating changes
+handle *values* mid-sequence, and cmd's CRT tracks pipe ends by the fd->handle
+identities it expects from a Windows CRT, so the two-process `_pipe`/`_dup2`/
+`_close` choreography ends up mapping the wrong end to each stage.
+
+The proper fix is to make the fd table model Windows CRT semantics: multiple fds
+share one underlying OS handle via reference counting, and `_close` only closes
+the OS handle when the last fd referencing it goes away (rather than each fd
+owning a distinct dup). That is a real fd-layer rework, not a patch, and it is
+the actionable next step for pipes. Redirection (single process) is done and
+verified; pipes (cross-process) wait on this. Source-only.
