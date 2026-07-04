@@ -41,10 +41,12 @@ struct Run {
     size: u64,
 }
 
-/// The crash register set we can capture at the bugcheck point (callee-saved
-/// registers are meaningful; RIP/RSP/RBP drive the stack unwind).
+/// The crash register set we capture at the bugcheck point (callee-saved
+/// registers are meaningful; RIP/RSP/RBP drive the stack unwind). Captured once
+/// at the bugcheck entry and shared by both dump writers, so the recorded crash
+/// context is the bugcheck site rather than deep inside the dump code.
 #[derive(Default, Clone, Copy)]
-struct Gpr {
+pub struct Gpr {
     rbx: u64,
     rbp: u64,
     rsp: u64,
@@ -125,7 +127,9 @@ fn walk_runs() -> Vec<Run> {
     runs
 }
 
-fn capture() -> Gpr {
+/// Snapshot the crash register set at the caller's point. Call once at the
+/// bugcheck entry and pass the result to the dump writers.
+pub fn capture() -> Gpr {
     let mut g = Gpr::default();
     unsafe {
         asm!(
@@ -187,16 +191,15 @@ fn note(out: &mut Vec<u8>, name: &str, ntype: u32, desc: &[u8]) {
 /// Write the crash core to `H:\nanokrnl.core` over 9P. Returns the byte count on
 /// success, or `None` if the host 9P server is absent/failed. Safe to call at
 /// bugcheck IRQL: it only does port I/O + reads of physical memory.
-pub fn write_core(bugcheck: u32, params: &[u64; 4]) -> Option<u64> {
+pub fn write_core(bugcheck: u32, params: &[u64; 4], g: &Gpr) -> Option<u64> {
     // Publish the kernel-debugger data (module + process lists +
     // KdDebuggerDataBlock) so the captured image carries a coherent snapshot a
     // Windows debugger can walk. Must run before we snapshot memory below.
     crate::init::kd_snapshot();
-    let g = capture();
 
     // Note segment: NT_PRSTATUS + VMCOREINFO.
     let mut notes = Vec::new();
-    note(&mut notes, "CORE", 1 /* NT_PRSTATUS */, &prstatus(&g));
+    note(&mut notes, "CORE", 1 /* NT_PRSTATUS */, &prstatus(g));
     let mut vci = Vec::new();
     let _ = bugcheck;
     vci.extend_from_slice(b"OSRELEASE=nanokrnl-0.1.0\n");
@@ -308,11 +311,10 @@ const DMP_HEADER: usize = 0x2000;
 /// (CR3), walks the captured page tables to translate every virtual address, and
 /// finds the NT structures [`crate::kd`] laid out. Returns the byte count, or
 /// `None` if the host 9P server is absent. Safe at bugcheck IRQL.
-pub fn write_memory_dmp(bugcheck: u32, params: &[u64; 4]) -> Option<u64> {
+pub fn write_memory_dmp(bugcheck: u32, params: &[u64; 4], g: &Gpr) -> Option<u64> {
     // The KDBG structures must be current (write_core also refreshes them; doing
     // it again is idempotent).
     crate::init::kd_snapshot();
-    let g = capture();
 
     let mut h = alloc::vec![0u8; DMP_HEADER];
     let put32 = |h: &mut [u8], off: usize, v: u32| h[off..off + 4].copy_from_slice(&v.to_le_bytes());

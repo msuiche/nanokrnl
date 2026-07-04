@@ -257,10 +257,13 @@ extern "C" fn nt_bugcheck(code: u64, _a2: u64, _a3: u64, _a4: u64) -> u64 {
     let params = [0u64; 4];
     #[cfg(target_arch = "x86_64")]
     {
-        let _ = crate::dump::write_core(stop, &params);
+        // Capture the crash register set once, here at the bugcheck entry, so
+        // both dumps record this site (not a frame inside the dump writer).
+        let g = crate::dump::capture();
+        let _ = crate::dump::write_core(stop, &params, &g);
         // Also author a native Windows kernel dump (H:\MEMORY.DMP) so a Windows
         // debugger opens the crash as a kernel target (lm, !process 0 0).
-        let _ = crate::dump::write_memory_dmp(stop, &params);
+        let _ = crate::dump::write_memory_dmp(stop, &params, &g);
         // Break into an attached kernel debugger (lldb/gdb), like KdBreak on a
         // real bugcheck. A no-op in nanox when nothing is attached.
         unsafe { core::arch::asm!("int3") };
