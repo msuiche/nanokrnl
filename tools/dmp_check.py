@@ -180,6 +180,17 @@ def main():
                   f"(WinDbg resolves Cs via Gdtr; {'resolvable' if present else 'not present'})")
         except KeyError as e:
             print(f"  GDT NOT readable at Gdtr.Base: {e}")
+        # Current thread -> process (what !process reads before walking the list).
+        off_ct = c.u16(c.kdbg + 0x2b4)   # OffsetPrcbCurrentThread
+        off_apc = c.u16(c.kdbg + 0x2a0)  # OffsetKThreadApcProcess
+        cur = c.u64(prcb + off_ct)
+        print(f"  OffsetPrcbCurrentThread={off_ct:#x} CurrentThread={cur:#x}")
+        try:
+            proc = c.u64(cur + off_apc)
+            img = read_cstr(c.read(proc + 0x28, 16))
+            print(f"  CurrentThread readable; ApcState.Process={proc:#x} Image='{img}'")
+        except KeyError as e:
+            print(f"  CurrentThread/Process NOT readable: {e}")
     else:
         print("  KiProcessorBlock is 0 - GetContextState will fail")
 

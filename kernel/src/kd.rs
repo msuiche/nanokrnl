@@ -187,15 +187,32 @@ impl KspecialRegisters {
     }
 }
 
-/// A minimal synthetic `KPRCB`: just the `ProcessorState` (`KPROCESSOR_STATE` =
-/// `SpecialRegisters` + `ContextFrame`). WinDbg locates each half through the
-/// `OffsetPrcbProcState*` fields we publish in [`KddebuggerData64`], so this can
-/// be compact instead of a full PRCB. `context` is a byte array (align 1) so it
-/// sits immediately after `special` at offset `size_of::<KspecialRegisters>()`.
+/// Layout of our synthetic `KPRCB`. Real PRCBs never place `CurrentThread` or
+/// `ProcessorState` at offset 0, and the engine treats `PRCB+0` reads (from a
+/// zero `OffsetPrcb*`) as garbage - so keep both at realistic nonzero offsets.
+const PRCB_CURRENT_THREAD: usize = 0x08;
+const PRCB_PROCESSOR_STATE: usize = 0x180;
+
+/// A synthetic `KPRCB` carrying just what the debugger reads: a `CurrentThread`
+/// pointer and the `ProcessorState` (`KPROCESSOR_STATE` = `SpecialRegisters` +
+/// `ContextFrame`). WinDbg finds each via the `OffsetPrcb*` fields we publish in
+/// [`KddebuggerData64`]. `context` (align 1) sits right after `special`.
 #[repr(C)]
 struct Kprcb {
-    special: KspecialRegisters,
-    context: [u8; CONTEXT_SIZE],
+    head: [u8; PRCB_PROCESSOR_STATE], // CurrentThread pointer lives at PRCB_CURRENT_THREAD
+    special: KspecialRegisters,       // ProcessorState.SpecialRegisters @ PRCB_PROCESSOR_STATE
+    context: [u8; CONTEXT_SIZE],      // ProcessorState.ContextFrame
+}
+
+/// Offset of the (synthetic) `ApcState.Process` pointer inside our KTHREAD,
+/// published as `OffsetKThreadApcProcess` so the engine maps the current thread
+/// to its `EPROCESS`. The rest of the KTHREAD is zero (readable, benign).
+const KTHREAD_APC_PROCESS: usize = 0x98;
+const KTHREAD_SIZE: usize = 0x300;
+
+#[repr(C)]
+struct Kthread {
+    bytes: [u8; KTHREAD_SIZE],
 }
 
 /// `_DBGKD_DEBUG_DATA_HEADER64` — the head of [`KddebuggerData64`].
@@ -275,10 +292,18 @@ static mut KdProcessEntries: [Eprocess; MAX_PROCS] = [Eprocess::zero(); MAX_PROC
 /// register/CS-descriptor context, plus the one-entry `KiProcessorBlock` array
 /// that points at it. Filled on the crash path by [`set_processor_state`].
 #[no_mangle]
-static mut KdPrcb0: Kprcb =
-    Kprcb { special: KspecialRegisters::zero(), context: [0; CONTEXT_SIZE] };
+static mut KdPrcb0: Kprcb = Kprcb {
+    head: [0; PRCB_PROCESSOR_STATE],
+    special: KspecialRegisters::zero(),
+    context: [0; CONTEXT_SIZE],
+};
 #[no_mangle]
 static mut KiProcessorBlock: [u64; 1] = [0];
+/// Synthetic current thread for processor 0 (readable KTHREAD whose
+/// `ApcState.Process` points at the first process), so `!process`/`!thread` can
+/// establish the current context instead of dereferencing a bogus pointer.
+#[no_mangle]
+static mut KdThread0: Kthread = Kthread { bytes: [0; KTHREAD_SIZE] };
 
 static KD_LOCK: SpinLock<()> = SpinLock::new(());
 static mut N_MODULES: usize = 0;
@@ -483,12 +508,30 @@ pub fn set_processor_state(
         };
         prcb.context.copy_from_slice(context);
 
+        // Current thread: point the PRCB at a readable KTHREAD whose
+        // ApcState.Process is the first process, so the engine can establish the
+        // current context instead of reading a control register as a pointer.
+        let thread_va = addr(&raw const KdThread0);
+        prcb.head[PRCB_CURRENT_THREAD..PRCB_CURRENT_THREAD + 8].copy_from_slice(&thread_va.to_le_bytes());
+        let proc0 = addr(&raw const (*(&raw const KdProcessEntries))[0]);
+        let thread = &mut *(&raw mut KdThread0);
+        thread.bytes[KTHREAD_APC_PROCESS..KTHREAD_APC_PROCESS + 8]
+            .copy_from_slice(&proc0.to_le_bytes());
+
         (*(&raw mut KiProcessorBlock))[0] = addr(&raw const KdPrcb0);
 
         let d = &mut *(&raw mut KdDebuggerDataBlock);
+        // Processor block: where the state lives and how big the PRCB is.
         put_rest_u64(d, 0x218, addr(&raw const KiProcessorBlock)); // KiProcessorBlock
         put_rest_u16(d, 0x2b0, core::mem::size_of::<Kprcb>() as u16); // SizePrcb
-        put_rest_u16(d, 0x2bc, core::mem::size_of::<KspecialRegisters>() as u16); // OffsetPrcbProcStateContext
-        put_rest_u16(d, 0x2ec, 0); // OffsetPrcbProcStateSpecialReg (SpecialRegisters is first)
+        put_rest_u16(d, 0x2b4, PRCB_CURRENT_THREAD as u16); // OffsetPrcbCurrentThread
+        put_rest_u16(d, 0x2bc, (PRCB_PROCESSOR_STATE + core::mem::size_of::<KspecialRegisters>()) as u16); // OffsetPrcbProcStateContext
+        put_rest_u16(d, 0x2ec, PRCB_PROCESSOR_STATE as u16); // OffsetPrcbProcStateSpecialReg
+        // Thread/process shape so !process can walk from the current thread and
+        // decode each EPROCESS (matches our compact _EPROCESS layout).
+        put_rest_u16(d, 0x2a0, KTHREAD_APC_PROCESS as u16); // OffsetKThreadApcProcess
+        put_rest_u16(d, 0x2a8, core::mem::size_of::<Eprocess>() as u16); // SizeEProcess
+        put_rest_u16(d, 0x2aa, 0x20); // OffsetEprocessPeb
+        put_rest_u16(d, 0x2ae, 0x18); // OffsetEprocessDirectoryTableBase
     }
 }
