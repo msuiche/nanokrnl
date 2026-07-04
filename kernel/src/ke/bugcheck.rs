@@ -26,19 +26,19 @@ pub const RUST_PANIC: u32 = 0xDEAD_0001;
 /// Re-entrancy latch: a bugcheck *during* a bugcheck (e.g. the printer
 /// faults) must not recurse forever; second entry goes straight to halt.
 static IN_BUGCHECK: AtomicBool = AtomicBool::new(false);
+/// Set once the STOP banner has been printed, so it is shown exactly once even
+/// when the crash path displays it early (before collecting the dump) and then
+/// funnels through [`ke_bug_check_ex`] to halt.
+static BANNER_PRINTED: AtomicBool = AtomicBool::new(false);
 
-/// `KeBugCheckEx` — fatal stop with four diagnostic parameters.
-///
-/// Never returns; the processor is left halted with interrupts off.
-pub fn ke_bug_check_ex(code: u32, p1: u64, p2: u64, p3: u64, p4: u64) -> ! {
-    // From here on nothing may preempt or interrupt us.
-    irql::disable_interrupts();
-    let _ = irql::ke_raise_irql(HIGH_LEVEL);
-
-    if IN_BUGCHECK.swap(true, Ordering::SeqCst) {
-        halt(); // recursive bugcheck: give up silently
+/// Print the STOP banner (the "blue screen") without halting. Idempotent. The
+/// crash path calls this *before* streaming the crash dump so the screen appears
+/// immediately - Windows likewise shows the stop screen, then collects the dump -
+/// instead of making the user wait for a multi-megabyte 9P transfer first.
+pub fn ke_display_bugcheck(code: u32, p1: u64, p2: u64, p3: u64, p4: u64) {
+    if BANNER_PRINTED.swap(true, Ordering::SeqCst) {
+        return;
     }
-
     #[cfg(target_arch = "x86_64")]
     unsafe {
         crate::hal::serial::write_fmt_forced(format_args!(
@@ -54,10 +54,25 @@ pub fn ke_bug_check_ex(code: u32, p1: u64, p2: u64, p3: u64, p4: u64) -> ! {
         ));
     }
     #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = (p1, p2, p3, p4);
-        panic!("KeBugCheckEx({code:#010X})");
+    let _ = (code, p1, p2, p3, p4);
+}
+
+/// `KeBugCheckEx` — fatal stop with four diagnostic parameters.
+///
+/// Never returns; the processor is left halted with interrupts off.
+pub fn ke_bug_check_ex(code: u32, p1: u64, p2: u64, p3: u64, p4: u64) -> ! {
+    // From here on nothing may preempt or interrupt us.
+    irql::disable_interrupts();
+    let _ = irql::ke_raise_irql(HIGH_LEVEL);
+
+    if IN_BUGCHECK.swap(true, Ordering::SeqCst) {
+        halt(); // recursive bugcheck: give up silently
     }
+
+    // Print the STOP banner (no-op if the crash path already showed it early).
+    ke_display_bugcheck(code, p1, p2, p3, p4);
+    #[cfg(not(target_arch = "x86_64"))]
+    panic!("KeBugCheckEx({code:#010X})");
 
     #[allow(unreachable_code)]
     {

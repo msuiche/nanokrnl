@@ -260,13 +260,20 @@ extern "C" fn nt_bugcheck(code: u64, _a2: u64, _a3: u64, _a4: u64) -> u64 {
         // Capture the crash register set once, here at the bugcheck entry, so
         // both dumps record this site (not a frame inside the dump writer).
         let g = crate::dump::capture();
-        let _ = crate::dump::write_core(stop, &params, &g);
-        // Also author a native Windows kernel dump (H:\MEMORY.DMP) so a Windows
-        // debugger opens the crash as a kernel target (lm, !process 0 0).
-        let _ = crate::dump::write_memory_dmp(stop, &params, &g);
+        // Show the STOP banner immediately - like Windows, the screen appears
+        // first, then the dump is collected. Otherwise the user waits for the
+        // multi-megabyte 9P transfer before anything shows.
+        crate::ke::bugcheck::ke_display_bugcheck(stop, params[0], params[1], params[2], params[3]);
         // Break into an attached kernel debugger (lldb/gdb), like KdBreak on a
-        // real bugcheck. A no-op in nanox when nothing is attached.
+        // real bugcheck, before collecting the dump so you can inspect live. A
+        // no-op in nanox when nothing is attached.
         unsafe { core::arch::asm!("int3") };
+        // Collect the crash dump(s) to the host (ELF core for lldb/gdb, MEMORY.DMP
+        // for WinDbg). This is the slow part; the banner is already on screen.
+        crate::kd_println!("*** Collecting crash dump to H:\\ ...");
+        let _ = crate::dump::write_core(stop, &params, &g);
+        let _ = crate::dump::write_memory_dmp(stop, &params, &g);
+        crate::kd_println!("*** Crash dump complete.");
     }
     crate::ke::bugcheck::ke_bug_check_ex(stop, params[0], params[1], params[2], params[3])
 }

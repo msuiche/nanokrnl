@@ -289,7 +289,7 @@ pub fn write_core(bugcheck: u32, params: &[u64; 4], g: &Gpr) -> Option<u64> {
         return None;
     }
     let mem = unsafe { core::slice::from_raw_parts(phys_to_virt(PhysAddr(0)), CAP as usize) };
-    if !w.write(mem) {
+    if !write_phys_progress(&mut w, mem, "nanokrnl.core") {
         return None;
     }
     let total = w.offset();
@@ -299,6 +299,41 @@ pub fn write_core(bugcheck: u32, params: &[u64; 4], g: &Gpr) -> Option<u64> {
 
 /// Size of a 64-bit Windows crash-dump header (`_DUMP_HEADER64`).
 const DMP_HEADER: usize = 0x2000;
+
+/// Stream `mem` to `w` in slices, drawing a `label: [####  ] NN%` progress bar
+/// over the serial console between slices - the multi-MiB physical-memory write
+/// is the slow part of a dump (Windows shows the same "Dumping physical memory
+/// to disk" bar). Returns false on any transport failure.
+fn write_phys_progress(w: &mut p9::Writer, mem: &[u8], label: &str) -> bool {
+    const CELLS: usize = 24;
+    const FILL: &str = "########################"; // CELLS '#'
+    const PAD: &str = "                        "; // CELLS spaces
+    const STEP: usize = 1 << 21; // 2 MiB per slice
+    let total = mem.len().max(1);
+    let mut off = 0usize;
+    while off < mem.len() {
+        let end = (off + STEP).min(mem.len());
+        if !w.write(&mem[off..end]) {
+            return false;
+        }
+        off = end;
+        let pct = (off * 100 / total).min(100);
+        let n = (pct * CELLS / 100).min(CELLS);
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            crate::hal::serial::write_fmt_forced(format_args!(
+                "\r*** {label}: [{}{}] {pct:3}%",
+                &FILL[..n],
+                &PAD[..CELLS - n],
+            ));
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        crate::hal::serial::write_fmt_forced(format_args!("\n"));
+    }
+    true
+}
 
 /// Write a **Windows kernel crash dump** to `H:\MEMORY.DMP` over 9P, so a real
 /// Windows debugger opens it as a kernel target (`lm`, `!process 0 0`).
@@ -391,7 +426,7 @@ pub fn write_memory_dmp(bugcheck: u32, params: &[u64; 4], g: &Gpr) -> Option<u64
         return None;
     }
     let mem = unsafe { core::slice::from_raw_parts(phys_to_virt(PhysAddr(0)), CAP as usize) };
-    if !w.write(mem) {
+    if !write_phys_progress(&mut w, mem, "MEMORY.DMP") {
         return None;
     }
     let total = w.offset();
