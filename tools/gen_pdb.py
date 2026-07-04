@@ -20,6 +20,54 @@ import sys
 
 KERNEL_VIRT_BASE = 0xFFFF_8000_0000_0000
 
+# CodeView type records for the NT structures nanokrnl lays out (see kernel
+# src/kd.rs), so `dt`, `lm`, and `!process` decode them by name. Type indices are
+# assigned sequentially from 0x1000 in record order; base types are CodeView
+# simple types (0x0077 unsigned __int64, 0x0075 unsigned, 0x0021 unsigned short,
+# 0x0020 unsigned char). Offsets/sizes are exactly kernel/src/kd.rs's #[repr(C)]
+# layouts - these describe *our* compact structs, not a real Windows build's.
+#   0x1001 _LIST_ENTRY   0x1003 _UNICODE_STRING   0x1004 char[16]
+#   0x1006 _EPROCESS     0x1008 _KLDR_DATA_TABLE_ENTRY
+TPI_RECORDS = """\
+TpiStream:
+  Version: VC80
+  Records:
+    - Kind: LF_FIELDLIST
+      FieldList:
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0077, FieldOffset: 0, Name: 'Flink' } }
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0077, FieldOffset: 8, Name: 'Blink' } }
+    - Kind: LF_STRUCTURE
+      Class: { MemberCount: 2, Options: [ None ], FieldList: 0x1000, Name: '_LIST_ENTRY', UniqueName: '', DerivationList: 0, VTableShape: 0, Size: 16 }
+    - Kind: LF_FIELDLIST
+      FieldList:
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0021, FieldOffset: 0, Name: 'Length' } }
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0021, FieldOffset: 2, Name: 'MaximumLength' } }
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0077, FieldOffset: 8, Name: 'Buffer' } }
+    - Kind: LF_STRUCTURE
+      Class: { MemberCount: 3, Options: [ None ], FieldList: 0x1002, Name: '_UNICODE_STRING', UniqueName: '', DerivationList: 0, VTableShape: 0, Size: 16 }
+    - Kind: LF_ARRAY
+      Array: { ElementType: 0x0020, IndexType: 0x0077, Size: 16, Name: '' }
+    - Kind: LF_FIELDLIST
+      FieldList:
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0077, FieldOffset: 0, Name: 'UniqueProcessId' } }
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x1001, FieldOffset: 8, Name: 'ActiveProcessLinks' } }
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0077, FieldOffset: 24, Name: 'DirectoryTableBase' } }
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0077, FieldOffset: 32, Name: 'Peb' } }
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x1004, FieldOffset: 40, Name: 'ImageFileName' } }
+    - Kind: LF_STRUCTURE
+      Class: { MemberCount: 5, Options: [ None ], FieldList: 0x1005, Name: '_EPROCESS', UniqueName: '', DerivationList: 0, VTableShape: 0, Size: 56 }
+    - Kind: LF_FIELDLIST
+      FieldList:
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x1001, FieldOffset: 0, Name: 'InLoadOrderLinks' } }
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0077, FieldOffset: 48, Name: 'DllBase' } }
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0077, FieldOffset: 56, Name: 'EntryPoint' } }
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0075, FieldOffset: 64, Name: 'SizeOfImage' } }
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x1003, FieldOffset: 72, Name: 'FullDllName' } }
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x1003, FieldOffset: 88, Name: 'BaseDllName' } }
+    - Kind: LF_STRUCTURE
+      Class: { MemberCount: 6, Options: [ None ], FieldList: 0x1007, Name: '_KLDR_DATA_TABLE_ENTRY', UniqueName: '', DerivationList: 0, VTableShape: 0, Size: 176 }\
+"""
+
 
 def find_tool(*names):
     for n in names:
@@ -103,6 +151,9 @@ def main():
         "  Age: 1",
         "  MachineType: Amd64",
         "  Modules: []",
+    ]
+    yaml += TPI_RECORDS.splitlines()
+    yaml += [
         "PublicsStream:",
         "  Records:",
     ]
