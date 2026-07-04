@@ -58,17 +58,18 @@ f1038d9 (whoami), 4657bab (per-process command line), 7cc5960 + 47047aa (more.co
 
 ## Log
 
-### 2026-07-04 (Part IV cont.) - crash UX: banner first, dump progress bar
+### 2026-07-04 (Part IV cont.) - crash UX: dump progress, dump-before-banner
 
-- On `crash` the bugcheck path wrote two 32 MiB dumps (ELF core + MEMORY.DMP)
-  over the byte-wise 9P transport *before* printing the STOP banner, so the BSOD
-  only appeared after the whole transfer. Reordered to Windows' sequence: show
-  the stop screen first, then collect the dump. `ke_display_bugcheck` prints the
-  banner without halting (idempotent), called from the crash path before the
-  int3/dump and reused by `ke_bug_check_ex`.
-- Added a per-file progress bar over the serial console during the physical
-  memory write (the slow part): `*** MEMORY.DMP: [########      ] 42%`, filling
-  6% -> 100%. Verified in a real `crash` run: banner, then the bar.
+- On `crash` the bugcheck path streams two 32 MiB dumps (ELF core + MEMORY.DMP)
+  over the byte-wise 9P transport, which is slow, so the crash appeared to stall.
+  Added a per-file progress readout during the physical-memory write: discrete
+  newline-terminated lines `***   MEMORY.DMP: 12%` ... `100%` (a `\r` bar was
+  tried first but is invisible where the console buffers on newline).
+- Ordering: the dump is written *before* the STOP banner. A brief detour tried
+  banner-first (Windows' visible order), but the browser front-end stops the
+  emulator the instant it sees `*** STOP:`, so the dump must complete first; the
+  progress lines provide the feedback banner-first was chasing. `ke_bug_check_ex`
+  prints the banner (via idempotent `ke_display_bugcheck`) after the dump.
 
 ### 2026-07-04 (Part IV cont.) - live KD bridge: packet layer
 
