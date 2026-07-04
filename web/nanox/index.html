@@ -920,26 +920,29 @@ function putChar(c) {
   else term += String.fromCharCode(c);
   col++;
 }
-let bsod = false;
+let bsod = false, bsodStopped = false;
 function drainUart() {
   let b, changed = false;
   while ((b = e.nanox_uart_read()) >= 0) { changed = true; putChar(b); }
   if (changed) {
     if (term.length > 200000) { term = term.slice(-150000); col = Math.min(col, term.length - term.lastIndexOf("\n") - 1); }
     render();
-    // A kernel bugcheck ("*** STOP:") turns the console into a blue screen and
-    // ends the session: the machine has halted itself.
-    if (!bsod && term.includes("*** STOP:")) {
+    // Recolor only, and do it as soon as the kernel BEGINS the bugcheck (the
+    // "Collecting crash dump" line), like Windows' blue "collecting data for
+    // crash dump" screen. The machine keeps running so the dump finishes
+    // writing; the console text is the kernel's own serial output, untouched.
+    if (!bsod && (term.includes("*** Collecting crash dump") || term.includes("*** STOP:"))) {
       bsod = true;
-      const name = (term.match(/\*\*\* ([A-Z0-9_]+)\s*$/m) || [])[1];
-      // Recolor only: the console text (dump-collection progress + the bugcheck
-      // banner) is the kernel's own serial output; we don't rewrite it. The
-      // window turns blue and auto-scrolls to the crash at the bottom.
       screen.classList.add("bsod");                          // the console window goes blue
       render();
-      // nanokrnl writes the core to H:\ itself (over 9P); the button appears
-      // once the server hands us the bytes, which usually happened already since
-      // the kernel dumps before printing STOP.
+    }
+    // Only end the session once the machine has actually halted ("*** STOP:"),
+    // which the kernel prints after the dump is written.
+    if (!bsodStopped && term.includes("*** STOP:")) {
+      bsodStopped = true;
+      const name = (term.match(/\*\*\* ([A-Z0-9_]+)\s*$/m) || [])[1];
+      // nanokrnl wrote the core to H:\ over 9P before printing STOP; the button
+      // appears once the server handed us the bytes.
       btnDump.style.display = dumpBytes ? "" : "none";
       setStatus("stop", "bugcheck" + (name ? " · " + name : "") + (dumpBytes ? " · core on H:\\" : ""));
       running = false; refreshButtons();
@@ -1001,7 +1004,7 @@ function loop() {
 async function boot(image) {
   stop();
   term = ""; col = 0; screen.textContent = ""; perFrame = 2_000_000;
-  bsod = false; screen.classList.remove("bsod"); btnDump.style.display = "none";
+  bsod = false; bsodStopped = false; screen.classList.remove("bsod"); btnDump.style.display = "none";
   insAccum = 0; statsT0 = performance.now();
   setStatus("boot", "cold boot · interpreting the full boot…");
   const inst = (await WebAssembly.instantiate(wasmBytes, {})).instance;
@@ -1020,7 +1023,7 @@ async function boot(image) {
 async function resume(snap) {
   stop();
   screen.textContent = ""; perFrame = 500_000;  // interactive at once
-  bsod = false; screen.classList.remove("bsod"); btnDump.style.display = "none";
+  bsod = false; bsodStopped = false; screen.classList.remove("bsod"); btnDump.style.display = "none";
   insAccum = 0; statsT0 = performance.now();
   setStatus("boot", "restoring snapshot…");
   const inst = (await WebAssembly.instantiate(wasmBytes, {})).instance;
