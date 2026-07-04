@@ -349,8 +349,8 @@ pub fn write_memory_dmp(bugcheck: u32, params: &[u64; 4], g: &Gpr) -> Option<u64
     // --- DUMP_HEADER64 fixed fields ------------------------------------
     h[0..4].copy_from_slice(b"PAGE"); // Signature
     h[4..8].copy_from_slice(b"DU64"); // ValidDump (64-bit)
-    put32(&mut h, 0x08, 15); // MajorVersion (NT)
-    put32(&mut h, 0x0c, 26100); // MinorVersion (build; drives symbol lookup)
+    put32(&mut h, 0x08, 15); // MajorVersion (NT free-build indicator)
+    put32(&mut h, 0x0c, 31337); // MinorVersion = build (nanokrnl 1.1.31337)
     put64(&mut h, 0x10, cr3() & ADDR_MASK); // DirectoryTableBase (kernel CR3)
     put64(&mut h, 0x18, 0); // PfnDataBase (not modeled)
     put64(&mut h, 0x20, &raw const crate::kd::PsLoadedModuleList as u64);

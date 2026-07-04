@@ -485,9 +485,9 @@ fn setup_user_blocks(s: SetupBlocks) -> Result<(crate::mm::PhysAddr, [u64; 3]), 
         w64(PEB_OFF + 0x20, PARAMS_BASE); // ProcessParameters
         w64(PEB_OFF + 0x30, PROCESS_HEAP); // ProcessHeap
         w32(PEB_OFF + 0xBC, 0); // NtGlobalFlag
-        w32(PEB_OFF + 0x118, 1); // OSMajorVersion
-        w32(PEB_OFF + 0x11C, 0); // OSMinorVersion
-        w16(PEB_OFF + 0x120, 1); // OSBuildNumber
+        w32(PEB_OFF + 0x118, 1); // OSMajorVersion  (nanokrnl 1.1.31337)
+        w32(PEB_OFF + 0x11C, 1); // OSMinorVersion
+        w16(PEB_OFF + 0x120, 31337); // OSBuildNumber
         w32(PEB_OFF + 0x124, 2); // OSPlatformId = VER_PLATFORM_WIN32_NT
 
         // ---- RTL_USER_PROCESS_PARAMETERS ----

@@ -866,13 +866,12 @@ pub unsafe extern "C" fn GetSystemInfo(info: *mut SystemInfo) {
     };
 }
 
-// Version the shim reports (Windows 10.0 build 19041), encoded the way each
-// API expects.
-// A deliberately fake placeholder version (1.0.1) — nanokrnl reports its own
-// version, not a real Windows build number.
+// The version nanokrnl reports through the Win32 version APIs: its own
+// 1.1.31337, deliberately not a real Windows build number so nothing mistakes it
+// for one (and no debugger tries to fetch Microsoft symbols for it).
 const OS_MAJOR: u32 = 1;
-const OS_MINOR: u32 = 0;
-const OS_BUILD: u32 = 1;
+const OS_MINOR: u32 = 1;
+const OS_BUILD: u32 = 31337;
 const VER_PLATFORM_WIN32_NT: u32 = 2;
 
 /// `GetVersion()` — the legacy packed version: low byte of LOWORD = major,
@@ -894,7 +893,7 @@ pub struct OsVersionInfoA {
 }
 
 /// `GetVersionExA(lpVersionInformation)` — fill the OS version structure.
-/// Reports NT platform 10.0 build 19041, empty service-pack string. Returns
+/// Reports NT platform 1.1 build 31337, empty service-pack string. Returns
 /// nonzero (TRUE).
 #[no_mangle]
 pub unsafe extern "C" fn GetVersionExA(info: *mut OsVersionInfoA) -> i32 {
