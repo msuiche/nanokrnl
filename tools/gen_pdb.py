@@ -69,6 +69,74 @@ TpiStream:
 """
 
 
+def write_pe_stub(path):
+    """Write a minimal ntoskrnl.exe PE stub whose headers + RSDS debug directory
+    match the masquerade header nanokrnl overlays into MEMORY.DMP (same GUID, age,
+    TimeDateStamp=0, SizeOfImage=0x400000). WinDbg reads the crash's memory header
+    to learn the image identity, then reads the *CodeView record from this file*
+    on the .exepath; the RSDS points it at ntoskrnl.pdb. Mirrors dump.rs's
+    masquerade_pe byte for byte."""
+    # File layout: headers in [0, 0x400); one section ".text" mapped RVA 0x1000
+    # -> file 0x400, holding the debug directory + RSDS so a section-based reader
+    # (dbghelp/llvm) can resolve their RVAs. RVA 0x1000 -> file 0x400.
+    p = bytearray(0x600)
+
+    def w16(o, v):
+        p[o:o + 2] = int(v).to_bytes(2, "little")
+
+    def w32(o, v):
+        p[o:o + 4] = int(v).to_bytes(4, "little")
+
+    def w64(o, v):
+        p[o:o + 8] = int(v).to_bytes(8, "little")
+
+    p[0:2] = b"MZ"
+    w32(0x3c, 0x40)
+    p[0x40:0x44] = b"PE\x00\x00"
+    w16(0x44, 0x8664)  # Machine = AMD64
+    w16(0x46, 1)  # NumberOfSections
+    w16(0x54, 0xF0)  # SizeOfOptionalHeader
+    w16(0x56, 0x0022)  # Characteristics
+    opt = 0x58
+    w16(opt, 0x20B)  # PE32+
+    w32(opt + 0x14, 0x1000)  # BaseOfCode
+    w64(opt + 0x18, KERNEL_VIRT_BASE)  # ImageBase
+    w32(opt + 0x20, 0x1000)  # SectionAlignment
+    w32(opt + 0x24, 0x200)  # FileAlignment
+    w16(opt + 0x30, 10)  # MajorSubsystemVersion
+    w32(opt + 0x38, 0x0040_0000)  # SizeOfImage
+    w32(opt + 0x3c, 0x400)  # SizeOfHeaders
+    w16(opt + 0x44, 1)  # Subsystem = NATIVE
+    w32(opt + 0x6c, 16)  # NumberOfRvaAndSizes
+    dd_debug = opt + 0x70 + 6 * 8
+    w32(dd_debug, 0x1000)  # DEBUG dir VA (inside .text)
+    w32(dd_debug + 4, 0x1c)  # DEBUG dir size
+    # Section table @ 0x148: ".text" VA 0x1000, raw data at file 0x400.
+    sec = 0x148
+    p[sec:sec + 5] = b".text"
+    w32(sec + 0x08, 0x0040_0000 - 0x1000)  # VirtualSize
+    w32(sec + 0x0c, 0x1000)  # VirtualAddress
+    w32(sec + 0x10, 0x200)  # SizeOfRawData
+    w32(sec + 0x14, 0x400)  # PointerToRawData
+    w32(sec + 0x24, 0x6000_0020)  # CODE|EXECUTE|READ
+    # IMAGE_DEBUG_DIRECTORY at RVA 0x1000 -> file 0x400.
+    dbg = 0x400
+    w32(dbg + 0x0c, 2)  # Type = CODEVIEW
+    w32(dbg + 0x10, 4 + 16 + 4 + 13)  # SizeOfData
+    w32(dbg + 0x14, 0x1020)  # AddressOfRawData (RVA of RSDS)
+    w32(dbg + 0x18, 0x420)  # PointerToRawData (file offset of RSDS)
+    # RSDS at RVA 0x1020 -> file 0x420.
+    rs = 0x420
+    p[rs:rs + 4] = b"RSDS"
+    p[rs + 4:rs + 20] = bytes(
+        [0x67, 0x45, 0x23, 0x01, 0xAB, 0x89, 0xEF, 0xCD, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]
+    )
+    w32(rs + 20, 1)  # Age
+    p[rs + 24:rs + 24 + 13] = b"ntoskrnl.pdb\x00"
+    with open(path, "wb") as f:
+        f.write(p)
+
+
 def find_tool(*names):
     for n in names:
         p = shutil.which(n)
@@ -176,9 +244,17 @@ def main():
     # Sanity-count what actually landed.
     dump = subprocess.run([pdbutil, "dump", "-publics", out_pdb], capture_output=True, text=True).stdout
     n_pub = dump.count("S_PUB32")
+
+    # Companion ntoskrnl.exe stub: WinDbg reads the RSDS from the image *file*,
+    # so it needs this alongside the PDB (matching the masquerade header in the
+    # dump). Written next to the PDB, named ntoskrnl.exe.
+    exe_path = os.path.join(os.path.dirname(out_pdb) or ".", "ntoskrnl.exe")
+    write_pe_stub(exe_path)
+
     print(f"wrote {out_pdb}: {n_pub} public symbols (of {len(syms)} defined)")
-    print("WinDbg: put ntoskrnl.pdb on your symbol path, then in the dump:")
-    print(f"  .reload /i /f ntoskrnl.exe=0x{KERNEL_VIRT_BASE:016x}")
+    print(f"wrote {exe_path}: ntoskrnl.exe PE stub (RSDS -> ntoskrnl.pdb)")
+    print("WinDbg: put BOTH on a local path (e.g. C:\\sym), then in the dump:")
+    print("  .exepath+ C:\\sym ; .sympath+ C:\\sym ; .reload /f")
     print("  (symbols resolve as KERNEL_VIRT_BASE + RVA; the kernel links at 0)")
 
 
