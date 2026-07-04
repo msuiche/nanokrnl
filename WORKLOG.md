@@ -58,6 +58,20 @@ f1038d9 (whoami), 4657bab (per-process command line), 7cc5960 + 47047aa (more.co
 
 ## Log
 
+### 2026-07-04 (Part IV cont.) - symbols for WinDbg (ntoskrnl.pdb)
+
+- WinDbg opened MEMORY.DMP as a kernel target but had no symbols (our kernel is
+  ELF/DWARF, no PDB). Added `tools/gen_pdb.py`: reads the kernel ELF symbol table
+  (`nm`) and emits `ntoskrnl.pdb` with one `S_PUB32` per defined symbol via
+  `llvm-pdbutil yaml2pdb`. The kernel links at 0, so each symbol value *is* its
+  RVA - the offset a debugger adds to the load base. Load in WinDbg with
+  `.reload /i /f ntoskrnl.exe=0xfffff800`00000000`; symbols resolve as
+  KERNEL_VIRT_BASE + RVA. 1856 publics, verified with `llvm-pdbutil dump`.
+- Fixed the module `SizeOfImage`: it was 0x290000, but the highest kernel symbol
+  is near RVA 0x313000 (past .text into .data/.bss), so globals like
+  PsLoadedModuleList fell outside the module range. Bumped to 0x400000 so `lm`
+  spans the whole image and all symbols land inside it.
+
 ### 2026-07-04 (Part IV cont.) - native Windows crash dump (MEMORY.DMP)
 
 - The KDBG structures were validated only by our own ELF-core walker; nothing

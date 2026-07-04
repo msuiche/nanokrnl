@@ -391,8 +391,11 @@ pub fn kd_snapshot() {
     use crate::kd;
     kd::begin();
     // The kernel itself first — its base becomes KernBase and a debugger loads
-    // ntoskrnl's (our DWARF) symbols against it. ~0x290000 covers the image.
-    kd::push_module(kd::KERNEL_VIRT_BASE, 0x0029_0000, b"ntoskrnl.exe");
+    // ntoskrnl's symbols (our DWARF, or the generated ntoskrnl.pdb) against it.
+    // SizeOfImage must span the whole image: the highest kernel symbol sits near
+    // RVA 0x313000 (past .text into .data/.bss), so a too-small size would leave
+    // globals like PsLoadedModuleList outside the module range in `lm`.
+    kd::push_module(kd::KERNEL_VIRT_BASE, 0x0040_0000, b"ntoskrnl.exe");
     // The user-mode modules the debug tracker knows about (kernel32/msvcrt/… and
     // the running program image).
     crate::ke::debug::for_each_module(|name, base, size| {
