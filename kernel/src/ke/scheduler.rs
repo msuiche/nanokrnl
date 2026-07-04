@@ -221,6 +221,18 @@ unsafe fn switch_away_locked(cur: *mut Kthread) {
         // and `next` (and the code executing here) stay mapped across the
         // load. Only switch when the target AS actually differs, to avoid a
         // needless TLB flush when staying within one address space.
+        // Emulated per-process DLL data: give the resuming process its private
+        // copy of the shim C-runtime state (fd table, cached std handles) by
+        // swapping it into the shared shim `.data` pages, saving the outgoing
+        // process's first. No-op unless an isolated process is involved. Done
+        // while `cur`'s address space is still active; the shim pages are in the
+        // shared high half (same physical frames in every space), so the copy
+        // sees the same bytes either side of the CR3 load.
+        let out_cr3 = (*cur).cr3;
+        let in_cr3 = (*next).cr3;
+        if out_cr3 != in_cr3 && (out_cr3 != 0 || in_cr3 != 0) {
+            crate::ldr::loaded::swap_shim_data(out_cr3, in_cr3);
+        }
         let target_cr3 = if (*next).cr3 != 0 {
             (*next).cr3
         } else {

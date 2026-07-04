@@ -485,6 +485,13 @@ pub(crate) fn create_user_process(image: &[u8], cmdline: &[u8], std_handles: [u6
         Ok(p) => p,
         Err(_) => return 0,
     };
+    // Give this process its own copy of the shims' C-runtime data (msvcrt's fd
+    // table, cached standard handles). The shim code is shared high-half code,
+    // but this state must be per-process or a concurrent child's CRT init would
+    // corrupt this process's - the root cause of `dir | sort` handing the wrong
+    // handle to `sort`. The scheduler swaps this buffer in whenever the process
+    // runs. Freed in on_user_thread_exit.
+    crate::ldr::loaded::alloc_shim_data(proc.cr3.0);
     // Patch the PEB command line with the real invocation so a tool that reads
     // PEB.ProcessParameters.CommandLine directly (e.g. ulib's more.com) sees its
     // arguments. The per-thread cmdline (for the GetCommandLine syscall) is set
@@ -512,9 +519,22 @@ pub(crate) fn create_user_process(image: &[u8], cmdline: &[u8], std_handles: [u6
     // invalidate another (its stdin). Set both the thread state (GetStdHandle
     // syscall path) and the PEB (programs that read the handles directly).
     let mut std = std_handles;
+    let child_cr3 = proc.cr3.0;
     for i in 0..3 {
         if std[i] == 0 {
+            // No redirect for this stream: the child's own console handle,
+            // already created in the child's table by setup_user_blocks.
             std[i] = proc.std_console[i];
+        } else {
+            // Inherited stream (a pipe end or file the parent redirected).
+            // std[i] names it in the *parent's* (calling) handle table; the
+            // child needs its own handle to the same object in the child's
+            // table, so the parent closing its copy leaves the child's alive.
+            let dup = match crate::ob::handle::ob_reference_object_by_handle(std[i]) {
+                Ok(obj) => crate::ob::handle::ob_create_handle_in(child_cr3, obj as *mut u8, 0),
+                Err(_) => 0,
+            };
+            std[i] = if dup != 0 { dup } else { proc.std_console[i] };
         }
     }
     unsafe { (*t).tcb.std_handles = std };
@@ -553,6 +573,14 @@ pub(crate) fn on_user_thread_exit(thread: u64) {
     };
     if let Some(mode) = mode {
         crate::io::console::set_input_mode(mode);
+    }
+    // Tear down the exiting process's handle table, dropping every reference it
+    // still holds and freeing the slot for reuse. `thread` is the ETHREAD; its
+    // address space (cr3) keys the table.
+    let cr3 = unsafe { (*(thread as *const ps::Ethread)).tcb.cr3 };
+    if cr3 != 0 {
+        crate::ob::handle::ob_free_table(cr3);
+        crate::ldr::loaded::free_shim_data(cr3);
     }
 }
 

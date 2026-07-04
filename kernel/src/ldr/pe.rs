@@ -394,12 +394,14 @@ struct SetupBlocks {
     tls_rva: usize,
 }
 
-/// Open a fresh handle to `\Device\Console` in the (system-wide) handle table,
-/// for the process's standard input/output/error. 0 if the device is absent.
-fn open_console_handle() -> u64 {
+/// Open a fresh handle to `\Device\Console` in the **new process's** handle
+/// table (keyed by its `cr3`), for its standard input/output/error. This runs in
+/// the spawning thread's context, so it must target `cr3` explicitly rather than
+/// the caller's table. 0 if the device is absent.
+fn open_console_handle(cr3: u64) -> u64 {
     let name = crate::io::AbiUnicodeString::from_units(crate::w!("\\Device\\Console"));
     match crate::io::namespace::lookup_device(&name) {
-        Ok(dev) => crate::ob::handle::ob_create_handle(dev as *mut u8, 0),
+        Ok(dev) => crate::ob::handle::ob_create_handle_in(cr3, dev as *mut u8, 0),
         Err(_) => 0,
     }
 }
@@ -429,7 +431,8 @@ fn setup_user_blocks(s: SetupBlocks) -> Result<(crate::mm::PhysAddr, [u64; 3]), 
     // when tearing down `dir > file`, sort closes stdin after reading - does not
     // invalidate the others. A single shared handle made cmd's stdout-close kill
     // its stdin, so the shell hit EOF and exited after every redirect.
-    let std_console = [open_console_handle(), open_console_handle(), open_console_handle()];
+    let std_console =
+        [open_console_handle(s.cr3.0), open_console_handle(s.cr3.0), open_console_handle(s.cr3.0)];
     let console = std_console[0];
     let (pid, tid) = next_client_id();
 
@@ -741,6 +744,44 @@ fn map_and_relocate(data: &[u8]) -> Result<Mapped, NtStatus> {
 /// STATUS_INVALID_IMAGE_FORMAT — the catch-all for a malformed image.
 fn bad() -> NtStatus {
     NtStatus(0xC000_0193)
+}
+
+/// Fill `out` with the `(rva, virtual_size)` of each **writable** section of a
+/// PE image (`.data`/`.bss`/`.didat`), returning how many were written. The
+/// loader uses these to snapshot and privatize a shim DLL's mutable data (the
+/// C-runtime's fd table, init flags, cached standard handles): the shim is
+/// shared code in the high half, but that state must be per-process.
+pub fn writable_sections(data: &[u8], out: &mut [(u32, u32)]) -> usize {
+    const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
+    let mut parse = || -> Option<usize> {
+        if u16le(data, 0)? != IMAGE_DOS_SIGNATURE {
+            return None;
+        }
+        let e = u32le(data, 0x3C)? as usize;
+        if u32le(data, e)? != IMAGE_NT_SIGNATURE {
+            return None;
+        }
+        let coff = e + 4;
+        let num_sections = u16le(data, coff + 2)? as usize;
+        let opt_size = u16le(data, coff + 16)? as usize;
+        let sec_table = coff + 20 + opt_size;
+        let mut n = 0;
+        for s in 0..num_sections {
+            if n >= out.len() {
+                break;
+            }
+            let sh = sec_table + s * 40;
+            let vsize = u32le(data, sh + 8)?;
+            let vaddr = u32le(data, sh + 12)?;
+            let chars = u32le(data, sh + 36)?;
+            if chars & IMAGE_SCN_MEM_WRITE != 0 && vsize > 0 {
+                out[n] = (vaddr, vsize);
+                n += 1;
+            }
+        }
+        Some(n)
+    };
+    parse().unwrap_or(0)
 }
 
 /// Walk the `.reloc` directory and apply DIR64 fixups in place.

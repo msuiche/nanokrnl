@@ -10,6 +10,7 @@
 //! more DLLs appear.
 
 use super::{ntdll, pe};
+use crate::ke::spinlock::SpinLock;
 use crate::rtl::NtStatus;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -45,6 +46,7 @@ pub fn load_kernel32(image: &[u8]) -> Result<(), NtStatus> {
     let loaded = pe::load_user(image)?;
     KERNEL32_BASE.store(loaded.base as u64, Ordering::Release);
     KERNEL32_SIZE.store(loaded.size, Ordering::Release);
+    register_shim_data(image, loaded.base as u64);
     crate::kd_println!(
         "LDR: loaded kernel32.dll @ {:p} ({} bytes)",
         loaded.base,
@@ -61,6 +63,7 @@ pub fn load_msvcrt(image: &[u8]) -> Result<(), NtStatus> {
     let loaded = pe::load_user(image)?;
     MSVCRT_BASE.store(loaded.base as u64, Ordering::Release);
     MSVCRT_SIZE.store(loaded.size, Ordering::Release);
+    register_shim_data(image, loaded.base as u64);
     crate::kd_println!(
         "LDR: loaded msvcrt.dll @ {:p} ({} bytes)",
         loaded.base,
@@ -118,6 +121,191 @@ pub fn reset_ulib_data() {
     crate::mm::virt::user_access_begin();
     unsafe {
         core::ptr::copy_nonoverlapping((&raw const ULIB_SNAPSHOT) as *const u8, base as *mut u8, len);
+    }
+    crate::mm::virt::user_access_end();
+}
+
+// ---------------------------------------------------------------------------
+// Per-process shim data (emulated copy-on-write DLL .data)
+// ---------------------------------------------------------------------------
+//
+// The shim DLLs (`kernel32`, `msvcrt`) are shared code in the high half, so a
+// single physical copy of their writable `.data` is visible to every process.
+// But that data holds *per-process* C-runtime state - most importantly msvcrt's
+// fd table and cached standard handles. With one shared copy, a concurrent
+// child's CRT init clobbers the parent's fd table mid-pipe-setup, so the parent
+// hands the wrong handle to the next stage (`dir | sort` feeds `sort` the
+// console instead of the pipe). Real Windows gives each process a private,
+// copy-on-write copy of a DLL's data; we emulate that by keeping a per-process
+// buffer of these regions and swapping it in/out of the shared pages on every
+// context switch between address spaces. The regions are small (a few KB), so
+// the per-switch copy is cheap, and `SHIM_ACTIVE` skips it entirely until at
+// least one isolated process exists (so boot and the self-tests pay nothing).
+
+/// A writable region of a shim, captured post-load. `snap_off` is its offset
+/// into the flat pristine snapshot / per-process buffers.
+#[derive(Clone, Copy)]
+struct ShimRegion {
+    va: u64,
+    len: usize,
+    snap_off: usize,
+}
+
+const MAX_SHIM_REGIONS: usize = 8;
+/// Total writable bytes we track across the shims (msvcrt+kernel32 `.data`).
+const SHIM_DATA_MAX: usize = 24 * 1024;
+
+struct ShimData {
+    regions: [ShimRegion; MAX_SHIM_REGIONS],
+    n: usize,
+    total: usize,
+    /// Pristine post-load bytes of every region, concatenated by `snap_off`.
+    snapshot: [u8; SHIM_DATA_MAX],
+}
+
+static SHIM_DATA: SpinLock<ShimData> = SpinLock::new(ShimData {
+    regions: [ShimRegion { va: 0, len: 0, snap_off: 0 }; MAX_SHIM_REGIONS],
+    n: 0,
+    total: 0,
+    snapshot: [0u8; SHIM_DATA_MAX],
+});
+
+const MAX_SHIM_SLOTS: usize = 16;
+struct ShimSlot {
+    cr3: u64,
+    in_use: bool,
+    data: [u8; SHIM_DATA_MAX],
+}
+static SHIM_SLOTS: SpinLock<[ShimSlot; MAX_SHIM_SLOTS]> = SpinLock::new(
+    [const { ShimSlot { cr3: 0, in_use: false, data: [0u8; SHIM_DATA_MAX] } }; MAX_SHIM_SLOTS],
+);
+/// Number of live per-process buffers. When 0, the context-switch swap is a
+/// pure no-op (the common case during boot and self-tests).
+static SHIM_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// Record a shim's writable sections and snapshot their pristine (post-load,
+/// pre-run) bytes, so each process can start its private copy from them. Call
+/// once per shim, right after it is loaded and before any process runs it.
+pub fn register_shim_data(image: &[u8], base: u64) {
+    let mut secs = [(0u32, 0u32); MAX_SHIM_REGIONS];
+    let n = pe::writable_sections(image, &mut secs);
+    let mut sd = SHIM_DATA.lock();
+    // The shim image is mapped user-accessible; a supervisor read traps under
+    // SMAP, so bracket the snapshot copy.
+    crate::mm::virt::user_access_begin();
+    for &(rva, vsize) in secs.iter().take(n) {
+        let len = vsize as usize;
+        if sd.n >= MAX_SHIM_REGIONS || sd.total + len > SHIM_DATA_MAX {
+            break;
+        }
+        let off = sd.total;
+        let va = base + rva as u64;
+        unsafe {
+            core::ptr::copy_nonoverlapping(va as *const u8, sd.snapshot[off..].as_mut_ptr(), len);
+        }
+        let i = sd.n;
+        sd.regions[i] = ShimRegion { va, len, snap_off: off };
+        sd.n += 1;
+        sd.total += len;
+    }
+    crate::mm::virt::user_access_end();
+}
+
+/// Give address space `cr3` a private copy of the shim data, initialized to the
+/// pristine snapshot. Idempotent per `cr3`. No-op for the kernel (`cr3 == 0`)
+/// or before any shim registered.
+pub fn alloc_shim_data(cr3: u64) {
+    if cr3 == 0 {
+        return;
+    }
+    let sd = SHIM_DATA.lock();
+    if sd.n == 0 {
+        return;
+    }
+    let total = sd.total;
+    let mut sl = SHIM_SLOTS.lock();
+    let idx = sl
+        .iter()
+        .position(|s| s.in_use && s.cr3 == cr3)
+        .or_else(|| sl.iter().position(|s| !s.in_use));
+    if let Some(i) = idx {
+        let was_free = !sl[i].in_use;
+        sl[i].cr3 = cr3;
+        sl[i].in_use = true;
+        sl[i].data[..total].copy_from_slice(&sd.snapshot[..total]);
+        if was_free {
+            SHIM_ACTIVE.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// Release address space `cr3`'s shim-data buffer on process exit.
+pub fn free_shim_data(cr3: u64) {
+    if cr3 == 0 {
+        return;
+    }
+    let mut sl = SHIM_SLOTS.lock();
+    for s in sl.iter_mut() {
+        if s.in_use && s.cr3 == cr3 {
+            s.in_use = false;
+            s.cr3 = 0;
+            SHIM_ACTIVE.fetch_sub(1, Ordering::AcqRel);
+            break;
+        }
+    }
+}
+
+/// On a context switch between address spaces, save the running (shared) shim
+/// data into the outgoing process's buffer and restore the incoming process's.
+/// A process without a buffer (the kernel, self-test workers) simply shares the
+/// pages, exactly as before. Called from the scheduler at DISPATCH_LEVEL.
+pub fn swap_shim_data(out_cr3: u64, in_cr3: u64) {
+    if out_cr3 == in_cr3 || SHIM_ACTIVE.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let sd = SHIM_DATA.lock();
+    if sd.n == 0 {
+        return;
+    }
+    let mut sl = SHIM_SLOTS.lock_at_dpc_level();
+    let out_idx = if out_cr3 != 0 {
+        sl.iter().position(|s| s.in_use && s.cr3 == out_cr3)
+    } else {
+        None
+    };
+    let in_idx = if in_cr3 != 0 {
+        sl.iter().position(|s| s.in_use && s.cr3 == in_cr3)
+    } else {
+        None
+    };
+    if out_idx.is_none() && in_idx.is_none() {
+        return;
+    }
+    // The shim pages are user-accessible; bracket the supervisor copies.
+    crate::mm::virt::user_access_begin();
+    if let Some(oi) = out_idx {
+        for k in 0..sd.n {
+            let r = sd.regions[k];
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    r.va as *const u8,
+                    sl[oi].data[r.snap_off..].as_mut_ptr(),
+                    r.len,
+                );
+            }
+        }
+    }
+    if let Some(ii) = in_idx {
+        for k in 0..sd.n {
+            let r = sd.regions[k];
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    sl[ii].data[r.snap_off..].as_ptr(),
+                    r.va as *mut u8,
+                    r.len,
+                );
+            }
+        }
     }
     crate::mm::virt::user_access_end();
 }

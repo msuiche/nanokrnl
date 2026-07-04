@@ -234,7 +234,9 @@ extern "C" fn nt_get_std_handle(which: u64, _a2: u64, _a3: u64, _a4: u64) -> u64
 extern "C" fn nt_set_startup_handles(h_in: u64, h_out: u64, h_err: u64, _a4: u64) -> u64 {
     let t = crate::ke::pcr::ke_get_current_thread();
     if !t.is_null() {
-        unsafe { (*t).child_std_handles = [h_in, h_out, h_err] };
+        unsafe {
+            (*t).child_std_handles = [h_in, h_out, h_err];
+        }
     }
     0
 }
@@ -481,7 +483,10 @@ extern "C" fn nt_create_process(path_ptr: u64, path_len: u64, cmd_ptr: u64, cmd_
     }
     let cmdline: &[u8] = if cn > 0 { &cbuf[..cn] } else { &abuf[..n] };
     // Consume any standard handles the parent staged for this child (pipe/file
-    // redirection via STARTUPINFO), then clear the staging slot.
+    // redirection via STARTUPINFO), then clear the staging slot. These are the
+    // private staging duplicates made in nt_set_startup_handles; they are still
+    // valid here (the parent cannot close them), so create_user_process can
+    // duplicate them into the child. We release them afterwards.
     let std = {
         let t = crate::ke::pcr::ke_get_current_thread();
         if t.is_null() {

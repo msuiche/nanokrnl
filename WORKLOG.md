@@ -58,6 +58,60 @@ f1038d9 (whoami), 4657bab (per-process command line), 7cc5960 + 47047aa (more.co
 
 ## Log
 
+### 2026-07-04
+- **Per-process handle tables (the rework the pipe work was waiting on).** The
+  object manager's handle table is no longer a single global array; it is keyed
+  by address space (`cr3`), matching NT's `EPROCESS.ObjectTable`. Kernel threads
+  (`cr3 == 0`) share a kernel table. Handle values are now per-process (two
+  processes can each hold handle `0x10` naming different objects).
+  - New `ob_create_handle_in(cr3, ...)` seeds a child's handles in the child's
+    own table; `ob_free_table(cr3)` tears a process's table down on exit
+    (dropping every reference), wired into `on_user_thread_exit`.
+  - `create_user_process` now implements `bInheritHandles` semantics: each staged
+    standard handle is resolved in the parent's table and a *copy* is created in
+    the child's table, so the parent closing its own copy leaves the child's
+    alive.
+  - `nt_set_startup_handles` no longer stores raw handle values (which the shell
+    closes before `CreateProcess` runs, in the `_dup2`/`_close` dance): it now
+    **duplicates** each handle at stage time into a private staging handle that
+    holds its own object reference; `CreateProcess` duplicates from that into the
+    child and releases it. This fixed the timing bug where a child inherited a
+    handle the parent had already closed.
+  - Verified: 67/67 boot self-tests pass, `dir > out.txt` + `type`/`more`
+    redirection still works, cmd survives every plain command (no early exit).
+  - Effect on pipes: every inherited handle now resolves to the correct object,
+    and the producer side is fully correct - `dir`'s stdout resolves to the real
+    pipe object and it writes the whole listing into the pipe. `dir | sort` does
+    not crash or hang; cmd survives it and continues.
+
+- **Per-process shim `.data` (emulated copy-on-write DLL data).** The shim DLLs
+  (`kernel32`/`msvcrt`) live once in the shared high half, so their writable
+  `.data` (the C-runtime's fd table, cached standard handles) was a single copy
+  shared across every process. Each process now gets a private buffer of those
+  regions, snapshotted pristine at load and swapped in/out of the shared pages on
+  every context switch between address spaces (`ldr::loaded`: `register_shim_data`
+  / `alloc_shim_data` / `free_shim_data` / `swap_shim_data`, hooked into the
+  scheduler; the regions total ~13 KB so the per-switch copy is cheap, and a live
+  count skips it entirely until an isolated process exists). This is the
+  per-process DLL data the earlier log flagged as needed; it fixes genuine
+  cross-process CRT-state corruption. Verified: 67/67 self-tests, redirect, no
+  regression.
+
+- **Pipe (`dir | sort`) - remaining blocker, now precisely diagnosed (and it is
+  NOT shared `.data`).** Traced the full handle/fd choreography. cmd drives pipes
+  through the msvcrt CRT fd layer (`_pipe`/`_dup2`/`_close`), and the failure is
+  a Win32-handle-vs-CRT-fd aliasing issue *inside cmd's own logic*: after
+  spawning the writer, cmd calls `DuplicateHandle(pipeRead, lpTargetHandle=NULL,
+  DUPLICATE_CLOSE_SOURCE)` - the Win32 idiom for "close this handle" - closing the
+  pipe-read *OS handle*, while the msvcrt fd still names it. cmd then does
+  `_dup2(readFd, 0)` to wire sort's stdin, which fails (`dup_handle` on the
+  closed handle) - cmd even prints its real error, "The handle could not be
+  duplicated during a pipe operation." So the producer writes the listing into
+  the pipe, but the consumer never gets the read end. Making this work needs the
+  msvcrt fd layer and Win32 handle layer to agree on ownership exactly as Windows
+  does (an fd's handle must not be a bare closeable alias), which is real CRT/Win32
+  fidelity work, not a handle-table or DLL-data problem.
+
 ### 2026-06-16
 - Reverted the bespoke WASM port (kernel-in-wasm module + x86 interpreter) after
   it became clear that running the real binaries through our own interpreter is
