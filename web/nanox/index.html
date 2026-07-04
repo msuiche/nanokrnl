@@ -932,14 +932,9 @@ function drainUart() {
     if (!bsod && term.includes("*** STOP:")) {
       bsod = true;
       const name = (term.match(/\*\*\* ([A-Z0-9_]+)\s*$/m) || [])[1];
-      // Clear the Command Prompt scrollback so the blue screen shows the crash
-      // dump collection (progress lines) and the bugcheck banner, like a real
-      // BSOD "collecting data for crash dump" screen. Prefer the "Collecting"
-      // line as the start; fall back to the STOP banner.
-      let i = term.indexOf("*** Collecting crash dump");
-      if (i < 0) i = term.indexOf("*** STOP:");
-      if (i >= 0) term = term.slice(i);
-      col = 0;
+      // Recolor only: the console text (dump-collection progress + the bugcheck
+      // banner) is the kernel's own serial output; we don't rewrite it. The
+      // window turns blue and auto-scrolls to the crash at the bottom.
       screen.classList.add("bsod");                          // the console window goes blue
       render();
       // nanokrnl writes the core to H:\ itself (over 9P); the button appears
