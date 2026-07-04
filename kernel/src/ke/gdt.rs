@@ -91,6 +91,14 @@ static mut IST3_STACK: IstStack = IstStack([0; IST_STACK_SIZE]);
 /// descriptor occupying two slots (indices 8 and 9). Index = selector >> 3.
 static mut BOOT_GDT: [u64; 10] = [0; 10];
 
+/// Base and limit of the loaded GDT — what `sgdt` would return. The crash dump
+/// records this in `KPROCESSOR_STATE.SpecialRegisters.Gdtr` so a debugger can
+/// resolve the CS/SS/DS descriptors; nanox does not implement `sgdt`, so we
+/// report the table we handed to `lgdt` directly.
+pub fn gdtr() -> (u64, u16) {
+    (&raw const BOOT_GDT as u64, (size_of::<[u64; 10]>() - 1) as u16)
+}
+
 /// Pseudo-descriptor operand for `lgdt`.
 #[repr(C, packed)]
 struct DescriptorTablePointer {

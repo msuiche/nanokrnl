@@ -128,6 +128,76 @@ impl Eprocess {
     }
 }
 
+/// Size of an amd64 `CONTEXT` record (what the debugger reads for register state).
+pub const CONTEXT_SIZE: usize = 0x4d0;
+
+/// `_KDESCRIPTOR` — GDTR/IDTR as stored in `KSPECIAL_REGISTERS`: six pad bytes,
+/// then the 16-bit limit and 64-bit base.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Kdescriptor {
+    pad: [u16; 3],
+    limit: u16,
+    base: u64,
+}
+impl Kdescriptor {
+    const fn zero() -> Self {
+        Kdescriptor { pad: [0; 3], limit: 0, base: 0 }
+    }
+}
+
+/// `_KSPECIAL_REGISTERS` (amd64) — the control/descriptor registers WinDbg needs
+/// to establish machine context (`GetContextState`) and resolve the CS
+/// descriptor (via `Gdtr`). Laid out at its genuine NT offsets; fields the engine
+/// does not read for a dump are left zero.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct KspecialRegisters {
+    cr0: u64,             // 0x00
+    cr2: u64,             // 0x08
+    cr3: u64,             // 0x10
+    cr4: u64,             // 0x18
+    kernel_dr: [u64; 6],  // 0x20  Dr0,Dr1,Dr2,Dr3,Dr6,Dr7
+    gdtr: Kdescriptor,    // 0x50
+    idtr: Kdescriptor,    // 0x60
+    tr: u16,              // 0x70
+    ldtr: u16,            // 0x72
+    mxcsr: u32,           // 0x74
+    debug_control: u64,   // 0x78
+    last_branch_to: u64,  // 0x80
+    last_branch_from: u64, // 0x88
+    last_exception_to: u64, // 0x90
+    last_exception_from: u64, // 0x98
+    cr8: u64,             // 0xa0
+    msr: [u64; 6],        // 0xa8  GsBase,GsSwap,Star,LStar,CStar,SyscallMask (ends 0xd8)
+}
+impl KspecialRegisters {
+    const fn zero() -> Self {
+        KspecialRegisters {
+            cr0: 0, cr2: 0, cr3: 0, cr4: 0,
+            kernel_dr: [0; 6],
+            gdtr: Kdescriptor::zero(),
+            idtr: Kdescriptor::zero(),
+            tr: 0, ldtr: 0, mxcsr: 0,
+            debug_control: 0, last_branch_to: 0, last_branch_from: 0,
+            last_exception_to: 0, last_exception_from: 0,
+            cr8: 0,
+            msr: [0; 6],
+        }
+    }
+}
+
+/// A minimal synthetic `KPRCB`: just the `ProcessorState` (`KPROCESSOR_STATE` =
+/// `SpecialRegisters` + `ContextFrame`). WinDbg locates each half through the
+/// `OffsetPrcbProcState*` fields we publish in [`KddebuggerData64`], so this can
+/// be compact instead of a full PRCB. `context` is a byte array (align 1) so it
+/// sits immediately after `special` at offset `size_of::<KspecialRegisters>()`.
+#[repr(C)]
+struct Kprcb {
+    special: KspecialRegisters,
+    context: [u8; CONTEXT_SIZE],
+}
+
 /// `_DBGKD_DEBUG_DATA_HEADER64` — the head of [`KddebuggerData64`].
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -200,6 +270,15 @@ const MAX_PROCS: usize = 16;
 static mut KdModuleEntries: [KldrEntry; MAX_MODULES] = [KldrEntry::zero(); MAX_MODULES];
 #[no_mangle]
 static mut KdProcessEntries: [Eprocess; MAX_PROCS] = [Eprocess::zero(); MAX_PROCS];
+
+/// Synthetic processor 0 state (`KPROCESSOR_STATE`) the debugger reads for
+/// register/CS-descriptor context, plus the one-entry `KiProcessorBlock` array
+/// that points at it. Filled on the crash path by [`set_processor_state`].
+#[no_mangle]
+static mut KdPrcb0: Kprcb =
+    Kprcb { special: KspecialRegisters::zero(), context: [0; CONTEXT_SIZE] };
+#[no_mangle]
+static mut KiProcessorBlock: [u64; 1] = [0];
 
 static KD_LOCK: SpinLock<()> = SpinLock::new(());
 static mut N_MODULES: usize = 0;
@@ -344,5 +423,72 @@ pub fn commit() {
         d.kern_base = KERN_BASE;
         d.ps_loaded_module_list = head;
         d.ps_active_process_head = phead;
+    }
+}
+
+/// Write a value into the zero-initialized `_rest` tail of `KdDebuggerDataBlock`
+/// at its absolute field offset (the tail begins at 0x58).
+fn put_rest_u64(d: &mut KddebuggerData64, abs_off: usize, v: u64) {
+    d._rest[abs_off - 0x58..abs_off - 0x58 + 8].copy_from_slice(&v.to_le_bytes());
+}
+fn put_rest_u16(d: &mut KddebuggerData64, abs_off: usize, v: u16) {
+    d._rest[abs_off - 0x58..abs_off - 0x58 + 2].copy_from_slice(&v.to_le_bytes());
+}
+
+/// Publish processor 0's `KPROCESSOR_STATE` so a Windows debugger can establish
+/// machine context (`GetContextState`) and resolve the CS descriptor. Fills the
+/// synthetic PRCB with the captured special registers + `CONTEXT`, points
+/// `KiProcessorBlock[0]` at it, and writes the `KdDebuggerDataBlock` tail fields
+/// the engine uses to find the state (`KiProcessorBlock` @0x218, `SizePrcb`
+/// @0x2b0, `OffsetPrcbProcStateContext` @0x2bc, `OffsetPrcbProcStateSpecialReg`
+/// @0x2ec). Call on the crash path after [`commit`] and before the memory
+/// snapshot, so the wired block and PRCB land in the dump. `context` is a full
+/// amd64 `CONTEXT` (the same bytes written to the dump header).
+#[allow(clippy::too_many_arguments)]
+pub fn set_processor_state(
+    cr0: u64,
+    cr2: u64,
+    cr3: u64,
+    cr4: u64,
+    cr8: u64,
+    gdt_base: u64,
+    gdt_limit: u16,
+    idt_base: u64,
+    idt_limit: u16,
+    tr: u16,
+    ldtr: u16,
+    context: &[u8; CONTEXT_SIZE],
+) {
+    let _g = KD_LOCK.lock();
+    unsafe {
+        let prcb = &mut *(&raw mut KdPrcb0);
+        prcb.special = KspecialRegisters {
+            cr0,
+            cr2,
+            cr3,
+            cr4,
+            kernel_dr: [0; 6],
+            gdtr: Kdescriptor { pad: [0; 3], limit: gdt_limit, base: gdt_base },
+            idtr: Kdescriptor { pad: [0; 3], limit: idt_limit, base: idt_base },
+            tr,
+            ldtr,
+            mxcsr: 0x1f80,
+            debug_control: 0,
+            last_branch_to: 0,
+            last_branch_from: 0,
+            last_exception_to: 0,
+            last_exception_from: 0,
+            cr8,
+            msr: [0; 6],
+        };
+        prcb.context.copy_from_slice(context);
+
+        (*(&raw mut KiProcessorBlock))[0] = addr(&raw const KdPrcb0);
+
+        let d = &mut *(&raw mut KdDebuggerDataBlock);
+        put_rest_u64(d, 0x218, addr(&raw const KiProcessorBlock)); // KiProcessorBlock
+        put_rest_u16(d, 0x2b0, core::mem::size_of::<Kprcb>() as u16); // SizePrcb
+        put_rest_u16(d, 0x2bc, core::mem::size_of::<KspecialRegisters>() as u16); // OffsetPrcbProcStateContext
+        put_rest_u16(d, 0x2ec, 0); // OffsetPrcbProcStateSpecialReg (SpecialRegisters is first)
     }
 }

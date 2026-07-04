@@ -56,6 +56,21 @@ pub struct Gpr {
     r15: u64,
     rip: u64,
     rflags: u64,
+    // Special registers for the KPROCESSOR_STATE a Windows debugger reads
+    // (control regs + the GDTR/IDTR that resolve the CS descriptor).
+    cr0: u64,
+    cr2: u64,
+    cr3: u64,
+    cr4: u64,
+    cr8: u64,
+    gdt_base: u64,
+    gdt_limit: u16,
+    idt_base: u64,
+    idt_limit: u16,
+    tr: u16,
+    ldtr: u16,
+    cs: u16,
+    ss: u16,
 }
 
 /// Read CR3.
@@ -140,7 +155,29 @@ pub fn capture() -> Gpr {
             r12 = out(reg) g.r12, r13 = out(reg) g.r13, r14 = out(reg) g.r14, r15 = out(reg) g.r15,
             rip = out(reg) g.rip, rfl = out(reg) g.rflags,
         );
+        // Control registers. nanox implements CR0/CR2/CR4/CR8; it does NOT
+        // implement sgdt/sidt/str/sldt or reading CS/SS, so those are taken from
+        // the kernel's own loaded tables/selectors below (which is exact anyway).
+        asm!("mov {}, cr0", out(reg) g.cr0, options(nomem, nostack, preserves_flags));
+        asm!("mov {}, cr2", out(reg) g.cr2, options(nomem, nostack, preserves_flags));
+        asm!("mov {}, cr4", out(reg) g.cr4, options(nomem, nostack, preserves_flags));
+        asm!("mov {}, cr8", out(reg) g.cr8, options(nomem, nostack, preserves_flags));
     }
+    g.cr3 = cr3();
+    // GDTR/IDTR: report the tables the kernel handed to lgdt/lidt (their bases are
+    // higher-half VAs the debugger translates via CR3 and reads the descriptors).
+    let (gb, gl) = crate::ke::gdt::gdtr();
+    let (ib, il) = crate::ke::idt::idtr();
+    g.gdt_base = gb;
+    g.gdt_limit = gl;
+    g.idt_base = ib;
+    g.idt_limit = il;
+    // Selectors the kernel runs with: the dumped GDT has valid long-mode
+    // descriptors at these indices, so the debugger resolves CS/SS/DS.
+    g.cs = crate::ke::selectors::KGDT64_R0_CODE;
+    g.ss = crate::ke::selectors::KGDT64_R0_DATA;
+    g.tr = crate::ke::selectors::KGDT64_SYS_TSS;
+    g.ldtr = 0;
     g
 }
 
@@ -464,13 +501,14 @@ pub fn write_memory_dmp(bugcheck: u32, params: &[u64; 4], g: &Gpr) -> Option<u64
     const CONTEXT_SEGMENTS: u32 = 0x4;
     put32(&mut h, c + 0x30, CONTEXT_AMD64 | CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS);
     put32(&mut h, c + 0x34, 0x1f80); // MxCsr (default; also mirrored in FltSave)
-    // Segment selectors: kernel code/data (same as the ELF NT_PRSTATUS view).
-    put16(&mut h, c + 0x38, 0x10); // SegCs
-    put16(&mut h, c + 0x3a, 0x18); // SegDs
-    put16(&mut h, c + 0x3c, 0x18); // SegEs
-    put16(&mut h, c + 0x3e, 0x18); // SegFs
-    put16(&mut h, c + 0x40, 0x18); // SegGs
-    put16(&mut h, c + 0x42, 0x18); // SegSs
+    // Segment selectors captured at the crash: SegCs must index a valid GDT
+    // descriptor (the debugger walks GDTR to resolve it), so use the live CS/SS.
+    put16(&mut h, c + 0x38, g.cs); // SegCs
+    put16(&mut h, c + 0x3a, g.ss); // SegDs
+    put16(&mut h, c + 0x3c, g.ss); // SegEs
+    put16(&mut h, c + 0x3e, g.ss); // SegFs
+    put16(&mut h, c + 0x40, g.ss); // SegGs
+    put16(&mut h, c + 0x42, g.ss); // SegSs
     put32(&mut h, c + 0x44, g.rflags as u32); // EFlags
     put64(&mut h, c + 0x90, g.rbx); // Rbx
     put64(&mut h, c + 0x98, g.rsp); // Rsp
@@ -481,6 +519,17 @@ pub fn write_memory_dmp(bugcheck: u32, params: &[u64; 4], g: &Gpr) -> Option<u64
     put64(&mut h, c + 0xf0, g.r15); // R15
     put64(&mut h, c + 0xf8, g.rip); // Rip
     put32(&mut h, c + 0x100 + 0x18, 0x1f80); // FltSave.MxCsr (kept consistent)
+
+    // Publish processor 0's KPROCESSOR_STATE (special registers + this CONTEXT)
+    // so the debugger can GetContextState and resolve the CS descriptor via the
+    // captured GDTR. Wires KiProcessorBlock in KdDebuggerDataBlock; must run
+    // before the memory snapshot below so the PRCB and wiring land in the dump.
+    let mut ctx = [0u8; crate::kd::CONTEXT_SIZE];
+    ctx.copy_from_slice(&h[c..c + crate::kd::CONTEXT_SIZE]);
+    crate::kd::set_processor_state(
+        g.cr0, g.cr2, g.cr3, g.cr4, g.cr8, g.gdt_base, g.gdt_limit, g.idt_base, g.idt_limit,
+        g.tr, g.ldtr, &ctx,
+    );
 
     // --- tail fields ---------------------------------------------------
     put32(&mut h, 0xf98, 1); // DumpType = DUMP_TYPE_FULL

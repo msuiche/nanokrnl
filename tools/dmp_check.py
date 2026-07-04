@@ -151,6 +151,38 @@ def main():
     print(f"  PsLoadedModuleList  = {ps_mod:#x}  (header says {c.ps_mod:#x})")
     print(f"  PsActiveProcessHead = {ps_proc:#x}  (header says {c.ps_proc:#x})")
 
+    # KPROCESSOR_STATE: what WinDbg reads for GetContextState / CS-descriptor.
+    # KiProcessorBlock @ kdbg+0x218 -> [PKPRCB]; the ProcStateSpecialReg/Context
+    # offsets tell it where SpecialRegisters (GDTR/CRs) and the CONTEXT sit.
+    print("\n=== KPROCESSOR_STATE (KiProcessorBlock -> KPRCB) ===")
+    ki = c.u64(c.kdbg + 0x218)
+    size_prcb = c.u16(c.kdbg + 0x2b0)
+    off_ctx = c.u16(c.kdbg + 0x2bc)
+    off_sr = c.u16(c.kdbg + 0x2ec)
+    print(f"  KiProcessorBlock={ki:#x} SizePrcb={size_prcb:#x} OffCtx={off_ctx:#x} OffSpecialReg={off_sr:#x}")
+    if ki:
+        prcb = c.u64(ki)
+        sr = prcb + off_sr
+        cr0, cr3sr, cr4 = c.u64(sr + 0x00), c.u64(sr + 0x10), c.u64(sr + 0x18)
+        gdt_limit, gdt_base = c.u16(sr + 0x56), c.u64(sr + 0x58)
+        idt_base = c.u64(sr + 0x68)
+        print(f"  PRCB={prcb:#x}  Cr0={cr0:#x} Cr3={cr3sr:#x} Cr4={cr4:#x}  (header CR3={c.dtb:#x})")
+        print(f"  Gdtr base={gdt_base:#x} limit={gdt_limit:#x}  Idtr base={idt_base:#x}")
+        ctx = prcb + off_ctx
+        segcs, rip = c.u16(ctx + 0x38), c.u64(ctx + 0xf8)
+        print(f"  ContextFrame: Cs={segcs:#x} Rip={rip:#x}")
+        try:
+            idx = segcs >> 3
+            d0 = c.u64(gdt_base + idx * 8)
+            present, longm, dpl = (d0 >> 47) & 1, (d0 >> 53) & 1, (d0 >> 45) & 3
+            print(f"  GDT[{idx}] (Cs={segcs:#x}) = {d0:#018x}  present={present} L={longm} dpl={dpl}")
+            print(f"  CS descriptor: {'OK' if present and longm else 'CHECK'} "
+                  f"(WinDbg resolves Cs via Gdtr; {'resolvable' if present else 'not present'})")
+        except KeyError as e:
+            print(f"  GDT NOT readable at Gdtr.Base: {e}")
+    else:
+        print("  KiProcessorBlock is 0 - GetContextState will fail")
+
     print("\n=== lm  (loaded modules) ===")
     print(f"{'start':<18} {'end':<18} {'module'}")
     head = ps_mod

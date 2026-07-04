@@ -57,6 +57,13 @@ impl IdtGate {
 /// interrupts disabled), read by hardware afterwards.
 static mut BOOT_IDT: [IdtGate; 256] = [IdtGate::empty(); 256];
 
+/// Base and limit of the loaded IDT — what `sidt` would return. Recorded in the
+/// crash dump's `KPROCESSOR_STATE.SpecialRegisters.Idtr` (nanox does not
+/// implement `sidt`, so we report the table we handed to `lidt` directly).
+pub fn idtr() -> (u64, u16) {
+    (&raw const BOOT_IDT as u64, (size_of::<[IdtGate; 256]>() - 1) as u16)
+}
+
 #[repr(C, packed)]
 struct Idtr {
     limit: u16,
