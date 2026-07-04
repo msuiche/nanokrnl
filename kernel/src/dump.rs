@@ -293,3 +293,106 @@ pub fn write_core(bugcheck: u32, params: &[u64; 4]) -> Option<u64> {
     w.close();
     Some(total)
 }
+
+/// Size of a 64-bit Windows crash-dump header (`_DUMP_HEADER64`).
+const DMP_HEADER: usize = 0x2000;
+
+/// Write a **Windows kernel crash dump** to `H:\MEMORY.DMP` over 9P, so a real
+/// Windows debugger opens it as a kernel target (`lm`, `!process 0 0`).
+///
+/// Unlike the ELF core (a Linux target), this is the native `DUMP_HEADER64`
+/// format: an 8 KiB header naming the address space (`DirectoryTableBase`), the
+/// `KdDebuggerDataBlock`, the `PsLoadedModuleList`/`PsActiveProcessHead` heads,
+/// the crash `CONTEXT`, and a `PHYSICAL_MEMORY_DESCRIPTOR`; followed by the raw
+/// physical memory the descriptor's runs name. WinDbg reads `DirectoryTableBase`
+/// (CR3), walks the captured page tables to translate every virtual address, and
+/// finds the NT structures [`crate::kd`] laid out. Returns the byte count, or
+/// `None` if the host 9P server is absent. Safe at bugcheck IRQL.
+pub fn write_memory_dmp(bugcheck: u32, params: &[u64; 4]) -> Option<u64> {
+    // The KDBG structures must be current (write_core also refreshes them; doing
+    // it again is idempotent).
+    crate::init::kd_snapshot();
+    let g = capture();
+
+    let mut h = alloc::vec![0u8; DMP_HEADER];
+    let put32 = |h: &mut [u8], off: usize, v: u32| h[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    let put64 = |h: &mut [u8], off: usize, v: u64| h[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    let put16 = |h: &mut [u8], off: usize, v: u16| h[off..off + 2].copy_from_slice(&v.to_le_bytes());
+
+    // --- DUMP_HEADER64 fixed fields ------------------------------------
+    h[0..4].copy_from_slice(b"PAGE"); // Signature
+    h[4..8].copy_from_slice(b"DU64"); // ValidDump (64-bit)
+    put32(&mut h, 0x08, 15); // MajorVersion (NT)
+    put32(&mut h, 0x0c, 26100); // MinorVersion (build; drives symbol lookup)
+    put64(&mut h, 0x10, cr3() & ADDR_MASK); // DirectoryTableBase (kernel CR3)
+    put64(&mut h, 0x18, 0); // PfnDataBase (not modeled)
+    put64(&mut h, 0x20, &raw const crate::kd::PsLoadedModuleList as u64);
+    put64(&mut h, 0x28, &raw const crate::kd::PsActiveProcessHead as u64);
+    put32(&mut h, 0x30, 0x8664); // MachineImageType = IMAGE_FILE_MACHINE_AMD64
+    put32(&mut h, 0x34, 1); // NumberProcessors
+    put32(&mut h, 0x38, bugcheck); // BugCheckCode
+    put64(&mut h, 0x40, params[0]);
+    put64(&mut h, 0x48, params[1]);
+    put64(&mut h, 0x50, params[2]);
+    put64(&mut h, 0x58, params[3]);
+    put64(&mut h, 0x80, &raw const crate::kd::KdDebuggerDataBlock as u64);
+
+    // --- PHYSICAL_MEMORY_DESCRIPTOR @ 0x88 -----------------------------
+    // One run covering the captured low window [0, CAP): BasePage/PageCount are
+    // in pages. The debugger translates VAs into these frames via the page
+    // tables (which live in this same window).
+    let pages = CAP / PAGE;
+    put32(&mut h, 0x88, 1); // NumberOfRuns
+    put64(&mut h, 0x90, pages); // NumberOfPages
+    put64(&mut h, 0x98, 0); // Run[0].BasePage
+    put64(&mut h, 0xa0, pages); // Run[0].PageCount
+
+    // --- CONTEXT record @ 0x348 (the KPROCESSOR_STATE.ContextFrame) --------
+    // This is the crash context a Windows debugger reads on a full dump. It must
+    // be a complete, self-consistent AMD64 CONTEXT: the ContextFlags advertise
+    // exactly the groups we fill (control + integer + segments, NOT floating
+    // point - we do not provide an XSAVE area, and claiming it we don't makes
+    // the debugger reject the context). CR3 is not in the CONTEXT; it travels in
+    // DirectoryTableBase above (the SpecialRegisters half of KPROCESSOR_STATE).
+    let c = 0x348usize;
+    const CONTEXT_AMD64: u32 = 0x0010_0000;
+    const CONTEXT_CONTROL: u32 = 0x1;
+    const CONTEXT_INTEGER: u32 = 0x2;
+    const CONTEXT_SEGMENTS: u32 = 0x4;
+    put32(&mut h, c + 0x30, CONTEXT_AMD64 | CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS);
+    put32(&mut h, c + 0x34, 0x1f80); // MxCsr (default; also mirrored in FltSave)
+    // Segment selectors: kernel code/data (same as the ELF NT_PRSTATUS view).
+    put16(&mut h, c + 0x38, 0x10); // SegCs
+    put16(&mut h, c + 0x3a, 0x18); // SegDs
+    put16(&mut h, c + 0x3c, 0x18); // SegEs
+    put16(&mut h, c + 0x3e, 0x18); // SegFs
+    put16(&mut h, c + 0x40, 0x18); // SegGs
+    put16(&mut h, c + 0x42, 0x18); // SegSs
+    put32(&mut h, c + 0x44, g.rflags as u32); // EFlags
+    put64(&mut h, c + 0x90, g.rbx); // Rbx
+    put64(&mut h, c + 0x98, g.rsp); // Rsp
+    put64(&mut h, c + 0xa0, g.rbp); // Rbp
+    put64(&mut h, c + 0xd8, g.r12); // R12
+    put64(&mut h, c + 0xe0, g.r13); // R13
+    put64(&mut h, c + 0xe8, g.r14); // R14
+    put64(&mut h, c + 0xf0, g.r15); // R15
+    put64(&mut h, c + 0xf8, g.rip); // Rip
+    put32(&mut h, c + 0x100 + 0x18, 0x1f80); // FltSave.MxCsr (kept consistent)
+
+    // --- tail fields ---------------------------------------------------
+    put32(&mut h, 0xf98, 1); // DumpType = DUMP_TYPE_FULL
+    put64(&mut h, 0xfa0, DMP_HEADER as u64 + CAP); // RequiredDumpSpace
+
+    // Stream: header, then the physical window [0, CAP) named by the run.
+    let mut w = p9::create("MEMORY.DMP")?;
+    if !w.write(&h) {
+        return None;
+    }
+    let mem = unsafe { core::slice::from_raw_parts(phys_to_virt(PhysAddr(0)), CAP as usize) };
+    if !w.write(mem) {
+        return None;
+    }
+    let total = w.offset();
+    w.close();
+    Some(total)
+}

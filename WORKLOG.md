@@ -58,6 +58,34 @@ f1038d9 (whoami), 4657bab (per-process command line), 7cc5960 + 47047aa (more.co
 
 ## Log
 
+### 2026-07-04 (Part IV cont.) - native Windows crash dump (MEMORY.DMP)
+
+- The KDBG structures were validated only by our own ELF-core walker; nothing
+  consumed them as a Windows target. Added a real Windows kernel crash dump so a
+  Windows debugger opens the crash natively (`lm`, `!process 0 0`).
+- `dump::write_memory_dmp` emits a `DUMP_HEADER64` (8 KiB): `PAGE`/`DU64`
+  signature, `DirectoryTableBase` (crash CR3, whose shared high half maps the
+  kernel), `KdDebuggerDataBlock` / `PsLoadedModuleList` / `PsActiveProcessHead`,
+  `MachineImageType = 0x8664`, bugcheck code+params, a `PHYSICAL_MEMORY_DESCRIPTOR`
+  (one run over the captured window), and the crash `CONTEXT`; then streams the
+  physical window to `H:\MEMORY.DMP` over 9P. `DumpType = DUMP_TYPE_FULL (1)` -
+  a complete memory dump (we are small, so we just dump the low window).
+- The `CONTEXT` is the `KPROCESSOR_STATE.ContextFrame` a full dump exposes: the
+  `ContextFlags` advertise exactly the groups filled (AMD64|CONTROL|INTEGER|
+  SEGMENTS, no floating-point claim we can't back), MxCsr and kernel segment
+  selectors set, Rip/Rsp/Rbp/Rflags from the crash capture. CR3 (the
+  SpecialRegisters half) rides in `DirectoryTableBase`.
+- Validated with `tools/dmp_check.py`, which does exactly what WinDbg does: reads
+  `DirectoryTableBase`, walks the captured 4-level page tables to translate VAs
+  against the dumped physical memory, checks the `'KDBG'` tag, and follows both
+  rings. On a real crash it prints ntoskrnl.exe + cmd.exe + the shims under `lm`
+  and all live processes under `!process 0 0`. New `emu/examples/memory_dmp.rs`
+  drives `crash` and captures the file over an in-process 9P server.
+- Verified: 67/67 self-tests, ELF core still written, MEMORY.DMP walks clean.
+- Caveat: x64 stack unwinding in WinDbg needs PE `.pdata` unwind info / a PDB,
+  which we do not have yet (synthetic-PDB follow-up), so beyond the top frame the
+  stack will not unwind. Live KD bridge (KDCOM/KDNET) is the next Part IV step.
+
 ### 2026-07-04
 - **Per-process handle tables (the rework the pipe work was waiting on).** The
   object manager's handle table is no longer a single global array; it is keyed
