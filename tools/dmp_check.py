@@ -124,6 +124,20 @@ def main():
     if not cf & 0x00100000:
         print("  WARNING: ContextFlags missing CONTEXT_AMD64 bit")
 
+    # Masquerade PE header at the kernel base: what a Windows debugger reads to
+    # find ntoskrnl.pdb (an RSDS whose GUID must match tools/gen_pdb.py).
+    kbase = 0xFFFF_8000_0000_0000
+    head = c.read(kbase, 0x1c0)
+    if head[0:2] == b"MZ":
+        e = struct.unpack_from("<I", head, 0x3c)[0]
+        pe = head[e:e + 4] == b"PE\x00\x00"
+        rsds = c.read(kbase + 0x1a0, 0x25)
+        guid = rsds[4:20].hex() if rsds[0:4] == b"RSDS" else "(no RSDS)"
+        pdbname = rsds[24:].split(b"\x00")[0].decode("latin1") if rsds[0:4] == b"RSDS" else ""
+        print(f"masquerade PE: MZ+PE={pe}  RSDS guid={guid}  pdb='{pdbname}'")
+    else:
+        print(f"masquerade PE: MISSING (base starts with {head[0:4]!r})")
+
     # KDDEBUGGER_DATA64: Header{List(16), OwnerTag(4), Size(4)}, KernBase@0x18,
     # PsLoadedModuleList@0x48, PsActiveProcessHead@0x50.
     owner = c.read(c.kdbg + 16, 4)

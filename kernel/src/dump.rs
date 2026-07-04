@@ -300,6 +300,82 @@ pub fn write_core(bugcheck: u32, params: &[u64; 4], g: &Gpr) -> Option<u64> {
 /// Size of a 64-bit Windows crash-dump header (`_DUMP_HEADER64`).
 const DMP_HEADER: usize = 0x2000;
 
+/// The RSDS PDB GUID nanokrnl advertises, matching `tools/gen_pdb.py`'s
+/// `{01234567-89AB-CDEF-0123-456789ABCDEF}` (age 1). A Windows debugger reads it
+/// from the masquerade PE below, then loads `ntoskrnl.pdb` with this identity.
+/// GUID wire order: Data1 (LE u32), Data2/Data3 (LE u16), Data4 (8 bytes as-is).
+const RSDS_GUID: [u8; 16] = [
+    0x67, 0x45, 0x23, 0x01, 0xAB, 0x89, 0xEF, 0xCD, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+];
+const RSDS_AGE: u32 = 1;
+
+/// Build a minimal PE32+ image header that masquerades as `ntoskrnl.exe`, so a
+/// Windows debugger (which reads a module's headers from memory at its base)
+/// finds a real `IMAGE_NT_HEADERS` with a CodeView/RSDS debug directory instead
+/// of nanokrnl's ELF header. It carries `SizeOfImage`, `ImageBase`, and the RSDS
+/// record (GUID + `ntoskrnl.pdb`) that points the debugger at our PDB. Overlaid
+/// onto the kernel image's first bytes *in the dump only* - the range is the ELF
+/// header and program headers, not code - so nothing executing is disturbed.
+fn masquerade_pe(size_of_image: u32, entry_rva: u32) -> Vec<u8> {
+    let mut p = alloc::vec![0u8; 0x400];
+    let w16 = |p: &mut [u8], o: usize, v: u16| p[o..o + 2].copy_from_slice(&v.to_le_bytes());
+    let w32 = |p: &mut [u8], o: usize, v: u32| p[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    let w64 = |p: &mut [u8], o: usize, v: u64| p[o..o + 8].copy_from_slice(&v.to_le_bytes());
+
+    // DOS header: 'MZ' and e_lfanew -> the PE header at 0x40.
+    p[0] = b'M';
+    p[1] = b'Z';
+    w32(&mut p, 0x3c, 0x40);
+
+    // PE signature + COFF header @ 0x40.
+    p[0x40..0x44].copy_from_slice(b"PE\0\0");
+    w16(&mut p, 0x44, 0x8664); // Machine = AMD64
+    w16(&mut p, 0x46, 1); // NumberOfSections
+    w32(&mut p, 0x48, 0); // TimeDateStamp (0 -> matches the dump's unknown stamp)
+    w16(&mut p, 0x54, 0xF0); // SizeOfOptionalHeader
+    w16(&mut p, 0x56, 0x0022); // Characteristics: EXECUTABLE | LARGE_ADDRESS_AWARE
+
+    // Optional header (PE32+) @ 0x58.
+    let opt = 0x58;
+    w16(&mut p, opt, 0x20B); // Magic = PE32+
+    w32(&mut p, opt + 0x10, entry_rva); // AddressOfEntryPoint
+    w32(&mut p, opt + 0x14, 0x1000); // BaseOfCode
+    w64(&mut p, opt + 0x18, super::kd::KERNEL_VIRT_BASE); // ImageBase
+    w32(&mut p, opt + 0x20, 0x1000); // SectionAlignment
+    w32(&mut p, opt + 0x24, 0x200); // FileAlignment
+    w16(&mut p, opt + 0x30, 10); // MajorSubsystemVersion
+    w32(&mut p, opt + 0x38, size_of_image); // SizeOfImage
+    w32(&mut p, opt + 0x3c, 0x400); // SizeOfHeaders
+    w16(&mut p, opt + 0x44, 1); // Subsystem = NATIVE
+    w32(&mut p, opt + 0x6c, 16); // NumberOfRvaAndSizes
+    // DataDirectory[6] = DEBUG, at opt+0x70 + 6*8.
+    let dd_debug = opt + 0x70 + 6 * 8;
+    w32(&mut p, dd_debug, 0x180); // VA of the debug directory
+    w32(&mut p, dd_debug + 4, 0x1c); // size (one IMAGE_DEBUG_DIRECTORY)
+
+    // Section header @ 0x148 (opt 0x58 + 0xF0): one section spanning the image.
+    let sec = 0x148;
+    p[sec..sec + 5].copy_from_slice(b".text");
+    w32(&mut p, sec + 0x08, size_of_image.saturating_sub(0x1000)); // VirtualSize
+    w32(&mut p, sec + 0x0c, 0x1000); // VirtualAddress
+    w32(&mut p, sec + 0x24, 0x6000_0020); // CODE | EXECUTE | READ
+
+    // IMAGE_DEBUG_DIRECTORY @ RVA 0x180.
+    let dbg = 0x180;
+    w32(&mut p, dbg + 0x0c, 2); // Type = IMAGE_DEBUG_TYPE_CODEVIEW
+    w32(&mut p, dbg + 0x10, 4 + 16 + 4 + 13); // SizeOfData (RSDS record)
+    w32(&mut p, dbg + 0x14, 0x1a0); // AddressOfRawData (RVA of RSDS)
+    w32(&mut p, dbg + 0x18, 0x1a0); // PointerToRawData
+
+    // CodeView RSDS record @ 0x1a0: 'RSDS', GUID, Age, "ntoskrnl.pdb\0".
+    let rs = 0x1a0;
+    p[rs..rs + 4].copy_from_slice(b"RSDS");
+    p[rs + 4..rs + 20].copy_from_slice(&RSDS_GUID);
+    w32(&mut p, rs + 20, RSDS_AGE);
+    p[rs + 24..rs + 24 + 13].copy_from_slice(b"ntoskrnl.pdb\0");
+    p
+}
+
 /// Stream `mem` to `w` in slices, printing a newline-terminated progress line
 /// every ~12% - the multi-MiB physical-memory write is the slow part of a dump
 /// (Windows shows the same "Dumping physical memory to disk" percentage). A
@@ -410,13 +486,28 @@ pub fn write_memory_dmp(bugcheck: u32, params: &[u64; 4], g: &Gpr) -> Option<u64
     put32(&mut h, 0xf98, 1); // DumpType = DUMP_TYPE_FULL
     put64(&mut h, 0xfa0, DMP_HEADER as u64 + CAP); // RequiredDumpSpace
 
-    // Stream: header, then the physical window [0, CAP) named by the run.
+    // Stream: header, then the physical window [0, CAP). Overlay the masquerade
+    // PE header at the kernel image's physical base so the debugger reads a valid
+    // ntoskrnl.exe header (and its RSDS -> ntoskrnl.pdb) from the dump instead of
+    // the ELF header. Splice it into the stream; the live image is untouched.
     let mut w = p9::create("MEMORY.DMP")?;
     if !w.write(&h) {
         return None;
     }
     let mem = unsafe { core::slice::from_raw_parts(phys_to_virt(PhysAddr(0)), CAP as usize) };
-    if !write_phys_progress(&mut w, mem, "MEMORY.DMP") {
+    let kbase_phys = crate::mm::virt::mm_get_physical_address(crate::kd::KERNEL_VIRT_BASE)
+        .map(|p| p.0 as usize)
+        .unwrap_or(usize::MAX);
+    let pe = masquerade_pe(0x0040_0000, 0);
+    if kbase_phys + pe.len() <= CAP as usize {
+        // [0, kbase_phys)  then  PE header  then  [kbase_phys + pe.len(), CAP)
+        if !w.write(&mem[..kbase_phys]) || !w.write(&pe) {
+            return None;
+        }
+        if !write_phys_progress(&mut w, &mem[kbase_phys + pe.len()..], "MEMORY.DMP") {
+            return None;
+        }
+    } else if !write_phys_progress(&mut w, mem, "MEMORY.DMP") {
         return None;
     }
     let total = w.offset();
