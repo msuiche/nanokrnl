@@ -58,6 +58,20 @@ f1038d9 (whoami), 4657bab (per-process command line), 7cc5960 + 47047aa (more.co
 
 ## Log
 
+### 2026-07-04 (Part IV cont.) - live KD bridge: packet layer
+
+- Started the live kernel-debugger bridge (WinDbg attach) with its foundation:
+  `ke::kdcom`, the KDCOM wire framing - `KD_PACKET` encode/decode (data + control
+  leaders, type, byte-count, id, sum-of-bytes checksum, trailer), the break-in
+  byte, and an incremental `Decoder` that reassembles split delivery, drops
+  corrupt packets, and resyncs after garbage. Dependency-free; 6 host unit tests
+  (`cargo test -p kernel kdcom`) cover round-trip, control packets, byte-at-a-time
+  reassembly, bad-checksum rejection, and resync.
+- Still to build on top: the KD state machine (wait-state-change on break-in,
+  then KD_STATE_MANIPULATE for read/write memory, get/set context, breakpoints)
+  and the byte transport (over the UART, bridged to WinDbg's `com:pipe`). Those
+  need a real WinDbg in the loop to validate byte-exactly.
+
 ### 2026-07-04 (Part IV cont.) - symbols for WinDbg (ntoskrnl.pdb)
 
 - WinDbg opened MEMORY.DMP as a kernel target but had no symbols (our kernel is

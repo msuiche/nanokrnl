@@ -18,6 +18,7 @@
 
 pub mod bugcheck;
 pub mod irql;
+pub mod kdcom;
 pub mod selectors;
 pub mod spinlock;
 
