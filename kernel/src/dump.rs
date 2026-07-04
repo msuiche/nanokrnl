@@ -300,37 +300,27 @@ pub fn write_core(bugcheck: u32, params: &[u64; 4], g: &Gpr) -> Option<u64> {
 /// Size of a 64-bit Windows crash-dump header (`_DUMP_HEADER64`).
 const DMP_HEADER: usize = 0x2000;
 
-/// Stream `mem` to `w` in slices, drawing a `label: [####  ] NN%` progress bar
-/// over the serial console between slices - the multi-MiB physical-memory write
-/// is the slow part of a dump (Windows shows the same "Dumping physical memory
-/// to disk" bar). Returns false on any transport failure.
+/// Stream `mem` to `w` in slices, printing a newline-terminated progress line
+/// every ~12% - the multi-MiB physical-memory write is the slow part of a dump
+/// (Windows shows the same "Dumping physical memory to disk" percentage). A
+/// carriage-return bar would be prettier, but not every console honors `\r`;
+/// discrete lines render everywhere. Returns false on any transport failure.
 fn write_phys_progress(w: &mut p9::Writer, mem: &[u8], label: &str) -> bool {
-    const CELLS: usize = 24;
-    const FILL: &str = "########################"; // CELLS '#'
-    const PAD: &str = "                        "; // CELLS spaces
     const STEP: usize = 1 << 21; // 2 MiB per slice
     let total = mem.len().max(1);
     let mut off = 0usize;
+    let mut shown: u64 = 0;
     while off < mem.len() {
         let end = (off + STEP).min(mem.len());
         if !w.write(&mem[off..end]) {
             return false;
         }
         off = end;
-        let pct = (off * 100 / total).min(100);
-        let n = (pct * CELLS / 100).min(CELLS);
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            crate::hal::serial::write_fmt_forced(format_args!(
-                "\r*** {label}: [{}{}] {pct:3}%",
-                &FILL[..n],
-                &PAD[..CELLS - n],
-            ));
+        let pct = (off as u64 * 100 / total as u64).min(100);
+        if pct >= shown + 12 || off == mem.len() {
+            shown = pct;
+            crate::kd_println!("***   {}: {}%", label, pct);
         }
-    }
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        crate::hal::serial::write_fmt_forced(format_args!("\n"));
     }
     true
 }

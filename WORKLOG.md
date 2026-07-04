@@ -58,6 +58,18 @@ f1038d9 (whoami), 4657bab (per-process command line), 7cc5960 + 47047aa (more.co
 
 ## Log
 
+### 2026-07-04 (Part IV cont.) - crash UX: banner first, dump progress bar
+
+- On `crash` the bugcheck path wrote two 32 MiB dumps (ELF core + MEMORY.DMP)
+  over the byte-wise 9P transport *before* printing the STOP banner, so the BSOD
+  only appeared after the whole transfer. Reordered to Windows' sequence: show
+  the stop screen first, then collect the dump. `ke_display_bugcheck` prints the
+  banner without halting (idempotent), called from the crash path before the
+  int3/dump and reused by `ke_bug_check_ex`.
+- Added a per-file progress bar over the serial console during the physical
+  memory write (the slow part): `*** MEMORY.DMP: [########      ] 42%`, filling
+  6% -> 100%. Verified in a real `crash` run: banner, then the bar.
+
 ### 2026-07-04 (Part IV cont.) - live KD bridge: packet layer
 
 - Started the live kernel-debugger bridge (WinDbg attach) with its foundation:
