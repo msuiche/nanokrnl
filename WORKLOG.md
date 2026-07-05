@@ -58,6 +58,66 @@ f1038d9 (whoami), 4657bab (per-process command line), 7cc5960 + 47047aa (more.co
 
 ## Log
 
+### 2026-07-05 (Part IV cont.) - WinDbg opens MEMORY.DMP as a full kernel target
+
+The self-authored `MEMORY.DMP` now opens in Microsoft WinDbg as a genuine kernel
+target: `lm`, `dt`, `r`, `kv`, `!analyze -v`, `!object`, `!process <addr>` and
+`dl nt!PsActiveProcessHead` all work. The kernel that wrote the dump has never
+run on real hardware; it runs inside the nanox emulator, yet every field WinDbg
+reads is a byte-accurate NT structure at the offset the debugger expects.
+
+- **`dt` decodes real types.** The synthetic `ntoskrnl.pdb` needed two things the
+  `yaml2pdb` path does not emit: the TPI hash stream filled per record (without
+  it dbghelp loads the PDB as "publics only" and `dt nt!_EPROCESS` fails even
+  though the type record is present), and a section-headers stream wired into the
+  DBI Optional Debug Header with publics emitted section-relative (RVA minus
+  section VA). `dt` now decodes `_EPROCESS`, `_KPROCESS`, `_OBJECT_TYPE`,
+  `_KUSER_SHARED_DATA` and the rest.
+- **Per-build PDB GUID kills stale-symbol caching.** dbghelp caches parsed PDBs
+  by GUID, so a fixed GUID made it serve old type layouts after the first load: a
+  fix would land, the rebuilt PDB would copy over, and WinDbg kept showing the
+  previous layout. `gen_pdb.py` now derives the GUID from content (sha256 of the
+  kernel image plus the type records) and patches that same GUID into the dump's
+  masquerade RSDS, so dump and PDB always agree and any change forces a reload.
+- **`r`/`kv`/`!analyze -v`.** Synthetic `KPROCESSOR_STATE`/`KPRCB`/`KPCR` (valid
+  `GdtBase`/`IdtBase`) plus a `KiProcessorBlock`, with the `KdDebuggerDataBlock`
+  offsets byte-exact. The `KDDEBUGGER_DATA64` tail has an eight-byte alignment
+  pad; getting the PCR offset fields off by that pad made WinDbg read the PCR at
+  the PRCB address and fail the CS descriptor lookup. Correct now:
+  `!analyze -v` gives a clean `MANUALLY_INITIATED_CRASH` bucket naming the
+  process, with the faulting thread and a symbolized top frame.
+- **`!object` -> Type: Process.** Since Vista an object's type is a `TypeIndex`
+  byte, decoded `index = TypeIndex XOR ((&header >> 8) & 0xff) XOR ObHeaderCookie`,
+  then `ObTypeIndexTable[index]` must equal `PsProcessType`. Every process object
+  now carries a real `_OBJECT_HEADER`; `ObHeaderCookie`, `ObTypeIndexTable` and a
+  `PsProcessType` object (whose own `Index` agrees) are all populated.
+- **`!process` "TYPE mismatch" fixed via the dispatcher header.** `!process` does
+  a second, different check from `!object`: it validates `Pcb.Header.Type ==
+  ProcessObject` (3) at dispatcher-header offset 0 (win2k `ke/procobj.c`; the
+  strings `Pcb.Header.Type` / `ProcessObject` are literally in `kdexts.dll`). Our
+  compact `_EPROCESS` had overlaid `UniqueProcessId` onto offset 0; moved the PID
+  to its own offset and put `Type = 3` at offset 0.
+- **`MmUserProbeAddress` for `!process 0 0`.** The command reads
+  `nt!MmUserProbeAddress` to tell a PID from a literal `_EPROCESS` address;
+  unexported it read 0, so `0 < 0` is false and it dereferenced address 0. Now
+  exported (`0x7fffffff0000`) and pointed at by the matching KDBG field.
+- **`KUSER_SHARED_DATA`.** WinDbg reads `SharedUserData` at `0xfffff78000000000`
+  at setup for version/timing/XState; its absence produced "Unable to get shared
+  data" and no uptime. We synthesize the page (version, `KdDebuggerEnabled`, time
+  fields, a minimal `_XSTATE_CONFIGURATION`) and map it into the kernel shared
+  high half so every CR3 sees it. System Uptime now shows.
+- **Caveat: `!process 0 0` lists only the first process.** `dl` and
+  `!for_each_process` traverse all four; `!process 0 0` prints the header and the
+  first entry, then stops. Traced to a `kdexts.dll` `CheckControlC` returning
+  nonzero after the first entry. Every data-side explanation was ruled out against
+  the dump: the process ring is a clean circular doubly-linked list, KUSER_SHARED_DATA
+  is mapped under every CR3, and the GDT kernel-code descriptor has the long-mode
+  bit set (same VA returns the same bytes in every context). The debugger here is
+  ARM64 WinDbg running the x64 `kdexts.dll` under emulation, so that
+  `CheckControlC` crosses an x64-to-ARM64 boundary; provably-correct data plus
+  inconsistent results across the typed enumerators (0, 1, 4) point at the
+  emulated extension layer, not the dump. Confirm on native x64 WinDbg.
+
 ### 2026-07-04 (Part IV cont.) - crash UX: dump progress, dump-before-banner
 
 - On `crash` the bugcheck path streams two 32 MiB dumps (ELF core + MEMORY.DMP)
