@@ -449,10 +449,60 @@ fn write_phys_progress(w: &mut p9::Writer, mem: &[u8], label: &str) -> bool {
 /// (CR3), walks the captured page tables to translate every virtual address, and
 /// finds the NT structures [`crate::kd`] laid out. Returns the byte count, or
 /// `None` if the host 9P server is absent. Safe at bugcheck IRQL.
+/// `KUSER_SHARED_DATA` (kernel view `0xfffff78000000000`). A Windows debugger
+/// reads `SharedUserData` during setup - version fields, timing, and the XState
+/// configuration. Without it dbgeng faults ("Unable to get shared data",
+/// `ReadVirtual() failed in GetXStateConfiguration()"), a swallowed error that
+/// can leave the engine in an abort state. We keep a page, populate the fields a
+/// debugger consults, and map it into the crash address space so it lands in the
+/// captured physical window and translates via the dump's DirectoryTableBase.
+#[repr(C, align(4096))]
+struct KuserSharedData([u8; 0x1000]);
+#[no_mangle]
+static mut KUSER_SHARED_DATA: KuserSharedData = KuserSharedData([0; 0x1000]);
+const KUSD_VA: u64 = 0xffff_f780_0000_0000;
+
+fn map_kuser_shared_data() {
+    unsafe {
+        let b = &mut (*(&raw mut KUSER_SHARED_DATA)).0;
+        let p32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        let p64 = |b: &mut [u8], o: usize, v: u64| b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+        p32(b, 0x004, 0x0fa0_0000); // TickCountMultiplier
+        p32(b, 0x008, 0x1000_0000); // InterruptTime.LowPart
+        p32(b, 0x014, 0xd000_0000); // SystemTime.LowPart
+        p32(b, 0x018, 0x01d9_a000); // SystemTime.High1Time
+        p32(b, 0x01c, 0x01d9_a000); // SystemTime.High2Time
+        p32(b, 0x26c, 10); // NtMajorVersion
+        p32(b, 0x270, 0); // NtMinorVersion
+        b[0x2d4] = 1; // KdDebuggerEnabled
+        p32(b, 0x320, 0x1000); // TickCount.LowPart
+        // _XSTATE_CONFIGURATION @0x3d8: legacy x87+SSE only, no extended state.
+        p64(b, 0x3d8, 0x3); // EnabledFeatures (XSTATE_MASK_LEGACY: x87|SSE)
+        p64(b, 0x3e0, 0x3); // EnabledVolatileFeatures
+        p32(b, 0x3e8, 0x240); // Size of the legacy save area
+        // Map it into the crash address space (== dump DirectoryTableBase), so a
+        // debugger resolves 0xfffff78000000000 through the captured page tables.
+        let va = &raw const KUSER_SHARED_DATA as u64;
+        if let Some(phys) = crate::mm::virt::mm_get_physical_address(va) {
+            crate::mm::virt::mm_map_user_range(
+                crate::mm::virt::mm_current_address_space(),
+                KUSD_VA,
+                phys,
+                1,
+                false,
+                false,
+            );
+        }
+    }
+}
+
 pub fn write_memory_dmp(bugcheck: u32, params: &[u64; 4], g: &Gpr) -> Option<u64> {
     // The KDBG structures must be current (write_core also refreshes them; doing
     // it again is idempotent).
     crate::init::kd_snapshot();
+    // Map/populate KUSER_SHARED_DATA before the physical window is streamed, so
+    // the page and the new page-table entries are captured in the dump.
+    map_kuser_shared_data();
 
     let mut h = alloc::vec![0u8; DMP_HEADER];
     let put32 = |h: &mut [u8], off: usize, v: u32| h[off..off + 4].copy_from_slice(&v.to_le_bytes());

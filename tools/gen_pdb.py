@@ -149,7 +149,22 @@ TpiStream:
         - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x1003, FieldOffset: 16, Name: 'Name' } }
         - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0020, FieldOffset: 40, Name: 'Index' } }
     - Kind: LF_STRUCTURE
-      Class: { MemberCount: 3, Options: [ None ], FieldList: 0x100f, Name: '_OBJECT_TYPE', UniqueName: '', DerivationList: 0, VTableShape: 0, Size: 256 }\
+      Class: { MemberCount: 3, Options: [ None ], FieldList: 0x100f, Name: '_OBJECT_TYPE', UniqueName: '', DerivationList: 0, VTableShape: 0, Size: 256 }
+    - Kind: LF_FIELDLIST
+      FieldList:
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0077, FieldOffset: 0, Name: 'EnabledFeatures' } }
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0077, FieldOffset: 8, Name: 'EnabledVolatileFeatures' } }
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0075, FieldOffset: 16, Name: 'Size' } }
+    - Kind: LF_STRUCTURE
+      Class: { MemberCount: 3, Options: [ None ], FieldList: 0x1011, Name: '_XSTATE_CONFIGURATION', UniqueName: '', DerivationList: 0, VTableShape: 0, Size: 832 }
+    - Kind: LF_FIELDLIST
+      FieldList:
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0075, FieldOffset: 620, Name: 'NtMajorVersion' } }
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0075, FieldOffset: 624, Name: 'NtMinorVersion' } }
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0020, FieldOffset: 724, Name: 'KdDebuggerEnabled' } }
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x1012, FieldOffset: 984, Name: 'XState' } }
+    - Kind: LF_STRUCTURE
+      Class: { MemberCount: 4, Options: [ None ], FieldList: 0x1013, Name: '_KUSER_SHARED_DATA', UniqueName: '', DerivationList: 0, VTableShape: 0, Size: 4096 }\
 """
 
 
