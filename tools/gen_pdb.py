@@ -325,11 +325,12 @@ def patch_section_headers(pdb_path):
         nb = 0 if s in (0, 0xFFFFFFFF) else (s + bs - 1) // bs
         blocks.append(list(struct.unpack_from(f"<{nb}I", dirb, off))); off += 4 * nb
 
-    # One IMAGE_SECTION_HEADER (40 bytes): .text at VA 0 spanning SizeOfImage.
-    SIZE_OF_IMAGE = 0x0040_0000
+    # One IMAGE_SECTION_HEADER (40 bytes): .text at VA 0x1000 spanning the image,
+    # matching the stub ntoskrnl.exe WinDbg maps (VA 0x1000, VSize 0x3ff000).
+    # Publics use Offset = RVA - 0x1000, so RVA = 0x1000 + Offset resolves.
     sect = bytearray(40)
     sect[0:8] = b".text\0\0\0"
-    struct.pack_into("<IIII", sect, 8, SIZE_OF_IMAGE, 0, SIZE_OF_IMAGE, 0)  # VSize, VAddr=0, RawSize, RawPtr
+    struct.pack_into("<IIII", sect, 8, 0x3FF000, 0x1000, 0x3FF000, 0x400)  # VSize, VAddr, RawSize, RawPtr
     struct.pack_into("<I", sect, 36, 0x6000_0020)  # CODE|EXECUTE|READ
 
     # Append the section-headers stream as a new block at end of file.
@@ -421,16 +422,26 @@ def main():
         "PublicsStream:",
         "  Records:",
     ]
+    # A public's address is SectionHeader[Segment-1].VirtualAddress + Offset, and
+    # the image/section table places .text at RVA SECTION_VA - so Offset must be
+    # RELATIVE to the section, not the full RVA (emitting the full RVA put every
+    # public out of section and WinDbg dropped them all). Symbols below SECTION_VA
+    # (the PE header region) can't live in section 1; there is essentially one.
+    SECTION_VA = 0x1000
+    n_pub_emitted = 0
     for rva, is_func, name in syms:
+        if rva < SECTION_VA:
+            continue
         flags = "[ Function ]" if is_func else "[ ]"
         yaml += [
             "    - Kind: S_PUB32",
             "      PublicSym32:",
             f"        Flags: {flags}",
-            f"        Offset: {rva:#x}",
+            f"        Offset: {rva - SECTION_VA:#x}",
             "        Segment: 1",
             f"        Name: '{name}'",
         ]
+        n_pub_emitted += 1
 
     yaml_path = out_pdb + ".yaml"
     with open(yaml_path, "w") as f:
