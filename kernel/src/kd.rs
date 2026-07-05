@@ -548,7 +548,11 @@ pub fn set_processor_state(
             last_exception_to: 0,
             last_exception_from: 0,
             cr8,
-            msr: [0; 6],
+            // MsrGsBase = the current (kernel) GS base = the KPCR. The engine
+            // locates the running processor's KPCR (hence GdtBase, for the CS
+            // descriptor) via this MSR, not via KiProcessorBlock. GsSwap holds
+            // the user base (none here).
+            msr: [kpcr_va, 0, 0, 0, 0, 0],
         };
         prcb.context.copy_from_slice(context);
         // Current thread: point the PRCB at a readable KTHREAD whose

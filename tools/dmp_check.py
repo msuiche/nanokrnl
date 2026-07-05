@@ -199,6 +199,8 @@ def main():
             kpcr = prcb - off_contained
             kpcr_gdt = c.u64(kpcr + 0x00)
             kpcr_self = c.u64(kpcr + off_selfpcr)
+            gs_base = c.u64(sr + 0xa8)  # KSPECIAL_REGISTERS.MsrGsBase
+            print(f"  MsrGsBase={gs_base:#x}  (== KPCR {kpcr:#x}: {gs_base == kpcr})")
             print(f"  KPCR={kpcr:#x} (Prcb-{off_contained:#x})  GdtBase={kpcr_gdt:#x} Self={kpcr_self:#x}")
             print(f"  KPCR.GdtBase==Gdtr.Base: {kpcr_gdt == gdt_base}; Self==KPCR: {kpcr_self == kpcr}")
             try:
