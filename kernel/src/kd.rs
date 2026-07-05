@@ -215,6 +215,26 @@ struct Kthread {
     bytes: [u8; KTHREAD_SIZE],
 }
 
+/// x64 `_KPCR`: `GdtBase`@0, `Self`@0x18, `CurrentPrcb`@0x20, `IdtBase`@0x38, and
+/// the embedded `KPRCB` at 0x180. WinDbg resolves segment descriptors (the CS
+/// lookup that yields the flat program counter) via `KPCR.GdtBase`, finding the
+/// KPCR as `KiProcessorBlock[n] - OffsetPcrContainedPrcb` - so the PRCB must sit
+/// inside a KPCR whose `GdtBase` points at the real GDT.
+const KPCR_PRCB_OFFSET: usize = 0x180;
+
+#[repr(C)]
+struct Kpcr {
+    gdt_base: u64,     // 0x00
+    tss_base: u64,     // 0x08
+    user_rsp: u64,     // 0x10
+    self_ptr: u64,     // 0x18  Self
+    current_prcb: u64, // 0x20  CurrentPrcb
+    _pad0: [u8; 0x38 - 0x28],
+    idt_base: u64,     // 0x38
+    _pad1: [u8; KPCR_PRCB_OFFSET - 0x40],
+    prcb: Kprcb,       // 0x180
+}
+
 /// `_DBGKD_DEBUG_DATA_HEADER64` — the head of [`KddebuggerData64`].
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -292,10 +312,20 @@ static mut KdProcessEntries: [Eprocess; MAX_PROCS] = [Eprocess::zero(); MAX_PROC
 /// register/CS-descriptor context, plus the one-entry `KiProcessorBlock` array
 /// that points at it. Filled on the crash path by [`set_processor_state`].
 #[no_mangle]
-static mut KdPrcb0: Kprcb = Kprcb {
-    head: [0; PRCB_PROCESSOR_STATE],
-    special: KspecialRegisters::zero(),
-    context: [0; CONTEXT_SIZE],
+static mut KdKpcr: Kpcr = Kpcr {
+    gdt_base: 0,
+    tss_base: 0,
+    user_rsp: 0,
+    self_ptr: 0,
+    current_prcb: 0,
+    _pad0: [0; 0x38 - 0x28],
+    idt_base: 0,
+    _pad1: [0; KPCR_PRCB_OFFSET - 0x40],
+    prcb: Kprcb {
+        head: [0; PRCB_PROCESSOR_STATE],
+        special: KspecialRegisters::zero(),
+        context: [0; CONTEXT_SIZE],
+    },
 };
 #[no_mangle]
 static mut KiProcessorBlock: [u64; 1] = [0];
@@ -486,7 +516,21 @@ pub fn set_processor_state(
 ) {
     let _g = KD_LOCK.lock();
     unsafe {
-        let prcb = &mut *(&raw mut KdPrcb0);
+        let kpcr_va = addr(&raw const KdKpcr);
+        let prcb_va = addr(&raw const KdKpcr.prcb);
+        let thread_va = addr(&raw const KdThread0);
+        let proc0 = addr(&raw const (*(&raw const KdProcessEntries))[0]);
+
+        // KPCR: GdtBase/IdtBase are what the engine reads to resolve segment
+        // descriptors (the CS lookup that yields the flat PC); Self/CurrentPrcb
+        // tie the KPCR to its embedded PRCB.
+        let kpcr = &mut *(&raw mut KdKpcr);
+        kpcr.gdt_base = gdt_base;
+        kpcr.idt_base = idt_base;
+        kpcr.self_ptr = kpcr_va;
+        kpcr.current_prcb = prcb_va;
+
+        let prcb = &mut kpcr.prcb;
         prcb.special = KspecialRegisters {
             cr0,
             cr2,
@@ -507,18 +551,16 @@ pub fn set_processor_state(
             msr: [0; 6],
         };
         prcb.context.copy_from_slice(context);
-
         // Current thread: point the PRCB at a readable KTHREAD whose
         // ApcState.Process is the first process, so the engine can establish the
         // current context instead of reading a control register as a pointer.
-        let thread_va = addr(&raw const KdThread0);
         prcb.head[PRCB_CURRENT_THREAD..PRCB_CURRENT_THREAD + 8].copy_from_slice(&thread_va.to_le_bytes());
-        let proc0 = addr(&raw const (*(&raw const KdProcessEntries))[0]);
+
         let thread = &mut *(&raw mut KdThread0);
         thread.bytes[KTHREAD_APC_PROCESS..KTHREAD_APC_PROCESS + 8]
             .copy_from_slice(&proc0.to_le_bytes());
 
-        (*(&raw mut KiProcessorBlock))[0] = addr(&raw const KdPrcb0);
+        (*(&raw mut KiProcessorBlock))[0] = prcb_va;
 
         let d = &mut *(&raw mut KdDebuggerDataBlock);
         // Processor block: where the state lives and how big the PRCB is.
@@ -527,6 +569,12 @@ pub fn set_processor_state(
         put_rest_u16(d, 0x2b4, PRCB_CURRENT_THREAD as u16); // OffsetPrcbCurrentThread
         put_rest_u16(d, 0x2bc, (PRCB_PROCESSOR_STATE + core::mem::size_of::<KspecialRegisters>()) as u16); // OffsetPrcbProcStateContext
         put_rest_u16(d, 0x2ec, PRCB_PROCESSOR_STATE as u16); // OffsetPrcbProcStateSpecialReg
+        // KPCR shape so the engine locates the GDT/IDT for descriptor lookups
+        // (KPCR = KiProcessorBlock[n] - OffsetPcrContainedPrcb).
+        put_rest_u16(d, 0x2da, core::mem::size_of::<Kpcr>() as u16); // SizePcr
+        put_rest_u16(d, 0x2dc, 0x18); // OffsetPcrSelfPcr
+        put_rest_u16(d, 0x2de, 0x20); // OffsetPcrCurrentPrcb
+        put_rest_u16(d, 0x2e0, KPCR_PRCB_OFFSET as u16); // OffsetPcrContainedPrcb
         // Thread/process shape so !process can walk from the current thread and
         // decode each EPROCESS (matches our compact _EPROCESS layout).
         put_rest_u16(d, 0x2a0, KTHREAD_APC_PROCESS as u16); // OffsetKThreadApcProcess

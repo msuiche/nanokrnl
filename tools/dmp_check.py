@@ -191,6 +191,23 @@ def main():
             print(f"  CurrentThread readable; ApcState.Process={proc:#x} Image='{img}'")
         except KeyError as e:
             print(f"  CurrentThread/Process NOT readable: {e}")
+        # KPCR: what the engine reads GdtBase from for the CS-descriptor lookup
+        # (KPCR = KiProcessorBlock[n] - OffsetPcrContainedPrcb; GdtBase @ KPCR+0).
+        off_contained = c.u16(c.kdbg + 0x2e0)  # OffsetPcrContainedPrcb
+        off_selfpcr = c.u16(c.kdbg + 0x2dc)     # OffsetPcrSelfPcr
+        if off_contained:
+            kpcr = prcb - off_contained
+            kpcr_gdt = c.u64(kpcr + 0x00)
+            kpcr_self = c.u64(kpcr + off_selfpcr)
+            print(f"  KPCR={kpcr:#x} (Prcb-{off_contained:#x})  GdtBase={kpcr_gdt:#x} Self={kpcr_self:#x}")
+            print(f"  KPCR.GdtBase==Gdtr.Base: {kpcr_gdt == gdt_base}; Self==KPCR: {kpcr_self == kpcr}")
+            try:
+                d0 = c.u64(kpcr_gdt + (segcs >> 3) * 8)
+                print(f"  GDT[{segcs>>3}] via KPCR.GdtBase = {d0:#018x} present={(d0>>47)&1} L={(d0>>53)&1}")
+            except KeyError as e:
+                print(f"  KPCR.GdtBase GDT read FAILED: {e}")
+        else:
+            print("  OffsetPcrContainedPrcb=0 - engine can't find KPCR.GdtBase")
     else:
         print("  KiProcessorBlock is 0 - GetContextState will fail")
 
