@@ -29,7 +29,10 @@ KERNEL_VIRT_BASE = 0xFFFF_8000_0000_0000
 # 0x0020 unsigned char). Offsets/sizes are exactly kernel/src/kd.rs's #[repr(C)]
 # layouts - these describe *our* compact structs, not a real Windows build's.
 #   0x1001 _LIST_ENTRY   0x1003 _UNICODE_STRING   0x1004 char[16]
-#   0x1006 _EPROCESS     0x1008 _KLDR_DATA_TABLE_ENTRY
+#   0x1006 _KPROCESS     0x1008 _EPROCESS         0x100a _KLDR_DATA_TABLE_ENTRY
+# _EPROCESS carries a Pcb (_KPROCESS) at offset 0 so `!process` can read
+# DirBase via _EPROCESS.Pcb.DirectoryTableBase (its genuine navigation path);
+# Pcb overlaps the compact fields, which CodeView permits.
 TPI_RECORDS = """\
 TpiStream:
   Version: VC80
@@ -51,13 +54,19 @@ TpiStream:
       Array: { ElementType: 0x0020, IndexType: 0x0077, Size: 16, Name: '' }
     - Kind: LF_FIELDLIST
       FieldList:
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0077, FieldOffset: 24, Name: 'DirectoryTableBase' } }
+    - Kind: LF_STRUCTURE
+      Class: { MemberCount: 1, Options: [ None ], FieldList: 0x1005, Name: '_KPROCESS', UniqueName: '', DerivationList: 0, VTableShape: 0, Size: 32 }
+    - Kind: LF_FIELDLIST
+      FieldList:
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x1006, FieldOffset: 0, Name: 'Pcb' } }
         - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0077, FieldOffset: 0, Name: 'UniqueProcessId' } }
         - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x1001, FieldOffset: 8, Name: 'ActiveProcessLinks' } }
         - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0077, FieldOffset: 24, Name: 'DirectoryTableBase' } }
         - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0077, FieldOffset: 32, Name: 'Peb' } }
         - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x1004, FieldOffset: 40, Name: 'ImageFileName' } }
     - Kind: LF_STRUCTURE
-      Class: { MemberCount: 5, Options: [ None ], FieldList: 0x1005, Name: '_EPROCESS', UniqueName: '', DerivationList: 0, VTableShape: 0, Size: 56 }
+      Class: { MemberCount: 6, Options: [ None ], FieldList: 0x1007, Name: '_EPROCESS', UniqueName: '', DerivationList: 0, VTableShape: 0, Size: 56 }
     - Kind: LF_FIELDLIST
       FieldList:
         - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x1001, FieldOffset: 0, Name: 'InLoadOrderLinks' } }
@@ -67,7 +76,7 @@ TpiStream:
         - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x1003, FieldOffset: 72, Name: 'FullDllName' } }
         - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x1003, FieldOffset: 88, Name: 'BaseDllName' } }
     - Kind: LF_STRUCTURE
-      Class: { MemberCount: 6, Options: [ None ], FieldList: 0x1007, Name: '_KLDR_DATA_TABLE_ENTRY', UniqueName: '', DerivationList: 0, VTableShape: 0, Size: 176 }\
+      Class: { MemberCount: 6, Options: [ None ], FieldList: 0x1009, Name: '_KLDR_DATA_TABLE_ENTRY', UniqueName: '', DerivationList: 0, VTableShape: 0, Size: 176 }\
 """
 
 
