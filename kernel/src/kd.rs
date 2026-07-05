@@ -105,26 +105,94 @@ impl KldrEntry {
 
 const IMAGE_NAME_LEN: usize = 16;
 
-/// `_EPROCESS` (the fields `!process` reads). Compact: a debugger takes these
-/// offsets from the type, and everything it needs to list a process is here.
+/// `ProcessObject` from the NT `KOBJECTS` enum - the `_DISPATCHER_HEADER.Type`
+/// value a process's `_KPROCESS` carries. `!process` validates this (its check is
+/// separate from the object-header type `!object` uses), so it must sit at
+/// `_EPROCESS + 0` (= `Pcb.Header.Type`).
+const PROCESS_OBJECT_TYPE: u8 = 3;
+
+/// `_EPROCESS` (the fields `!process` reads). Compact, but offset 0 must be the
+/// embedded `_KPROCESS`'s dispatcher `Type` (not the PID) - `!process` reads
+/// `Pcb.Header.Type` and rejects the object otherwise. `UniqueProcessId` moves to
+/// 0x38 so it no longer overlaps that byte.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Eprocess {
-    unique_process_id: u64,             // 0x00  PID (as a HANDLE-shaped value)
-    active_process_links: ListEntry,    // 0x08  links in PsActiveProcessHead
-    directory_table_base: u64,          // 0x18  CR3
-    peb: u64,                           // 0x20
+    dispatcher_type: u8,                   // 0x00  Pcb.Header.Type = ProcessObject(3)
+    _pad0: [u8; 7],                        // 0x01
+    active_process_links: ListEntry,       // 0x08  links in PsActiveProcessHead
+    directory_table_base: u64,             // 0x18  CR3 (also Pcb.DirectoryTableBase)
+    peb: u64,                              // 0x20
     image_file_name: [u8; IMAGE_NAME_LEN], // 0x28  ASCII, NUL-padded
+    unique_process_id: u64,                // 0x38  PID (as a HANDLE-shaped value)
 }
 impl Eprocess {
     const fn zero() -> Self {
         Eprocess {
-            unique_process_id: 0,
+            dispatcher_type: 0,
+            _pad0: [0; 7],
             active_process_links: ListEntry::zero(),
             directory_table_base: 0,
             peb: 0,
             image_file_name: [0; IMAGE_NAME_LEN],
+            unique_process_id: 0,
         }
+    }
+}
+
+/// Size of an `_OBJECT_HEADER` from its start to the object body (`Body` @0x30).
+const OBJECT_HEADER_SIZE: usize = 0x30;
+
+/// `_OBJECT_HEADER` (amd64). `!process` validates that an address is really a
+/// process object: it reads the header sitting `OBJECT_HEADER_SIZE` bytes before
+/// the `_EPROCESS`, decodes `TypeIndex` (@0x18) and compares the resulting
+/// `_OBJECT_TYPE*` against `nt!PsProcessType`. Without this it prints
+/// "TYPE mismatch for process object". Only the fields the engine reads are named.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ObjectHeader {
+    pointer_count: u64,       // 0x00
+    handle_count: u64,        // 0x08
+    lock: u64,                // 0x10
+    type_index: u8,           // 0x18  obfuscated index into nt!ObTypeIndexTable
+    trace_flags: u8,          // 0x19
+    info_mask: u8,            // 0x1a
+    flags: u8,                // 0x1b
+    _pad0: u32,               // 0x1c
+    quota_block: u64,         // 0x20
+    security_descriptor: u64, // 0x28
+    // Body (the _EPROCESS) begins at 0x30.
+}
+impl ObjectHeader {
+    const fn zero() -> Self {
+        ObjectHeader {
+            pointer_count: 0,
+            handle_count: 0,
+            lock: 0,
+            type_index: 0,
+            trace_flags: 0,
+            info_mask: 0,
+            flags: 0,
+            _pad0: 0,
+            quota_block: 0,
+            security_descriptor: 0,
+        }
+    }
+}
+
+/// A process object as it lives in kernel memory: an `_OBJECT_HEADER` immediately
+/// followed by the `_EPROCESS` body. Every address we publish for a process (the
+/// active-process links, `PsInitialSystemProcess`, `!process <addr>`) points at
+/// `body`; the header sits at `&body - OBJECT_HEADER_SIZE` for the type check.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProcessObject {
+    object_header: ObjectHeader, // 0x00
+    body: Eprocess,              // 0x30
+}
+impl ProcessObject {
+    const fn zero() -> Self {
+        ProcessObject { object_header: ObjectHeader::zero(), body: Eprocess::zero() }
     }
 }
 
@@ -309,13 +377,56 @@ pub static mut PsInitialSystemProcess: u64 = 0;
 #[no_mangle]
 pub static mut PsIdleProcess: u64 = 0;
 
+/// Object-manager plumbing so `!process` accepts our processes as real process
+/// objects. It reads the `_OBJECT_HEADER` before an `_EPROCESS`, decodes
+///   index = TypeIndex ^ ((&header >> 8) & 0xff) ^ ObHeaderCookie
+/// indexes `nt!ObTypeIndexTable[index]` and compares that `_OBJECT_TYPE*` with
+/// `nt!PsProcessType`; a mismatch prints "TYPE mismatch for process object".
+/// We put a single process `_OBJECT_TYPE` (`PsProcessTypeObject`) in the table at
+/// `PROCESS_TYPE_INDEX`, point `PsProcessType` at it, keep the cookie 0, and set
+/// each header's `TypeIndex` so the decode lands on that slot.
+const PROCESS_TYPE_INDEX: u8 = 3;
+#[no_mangle]
+pub static mut ObHeaderCookie: u8 = 0;
+/// `nt!ObTypeIndexTable[PROCESS_TYPE_INDEX]` points at the process `_OBJECT_TYPE`.
+/// `!process` decodes the object header's `TypeIndex` to an index and checks the
+/// type at that slot; it also cross-checks the decoded index against the type's
+/// own `Index` field, so all three (the header decode, this slot, and
+/// `PsProcessTypeObject.Index`) must agree on PROCESS_TYPE_INDEX.
+#[no_mangle]
+static mut ObTypeIndexTable: [u64; 16] = [0; 16];
+/// The process `_OBJECT_TYPE`. `Name` (@0x10) and `Index` (@0x28) are filled in
+/// [`commit`]; the rest is zero (benign - `!process` only reads those two).
+#[no_mangle]
+static mut PsProcessTypeObject: [u8; 0x100] = [0; 0x100];
+/// UTF-16 `"Process"` for `PsProcessTypeObject.Name`.
+static mut PsProcessTypeName: [u16; 8] = [b'P' as u16, b'r' as u16, b'o' as u16, b'c' as u16,
+    b'e' as u16, b's' as u16, b's' as u16, 0];
+#[no_mangle]
+pub static mut PsProcessType: u64 = 0;
+
+/// `nt!MmUserProbeAddress` - the user/kernel VA boundary (highest user address +
+/// 1). `!process 0 0` reads this to decide whether its argument is a PID/`0`
+/// (walk `PsActiveProcessHead`) or a literal `_EPROCESS` address; if it reads 0,
+/// `0 < 0` is false and it tries to read an `_EPROCESS` at address 0 ("Error in
+/// reading nt!_EPROCESS at 0"). The engine dereferences the symbol (and the KDBG
+/// `MmUserProbeAddress` field points here), so it must hold the real value.
+#[no_mangle]
+pub static mut MmUserProbeAddress: u64 = 0x0000_7FFF_FFFF_0000;
+/// Offset of `MmUserProbeAddress` in `_KDDEBUGGER_DATA64` (holds &MmUserProbeAddress).
+const KDBG_OFF_MM_USER_PROBE: usize = 0x1d8;
+
+/// Offsets into `_OBJECT_TYPE` (amd64) that `!process` reads.
+const OBJECT_TYPE_NAME_OFFSET: usize = 0x10;
+const OBJECT_TYPE_INDEX_OFFSET: usize = 0x28;
+
 const MAX_MODULES: usize = 16;
 const MAX_PROCS: usize = 16;
 
 #[no_mangle]
 static mut KdModuleEntries: [KldrEntry; MAX_MODULES] = [KldrEntry::zero(); MAX_MODULES];
 #[no_mangle]
-static mut KdProcessEntries: [Eprocess; MAX_PROCS] = [Eprocess::zero(); MAX_PROCS];
+static mut KdProcessEntries: [ProcessObject; MAX_PROCS] = [ProcessObject::zero(); MAX_PROCS];
 
 /// Synthetic processor 0 state (`KPROCESSOR_STATE`) the debugger reads for
 /// register/CS-descriptor context, plus the one-entry `KiProcessorBlock` array
@@ -409,13 +520,14 @@ pub fn push_process(pid: u64, cr3: u64, peb: u64, name: &[u8]) {
             return;
         }
         let e = &mut (*(&raw mut KdProcessEntries))[i];
-        *e = Eprocess::zero();
-        e.unique_process_id = pid;
-        e.directory_table_base = cr3;
-        e.peb = peb;
+        *e = ProcessObject::zero();
+        e.body.dispatcher_type = PROCESS_OBJECT_TYPE;
+        e.body.unique_process_id = pid;
+        e.body.directory_table_base = cr3;
+        e.body.peb = peb;
         let n = name.len().min(IMAGE_NAME_LEN - 1);
         for (j, &b) in name.iter().take(n).enumerate() {
-            e.image_file_name[j] = b;
+            e.body.image_file_name[j] = b;
         }
         N_PROCS = i + 1;
     }
@@ -452,33 +564,67 @@ pub fn commit() {
             PsLoadedModuleList = ListEntry { flink: first, blink: last };
         }
 
+        // ---- Object-manager type wiring ----
+        // A single process `_OBJECT_TYPE`, published in the type-index table at
+        // PROCESS_TYPE_INDEX and pointed to by PsProcessType, is what every
+        // process object's header must decode to for `!process` to accept it.
+        let proc_type = addr(&raw const PsProcessTypeObject);
+        PsProcessType = proc_type;
+        ObTypeIndexTable[PROCESS_TYPE_INDEX as usize] = proc_type;
+        // Fill the process `_OBJECT_TYPE`: a `Name` UNICODE_STRING and the `Index`
+        // field the engine cross-checks against the object header's decoded index.
+        {
+            let ty = &mut *(&raw mut PsProcessTypeObject);
+            let name_va = addr(PsProcessTypeName.as_ptr());
+            let name_len: u16 = 7 * 2; // "Process", excluding the NUL
+            ty[OBJECT_TYPE_NAME_OFFSET..OBJECT_TYPE_NAME_OFFSET + 2]
+                .copy_from_slice(&name_len.to_le_bytes());
+            ty[OBJECT_TYPE_NAME_OFFSET + 2..OBJECT_TYPE_NAME_OFFSET + 4]
+                .copy_from_slice(&(name_len + 2).to_le_bytes());
+            ty[OBJECT_TYPE_NAME_OFFSET + 8..OBJECT_TYPE_NAME_OFFSET + 16]
+                .copy_from_slice(&name_va.to_le_bytes());
+            ty[OBJECT_TYPE_INDEX_OFFSET] = PROCESS_TYPE_INDEX;
+        }
+        let cookie = ObHeaderCookie;
+
         // ---- Active-process ring (via ActiveProcessLinks) ----
+        // Links, PsInitialSystemProcess, and the addresses `!process` reports all
+        // reference the `_EPROCESS` body; the `_OBJECT_HEADER` sits before it.
         let nprocs = N_PROCS;
         let phead = addr(&raw const PsActiveProcessHead);
         for i in 0..nprocs {
             let next = if i + 1 < nprocs {
-                addr(&raw const (*(&raw const KdProcessEntries))[i + 1].active_process_links)
+                addr(&raw const (*(&raw const KdProcessEntries))[i + 1].body.active_process_links)
             } else {
                 phead
             };
             let prev = if i == 0 {
                 phead
             } else {
-                addr(&raw const (*(&raw const KdProcessEntries))[i - 1].active_process_links)
+                addr(&raw const (*(&raw const KdProcessEntries))[i - 1].body.active_process_links)
             };
-            (*(&raw mut KdProcessEntries))[i].active_process_links =
-                ListEntry { flink: next, blink: prev };
+            let e = &mut (*(&raw mut KdProcessEntries))[i];
+            e.body.active_process_links = ListEntry { flink: next, blink: prev };
+            // Make the header decode to PROCESS_TYPE_INDEX:
+            //   index = TypeIndex ^ ((&header >> 8) & 0xff) ^ ObHeaderCookie
+            let hdr_va = addr(&raw const (*(&raw const KdProcessEntries))[i].object_header);
+            e.object_header.pointer_count = 1;
+            e.object_header.handle_count = 1;
+            e.object_header.type_index =
+                PROCESS_TYPE_INDEX ^ ((hdr_va >> 8) as u8) ^ cookie;
         }
         if nprocs == 0 {
             PsActiveProcessHead = ListEntry { flink: phead, blink: phead };
         } else {
-            let first = addr(&raw const (*(&raw const KdProcessEntries))[0].active_process_links);
-            let last =
-                addr(&raw const (*(&raw const KdProcessEntries))[nprocs - 1].active_process_links);
+            let first =
+                addr(&raw const (*(&raw const KdProcessEntries))[0].body.active_process_links);
+            let last = addr(
+                &raw const (*(&raw const KdProcessEntries))[nprocs - 1].body.active_process_links,
+            );
             PsActiveProcessHead = ListEntry { flink: first, blink: last };
             // Anchor the System/Idle process at our first EPROCESS so `!process`
             // (which reads PsInitialSystemProcess up front) doesn't hit a null.
-            let p0 = addr(&raw const (*(&raw const KdProcessEntries))[0]);
+            let p0 = addr(&raw const (*(&raw const KdProcessEntries))[0].body);
             PsInitialSystemProcess = p0;
             PsIdleProcess = p0;
         }
@@ -492,6 +638,9 @@ pub fn commit() {
         d.kern_base = KERN_BASE;
         d.ps_loaded_module_list = head;
         d.ps_active_process_head = phead;
+        // KDBG.MmUserProbeAddress holds the *address* of the nt!MmUserProbeAddress
+        // variable; `!process 0 0` dereferences it for the user/kernel boundary.
+        put_rest_u64(d, KDBG_OFF_MM_USER_PROBE, addr(&raw const MmUserProbeAddress));
     }
 }
 
@@ -533,7 +682,7 @@ pub fn set_processor_state(
         let kpcr_va = addr(&raw const KdKpcr);
         let prcb_va = addr(&raw const KdKpcr.prcb);
         let thread_va = addr(&raw const KdThread0);
-        let proc0 = addr(&raw const (*(&raw const KdProcessEntries))[0]);
+        let proc0 = addr(&raw const (*(&raw const KdProcessEntries))[0].body);
 
         // KPCR: GdtBase/IdtBase are what the engine reads to resolve segment
         // descriptors (the CS lookup that yields the flat PC); Self/CurrentPrcb

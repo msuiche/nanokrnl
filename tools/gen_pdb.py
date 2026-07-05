@@ -12,6 +12,7 @@ WinDbg against the ntoskrnl.exe module (see the printed hint) with `.reload /i`.
 
 Requires `llvm-pdbutil` (Homebrew llvm) and `nm` on PATH.
 """
+import hashlib
 import os
 import re
 import shutil
@@ -22,6 +23,48 @@ import zlib
 
 KERNEL_VIRT_BASE = 0xFFFF_8000_0000_0000
 
+
+def compute_pdb_guid(kernel_bytes):
+    """A per-build PDB GUID derived from the kernel image plus the type records.
+    dbghelp caches parsed PDBs by GUID/age, so a fixed GUID makes WinDbg serve
+    stale types after the PDB changes (it thinks it already has this PDB). Deriving
+    the GUID from the content means it changes exactly when the kernel or the type
+    definitions change - forcing a fresh load - and stays stable otherwise."""
+    return hashlib.sha256(kernel_bytes + TPI_RECORDS.encode()).digest()[:16]
+
+
+def guid_string(g):
+    """Format 16 raw RSDS GUID bytes as a canonical `{...}` string. Wire order:
+    Data1 (LE u32), Data2/Data3 (LE u16), Data4 (8 bytes as-is)."""
+    return (
+        "{{{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-"
+        "{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}"
+    ).format(g[3], g[2], g[1], g[0], g[5], g[4], g[7], g[6], g[8], g[9],
+             g[10], g[11], g[12], g[13], g[14], g[15])
+
+
+def patch_dump_guid(dump_path, guid):
+    """Rewrite the RSDS GUID in a MEMORY.DMP's masquerade PE so it matches the PDB
+    we just wrote. The kernel stamped its (fixed) compile-time GUID into the dump;
+    overwrite the copy that precedes the `ntoskrnl.pdb` name. Returns the count
+    patched (0 if the dump isn't present)."""
+    if not os.path.exists(dump_path):
+        return 0
+    d = bytearray(open(dump_path, "rb").read())
+    n, i = 0, 0
+    while True:
+        i = d.find(b"RSDS", i)
+        if i < 0:
+            break
+        name = i + 4 + 16 + 4  # after RSDS + GUID(16) + Age(4)
+        if d[name:name + 13] == b"ntoskrnl.pdb\x00":
+            d[i + 4:i + 20] = guid
+            n += 1
+        i += 4
+    if n:
+        open(dump_path, "wb").write(d)
+    return n
+
 # CodeView type records for the NT structures nanokrnl lays out (see kernel
 # src/kd.rs), so `dt`, `lm`, and `!process` decode them by name. Type indices are
 # assigned sequentially from 0x1000 in record order; base types are CodeView
@@ -29,10 +72,17 @@ KERNEL_VIRT_BASE = 0xFFFF_8000_0000_0000
 # 0x0020 unsigned char). Offsets/sizes are exactly kernel/src/kd.rs's #[repr(C)]
 # layouts - these describe *our* compact structs, not a real Windows build's.
 #   0x1001 _LIST_ENTRY   0x1003 _UNICODE_STRING   0x1004 char[16]
-#   0x1006 _KPROCESS     0x1008 _EPROCESS         0x100a _KLDR_DATA_TABLE_ENTRY
-# _EPROCESS carries a Pcb (_KPROCESS) at offset 0 so `!process` can read
-# DirBase via _EPROCESS.Pcb.DirectoryTableBase (its genuine navigation path);
-# Pcb overlaps the compact fields, which CodeView permits.
+#   0x1006 _DISPATCHER_HEADER (Type@0)   0x1008 _KPROCESS   0x100a _EPROCESS
+#   0x100c _KLDR_DATA_TABLE_ENTRY
+#   0x100e _OBJECT_HEADER (TypeIndex@0x18, Body@0x30) - `!object` reads it before
+#          the _EPROCESS to decode the object type and match nt!PsProcessType
+#   0x1010 _OBJECT_TYPE (Name@0x10, Index@0x28) - the process type object; its
+#          Index must match the header's decoded TypeIndex
+# _EPROCESS carries a Pcb (_KPROCESS) at offset 0 whose _DISPATCHER_HEADER.Type is
+# ProcessObject(3) - `!process` validates that (a separate check from the object
+# header) and reads DirBase via _EPROCESS.Pcb.DirectoryTableBase. Pcb overlaps the
+# compact fields, which CodeView permits; UniqueProcessId sits at 0x38 so it does
+# not collide with the dispatcher Type byte at offset 0.
 TPI_RECORDS = """\
 TpiStream:
   Version: VC80
@@ -54,19 +104,25 @@ TpiStream:
       Array: { ElementType: 0x0020, IndexType: 0x0077, Size: 16, Name: '' }
     - Kind: LF_FIELDLIST
       FieldList:
-        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0077, FieldOffset: 24, Name: 'DirectoryTableBase' } }
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0020, FieldOffset: 0, Name: 'Type' } }
     - Kind: LF_STRUCTURE
-      Class: { MemberCount: 1, Options: [ None ], FieldList: 0x1005, Name: '_KPROCESS', UniqueName: '', DerivationList: 0, VTableShape: 0, Size: 32 }
+      Class: { MemberCount: 1, Options: [ None ], FieldList: 0x1005, Name: '_DISPATCHER_HEADER', UniqueName: '', DerivationList: 0, VTableShape: 0, Size: 24 }
     - Kind: LF_FIELDLIST
       FieldList:
-        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x1006, FieldOffset: 0, Name: 'Pcb' } }
-        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0077, FieldOffset: 0, Name: 'UniqueProcessId' } }
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x1006, FieldOffset: 0, Name: 'Header' } }
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0077, FieldOffset: 24, Name: 'DirectoryTableBase' } }
+    - Kind: LF_STRUCTURE
+      Class: { MemberCount: 2, Options: [ None ], FieldList: 0x1007, Name: '_KPROCESS', UniqueName: '', DerivationList: 0, VTableShape: 0, Size: 32 }
+    - Kind: LF_FIELDLIST
+      FieldList:
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x1008, FieldOffset: 0, Name: 'Pcb' } }
         - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x1001, FieldOffset: 8, Name: 'ActiveProcessLinks' } }
         - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0077, FieldOffset: 24, Name: 'DirectoryTableBase' } }
         - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0077, FieldOffset: 32, Name: 'Peb' } }
         - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x1004, FieldOffset: 40, Name: 'ImageFileName' } }
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0077, FieldOffset: 56, Name: 'UniqueProcessId' } }
     - Kind: LF_STRUCTURE
-      Class: { MemberCount: 6, Options: [ None ], FieldList: 0x1007, Name: '_EPROCESS', UniqueName: '', DerivationList: 0, VTableShape: 0, Size: 56 }
+      Class: { MemberCount: 6, Options: [ None ], FieldList: 0x1009, Name: '_EPROCESS', UniqueName: '', DerivationList: 0, VTableShape: 0, Size: 64 }
     - Kind: LF_FIELDLIST
       FieldList:
         - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x1001, FieldOffset: 0, Name: 'InLoadOrderLinks' } }
@@ -76,11 +132,27 @@ TpiStream:
         - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x1003, FieldOffset: 72, Name: 'FullDllName' } }
         - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x1003, FieldOffset: 88, Name: 'BaseDllName' } }
     - Kind: LF_STRUCTURE
-      Class: { MemberCount: 6, Options: [ None ], FieldList: 0x1009, Name: '_KLDR_DATA_TABLE_ENTRY', UniqueName: '', DerivationList: 0, VTableShape: 0, Size: 176 }\
+      Class: { MemberCount: 6, Options: [ None ], FieldList: 0x100b, Name: '_KLDR_DATA_TABLE_ENTRY', UniqueName: '', DerivationList: 0, VTableShape: 0, Size: 176 }
+    - Kind: LF_FIELDLIST
+      FieldList:
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0077, FieldOffset: 0, Name: 'PointerCount' } }
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0077, FieldOffset: 8, Name: 'HandleCount' } }
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0020, FieldOffset: 24, Name: 'TypeIndex' } }
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0020, FieldOffset: 26, Name: 'InfoMask' } }
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0020, FieldOffset: 27, Name: 'Flags' } }
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0077, FieldOffset: 48, Name: 'Body' } }
+    - Kind: LF_STRUCTURE
+      Class: { MemberCount: 6, Options: [ None ], FieldList: 0x100d, Name: '_OBJECT_HEADER', UniqueName: '', DerivationList: 0, VTableShape: 0, Size: 56 }
+    - Kind: LF_FIELDLIST
+      FieldList:
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x1003, FieldOffset: 16, Name: 'Name' } }
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0020, FieldOffset: 40, Name: 'Index' } }
+    - Kind: LF_STRUCTURE
+      Class: { MemberCount: 2, Options: [ None ], FieldList: 0x100f, Name: '_OBJECT_TYPE', UniqueName: '', DerivationList: 0, VTableShape: 0, Size: 256 }\
 """
 
 
-def write_pe_stub(path):
+def write_pe_stub(path, guid):
     """Write a minimal ntoskrnl.exe PE stub whose headers + RSDS debug directory
     match the masquerade header nanokrnl overlays into MEMORY.DMP (same GUID, age,
     TimeDateStamp=0, SizeOfImage=0x400000). WinDbg reads the crash's memory header
@@ -139,9 +211,7 @@ def write_pe_stub(path):
     # RSDS at RVA 0x1020 -> file 0x420.
     rs = 0x420
     p[rs:rs + 4] = b"RSDS"
-    p[rs + 4:rs + 20] = bytes(
-        [0x67, 0x45, 0x23, 0x01, 0xAB, 0x89, 0xEF, 0xCD, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]
-    )
+    p[rs + 4:rs + 20] = bytes(guid)
     w32(rs + 20, 1)  # Age
     p[rs + 24:rs + 24 + 13] = b"ntoskrnl.pdb\x00"
     with open(path, "wb") as f:
@@ -383,6 +453,15 @@ def main():
         i = args.index("-o")
         out_pdb = args[i + 1]
         del args[i : i + 2]
+    # Dump(s) whose masquerade-PE RSDS GUID we sync to this PDB. Defaults to
+    # /tmp/MEMORY.DMP (the local emulator's output) when present.
+    dumps = []
+    while "--dump" in args:
+        i = args.index("--dump")
+        dumps.append(args[i + 1])
+        del args[i : i + 2]
+    if not dumps and os.path.exists("/tmp/MEMORY.DMP"):
+        dumps.append("/tmp/MEMORY.DMP")
     kernel = args[0] if args else "target/x86_64-unknown-none/debug/kernel"
     if not os.path.exists(kernel):
         sys.exit(f"kernel not found: {kernel}")
@@ -396,6 +475,9 @@ def main():
     if not syms:
         sys.exit("no symbols found in kernel ELF")
 
+    guid = compute_pdb_guid(open(kernel, "rb").read())
+    guid_str = guid_string(guid)
+
     yaml = [
         "MSF:",
         "  SuperBlock:",
@@ -407,7 +489,7 @@ def main():
         "    BlockMapAddr: 3",
         "PdbStream:",
         "  Age: 1",
-        "  Guid: '{01234567-89AB-CDEF-0123-456789ABCDEF}'",
+        f"  Guid: '{guid_str}'",
         "  Signature: 0",
         "  Features: [ VC140 ]",
         "  Version: VC70",
@@ -462,10 +544,17 @@ def main():
     # so it needs this alongside the PDB (matching the masquerade header in the
     # dump). Written next to the PDB, named ntoskrnl.exe.
     exe_path = os.path.join(os.path.dirname(out_pdb) or ".", "ntoskrnl.exe")
-    write_pe_stub(exe_path)
+    write_pe_stub(exe_path, guid)
+
+    # Sync each dump's masquerade-PE RSDS GUID to this PDB so WinDbg pairs them
+    # (and can't reuse a stale cached PDB of the same identity).
+    for dp in dumps:
+        n = patch_dump_guid(dp, guid)
+        print(f"patched {dp}: {n} RSDS GUID(s) -> {guid_str}")
 
     print(f"wrote {out_pdb}: {n_pub} public symbols (of {len(syms)} defined), {n_types} TPI type hashes")
     print(f"wrote {exe_path}: ntoskrnl.exe PE stub (RSDS -> ntoskrnl.pdb)")
+    print(f"PDB GUID (per-build): {guid_str}")
     print("WinDbg: put BOTH on a local path (e.g. C:\\sym), then in the dump:")
     print("  .exepath+ C:\\sym ; .sympath+ C:\\sym ; .reload /f")
     print("  (symbols resolve as KERNEL_VIRT_BASE + RVA; the kernel links at 0)")

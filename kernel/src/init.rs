@@ -410,7 +410,10 @@ pub fn kd_snapshot() {
             continue;
         }
         let cr3 = unsafe { (*(e.ethread as *const ps::Ethread)).tcb.cr3 };
-        kd::push_process(pid, cr3, 0, exe_basename(&e.cmdline[..e.cmdline_len]));
+        // The PE loader maps a real PEB at a fixed user VA in every process's
+        // address space (chained to the loader module list); report it so
+        // `!process`/`!peb` and user-symbol loading see a valid PEB, not NULL.
+        kd::push_process(pid, cr3, crate::ldr::pe::PEB_BASE, exe_basename(&e.cmdline[..e.cmdline_len]));
         pid += 4;
     }
     drop(tbl);

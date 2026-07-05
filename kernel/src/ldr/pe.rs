@@ -224,7 +224,7 @@ const USER_STACK_PAGES: usize = 64; // 256 KiB
 ///   (with its UNICODE_STRING buffers), the loader module list, a TLS array,
 ///   and an environment block.
 const TEB_BASE: u64 = 0x0000_7FFF_FFE0_0000;
-const PEB_BASE: u64 = TEB_BASE + 0x2000;
+pub const PEB_BASE: u64 = TEB_BASE + 0x2000;
 const PARAMS_BASE: u64 = TEB_BASE + 0x3000;
 const LDR_BASE: u64 = TEB_BASE + 0x4000;
 const TLS_BASE: u64 = TEB_BASE + 0x5000;
