@@ -416,9 +416,38 @@ pub static mut MmUserProbeAddress: u64 = 0x0000_7FFF_FFFF_0000;
 /// Offset of `MmUserProbeAddress` in `_KDDEBUGGER_DATA64` (holds &MmUserProbeAddress).
 const KDBG_OFF_MM_USER_PROBE: usize = 0x1d8;
 
-/// Offsets into `_OBJECT_TYPE` (amd64) that `!process` reads.
+/// Offsets into `_OBJECT_TYPE` (amd64). `TypeList` (@0) links all object types;
+/// `!process <pid>` / object commands walk it from `nt!ObpTypeObjectType`.
+const OBJECT_TYPE_TYPELIST_OFFSET: usize = 0x00;
 const OBJECT_TYPE_NAME_OFFSET: usize = 0x10;
 const OBJECT_TYPE_INDEX_OFFSET: usize = 0x28;
+
+/// `nt!ObpTypeObjectType` - the "Type" object type (the type-of-types). To resolve
+/// the process type by name (e.g. `!process 4 0`, object commands), the engine
+/// reads `*ObpTypeObjectType` and walks the `_OBJECT_TYPE.TypeList` ring comparing
+/// each type's `Name`; we link the process type in so "Process" is found.
+#[no_mangle]
+static mut ObpTypeObjectTypeObject: [u8; 0x100] = [0; 0x100];
+/// UTF-16 `"Type"` for `ObpTypeObjectTypeObject.Name`.
+static mut ObpTypeTypeName: [u16; 5] =
+    [b'T' as u16, b'y' as u16, b'p' as u16, b'e' as u16, 0];
+/// `POBJECT_TYPE` -> the "Type" object type; the engine dereferences this.
+#[no_mangle]
+pub static mut ObpTypeObjectType: u64 = 0;
+const TYPE_OBJECT_TYPE_INDEX: u8 = 2;
+/// Offset of `ObpTypeObjectType` in `_KDDEBUGGER_DATA64` (holds &ObpTypeObjectType).
+const KDBG_OFF_OBP_TYPE_OBJECT_TYPE: usize = 0xa0;
+
+/// Fill an `_OBJECT_TYPE` blob's `Name` (@0x10) + `Index` (@0x28).
+unsafe fn fill_object_type(ty: &mut [u8], name_va: u64, name_chars: u16, index: u8) {
+    let bytes = name_chars * 2;
+    ty[OBJECT_TYPE_NAME_OFFSET..OBJECT_TYPE_NAME_OFFSET + 2].copy_from_slice(&bytes.to_le_bytes());
+    ty[OBJECT_TYPE_NAME_OFFSET + 2..OBJECT_TYPE_NAME_OFFSET + 4]
+        .copy_from_slice(&(bytes + 2).to_le_bytes());
+    ty[OBJECT_TYPE_NAME_OFFSET + 8..OBJECT_TYPE_NAME_OFFSET + 16]
+        .copy_from_slice(&name_va.to_le_bytes());
+    ty[OBJECT_TYPE_INDEX_OFFSET] = index;
+}
 
 const MAX_MODULES: usize = 16;
 const MAX_PROCS: usize = 16;
@@ -571,19 +600,34 @@ pub fn commit() {
         let proc_type = addr(&raw const PsProcessTypeObject);
         PsProcessType = proc_type;
         ObTypeIndexTable[PROCESS_TYPE_INDEX as usize] = proc_type;
-        // Fill the process `_OBJECT_TYPE`: a `Name` UNICODE_STRING and the `Index`
-        // field the engine cross-checks against the object header's decoded index.
+        // Fill the process + "Type" `_OBJECT_TYPE`s (Name cross-checked against the
+        // object header's decoded index; the engine also resolves types by name).
+        let type_type = addr(&raw const ObpTypeObjectTypeObject);
+        ObpTypeObjectType = type_type;
+        fill_object_type(
+            &mut *(&raw mut PsProcessTypeObject),
+            addr(PsProcessTypeName.as_ptr()),
+            7, // "Process"
+            PROCESS_TYPE_INDEX,
+        );
+        fill_object_type(
+            &mut *(&raw mut ObpTypeObjectTypeObject),
+            addr(ObpTypeTypeName.as_ptr()),
+            4, // "Type"
+            TYPE_OBJECT_TYPE_INDEX,
+        );
+        // Link the two `_OBJECT_TYPE`s into a `TypeList` ring (TypeList @ offset 0),
+        // so walking from `ObpTypeObjectType` reaches the process type by name.
+        let tl = OBJECT_TYPE_TYPELIST_OFFSET;
         {
-            let ty = &mut *(&raw mut PsProcessTypeObject);
-            let name_va = addr(PsProcessTypeName.as_ptr());
-            let name_len: u16 = 7 * 2; // "Process", excluding the NUL
-            ty[OBJECT_TYPE_NAME_OFFSET..OBJECT_TYPE_NAME_OFFSET + 2]
-                .copy_from_slice(&name_len.to_le_bytes());
-            ty[OBJECT_TYPE_NAME_OFFSET + 2..OBJECT_TYPE_NAME_OFFSET + 4]
-                .copy_from_slice(&(name_len + 2).to_le_bytes());
-            ty[OBJECT_TYPE_NAME_OFFSET + 8..OBJECT_TYPE_NAME_OFFSET + 16]
-                .copy_from_slice(&name_va.to_le_bytes());
-            ty[OBJECT_TYPE_INDEX_OFFSET] = PROCESS_TYPE_INDEX;
+            let t = &mut *(&raw mut ObpTypeObjectTypeObject);
+            t[tl..tl + 8].copy_from_slice(&proc_type.to_le_bytes()); // Flink -> Process
+            t[tl + 8..tl + 16].copy_from_slice(&proc_type.to_le_bytes()); // Blink
+        }
+        {
+            let p = &mut *(&raw mut PsProcessTypeObject);
+            p[tl..tl + 8].copy_from_slice(&type_type.to_le_bytes()); // Flink -> Type
+            p[tl + 8..tl + 16].copy_from_slice(&type_type.to_le_bytes()); // Blink
         }
         let cookie = ObHeaderCookie;
 
@@ -641,6 +685,9 @@ pub fn commit() {
         // KDBG.MmUserProbeAddress holds the *address* of the nt!MmUserProbeAddress
         // variable; `!process 0 0` dereferences it for the user/kernel boundary.
         put_rest_u64(d, KDBG_OFF_MM_USER_PROBE, addr(&raw const MmUserProbeAddress));
+        // KDBG.ObpTypeObjectType holds the *address* of the nt!ObpTypeObjectType
+        // pointer; object commands deref it to reach the "Type" object type.
+        put_rest_u64(d, KDBG_OFF_OBP_TYPE_OBJECT_TYPE, addr(&raw const ObpTypeObjectType));
     }
 }
 

@@ -145,10 +145,11 @@ TpiStream:
       Class: { MemberCount: 6, Options: [ None ], FieldList: 0x100d, Name: '_OBJECT_HEADER', UniqueName: '', DerivationList: 0, VTableShape: 0, Size: 56 }
     - Kind: LF_FIELDLIST
       FieldList:
+        - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x1001, FieldOffset: 0, Name: 'TypeList' } }
         - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x1003, FieldOffset: 16, Name: 'Name' } }
         - { Kind: LF_MEMBER, DataMember: { Attrs: 3, Type: 0x0020, FieldOffset: 40, Name: 'Index' } }
     - Kind: LF_STRUCTURE
-      Class: { MemberCount: 2, Options: [ None ], FieldList: 0x100f, Name: '_OBJECT_TYPE', UniqueName: '', DerivationList: 0, VTableShape: 0, Size: 256 }\
+      Class: { MemberCount: 3, Options: [ None ], FieldList: 0x100f, Name: '_OBJECT_TYPE', UniqueName: '', DerivationList: 0, VTableShape: 0, Size: 256 }\
 """
 
 
