@@ -396,11 +396,12 @@ pub fn kd_snapshot() {
     // RVA 0x313000 (past .text into .data/.bss), so a too-small size would leave
     // globals like PsLoadedModuleList outside the module range in `lm`.
     kd::push_module(kd::KERNEL_VIRT_BASE, 0x0040_0000, b"ntoskrnl.exe");
-    // The user-mode modules the debug tracker knows about (kernel32/msvcrt/… and
-    // the running program image).
-    crate::ke::debug::for_each_module(|name, base, size| {
-        kd::push_module(base, size, name.as_bytes());
-    });
+    // PsLoadedModuleList is the KERNEL module list (ntoskrnl + drivers). The
+    // user-mode images the debug tracker knows about (cmd.exe/ntdll/kernel32/
+    // msvcrt) are per-process user modules, not kernel modules - listing them
+    // here (some at user VAs like 0x140000000) corrupts the debugger's
+    // kernel/user address model. nanokrnl has no drivers yet, so the kernel
+    // module list is just ntoskrnl.exe.
     // Active processes, from the process table.
     let tbl = PROC_TABLE.lock();
     let mut pid = 4u64;
