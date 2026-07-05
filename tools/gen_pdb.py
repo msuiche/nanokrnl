@@ -299,6 +299,78 @@ def patch_tpi_hash(pdb_path):
     return len(hashes)
 
 
+def patch_section_headers(pdb_path):
+    """Inject a DBG_SECTION_HDR stream so public symbols resolve by name.
+
+    A public's address is SectionHeader[Segment-1].VirtualAddress + Offset;
+    llvm-pdbutil writes no section-headers stream, so WinDbg can't map our
+    publics (Segment 1, Offset=RVA) to addresses and drops them all from name
+    resolution. Append a stream with one IMAGE_SECTION_HEADER at VirtualAddress 0
+    spanning the image (so RVA = 0 + Offset = the true RVA), and point the DBI
+    Optional Debug Header's SectionHdr slot at it."""
+    d = bytearray(open(pdb_path, "rb").read())
+    bs = struct.unpack_from("<I", d, 0x20)[0]
+    num_blocks = struct.unpack_from("<I", d, 0x28)[0]
+    ndir = struct.unpack_from("<I", d, 0x2c)[0]
+    blockmap = struct.unpack_from("<I", d, 0x34)[0]
+    ndir_blocks = (ndir + bs - 1) // bs
+    dir_blk = list(struct.unpack_from(f"<{ndir_blocks}I", d, blockmap * bs))
+    dirb = b"".join(bytes(d[b * bs:b * bs + bs]) for b in dir_blk)[:ndir]
+
+    off = 0
+    ns = struct.unpack_from("<I", dirb, off)[0]; off += 4
+    sizes = list(struct.unpack_from(f"<{ns}I", dirb, off)); off += 4 * ns
+    blocks = []
+    for s in sizes:
+        nb = 0 if s in (0, 0xFFFFFFFF) else (s + bs - 1) // bs
+        blocks.append(list(struct.unpack_from(f"<{nb}I", dirb, off))); off += 4 * nb
+
+    # One IMAGE_SECTION_HEADER (40 bytes): .text at VA 0 spanning SizeOfImage.
+    SIZE_OF_IMAGE = 0x0040_0000
+    sect = bytearray(40)
+    sect[0:8] = b".text\0\0\0"
+    struct.pack_into("<IIII", sect, 8, SIZE_OF_IMAGE, 0, SIZE_OF_IMAGE, 0)  # VSize, VAddr=0, RawSize, RawPtr
+    struct.pack_into("<I", sect, 36, 0x6000_0020)  # CODE|EXECUTE|READ
+
+    # Append the section-headers stream as a new block at end of file.
+    new_stream = ns
+    new_block = num_blocks
+    if len(sect) > bs:
+        sys.exit("section header stream exceeds one block")
+    if (new_block + 1) * bs > len(d):
+        d.extend(b"\0" * ((new_block + 1) * bs - len(d)))
+    d[new_block * bs:new_block * bs + len(sect)] = sect
+
+    # Rebuild the stream directory with the extra stream, and rewrite it in place
+    # (it still fits its one directory block). Update superblock NumBlocks/dir size.
+    sizes.append(len(sect))
+    blocks.append([new_block])
+    nd = bytearray(struct.pack("<I", ns + 1))
+    nd += b"".join(struct.pack("<I", s) for s in sizes)
+    for bl in blocks:
+        nd += b"".join(struct.pack("<I", b) for b in bl)
+    if len(nd) > ndir_blocks * bs:
+        sys.exit("stream directory would need another block; unhandled")
+    dbytes = bytearray(b"\0" * (ndir_blocks * bs))
+    dbytes[:len(nd)] = nd
+    for i, b in enumerate(dir_blk):
+        d[b * bs:b * bs + bs] = dbytes[i * bs:(i + 1) * bs]
+    struct.pack_into("<I", d, 0x2c, len(nd))          # NumDirectoryBytes
+    struct.pack_into("<I", d, 0x28, new_block + 1)     # NumBlocks
+
+    # DBI Optional Debug Header: set the SectionHdr slot (index 5) to the new
+    # stream. The dbg header is the last DBI substream (its offset = 64 + the
+    # preceding substream sizes); each entry is a uint16 stream index.
+    dbi_blk = blocks[3][0] * bs
+    (modinfo, seccontrib, secmap, srcinfo, typesrv) = struct.unpack_from("<iiiii", d, dbi_blk + 24)
+    ecsize = struct.unpack_from("<i", d, dbi_blk + 52)[0]
+    dbg_off = 64 + modinfo + seccontrib + secmap + srcinfo + typesrv + ecsize
+    struct.pack_into("<H", d, dbi_blk + dbg_off + 5 * 2, new_stream)  # DBG_SECTION_HDR = 5
+
+    open(pdb_path, "wb").write(d)
+    return new_stream
+
+
 def main():
     args = [a for a in sys.argv[1:]]
     out_pdb = "ntoskrnl.pdb"
@@ -364,6 +436,9 @@ def main():
     # yaml2pdb leaves the TPI HashValueBuffer empty; fill it so dbghelp can
     # resolve types by name (`dt nt!_EPROCESS`) instead of loading public-only.
     n_types = patch_tpi_hash(out_pdb)
+    # Add a section table so public symbols resolve by name (WinDbg maps a
+    # public's Segment:Offset through the section headers to an address).
+    patch_section_headers(out_pdb)
     # Sanity-count what actually landed.
     dump = subprocess.run([pdbutil, "dump", "-publics", out_pdb], capture_output=True, text=True).stdout
     n_pub = dump.count("S_PUB32")
