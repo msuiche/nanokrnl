@@ -357,6 +357,10 @@ def patch_section_headers(pdb_path):
         d[b * bs:b * bs + bs] = dbytes[i * bs:(i + 1) * bs]
     struct.pack_into("<I", d, 0x2c, len(nd))          # NumDirectoryBytes
     struct.pack_into("<I", d, 0x28, new_block + 1)     # NumBlocks
+    # Mark the appended block used in the active Free Page Map (bit set = free),
+    # or dbghelp intermittently fails to read the PDB ("file system error").
+    fpm = struct.unpack_from("<I", d, 0x24)[0]
+    d[fpm * bs + (new_block // 8)] &= ~(1 << (new_block % 8))
 
     # DBI Optional Debug Header: set the SectionHdr slot (index 5) to the new
     # stream. The dbg header is the last DBI substream (its offset = 64 + the
