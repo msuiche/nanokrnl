@@ -144,6 +144,10 @@ pub fn ki_system_startup(boot_info: &'static mut BootInfo) -> ! {
     // Record the boot address space; per-process address spaces clone its
     // (high-half) kernel mappings.
     mm::virt::mm_save_kernel_address_space();
+    // Map KUSER_SHARED_DATA into the kernel high half now, before any per-process
+    // address space is cloned, so every process (and the debugger's current
+    // context) sees it at 0xfffff78000000000.
+    crate::dump::map_kuser_shared_data();
 
     // Interrupt controllers: legacy PICs masked away, APIC + clock on.
     hal::pic::init_and_mask();

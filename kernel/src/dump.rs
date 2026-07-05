@@ -462,7 +462,7 @@ struct KuserSharedData([u8; 0x1000]);
 static mut KUSER_SHARED_DATA: KuserSharedData = KuserSharedData([0; 0x1000]);
 const KUSD_VA: u64 = 0xffff_f780_0000_0000;
 
-fn map_kuser_shared_data() {
+pub fn map_kuser_shared_data() {
     unsafe {
         let b = &mut (*(&raw mut KUSER_SHARED_DATA)).0;
         let p32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
@@ -480,12 +480,15 @@ fn map_kuser_shared_data() {
         p64(b, 0x3d8, 0x3); // EnabledFeatures (XSTATE_MASK_LEGACY: x87|SSE)
         p64(b, 0x3e0, 0x3); // EnabledVolatileFeatures
         p32(b, 0x3e8, 0x240); // Size of the legacy save area
-        // Map it into the crash address space (== dump DirectoryTableBase), so a
-        // debugger resolves 0xfffff78000000000 through the captured page tables.
+        // Map into the *kernel* address space's high half (PML4 entry 495, in the
+        // 256..512 range every per-process address space clones), so KUSER_SHARED_DATA
+        // is visible under whichever CR3 the debugger's current context uses - not
+        // just the crash process. Must be called at phase 0, before any per-process
+        // address space is created, so they inherit the shared entry.
         let va = &raw const KUSER_SHARED_DATA as u64;
         if let Some(phys) = crate::mm::virt::mm_get_physical_address(va) {
             crate::mm::virt::mm_map_user_range(
-                crate::mm::virt::mm_current_address_space(),
+                crate::mm::virt::mm_kernel_address_space(),
                 KUSD_VA,
                 phys,
                 1,
@@ -500,9 +503,6 @@ pub fn write_memory_dmp(bugcheck: u32, params: &[u64; 4], g: &Gpr) -> Option<u64
     // The KDBG structures must be current (write_core also refreshes them; doing
     // it again is idempotent).
     crate::init::kd_snapshot();
-    // Map/populate KUSER_SHARED_DATA before the physical window is streamed, so
-    // the page and the new page-table entries are captured in the dump.
-    map_kuser_shared_data();
 
     let mut h = alloc::vec![0u8; DMP_HEADER];
     let put32 = |h: &mut [u8], off: usize, v: u32| h[off..off + 4].copy_from_slice(&v.to_le_bytes());
