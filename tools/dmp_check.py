@@ -158,7 +158,7 @@ def main():
     ki = c.u64(c.kdbg + 0x218)
     size_prcb = c.u16(c.kdbg + 0x2b0)
     off_ctx = c.u16(c.kdbg + 0x2bc)
-    off_sr = c.u16(c.kdbg + 0x2ec)
+    off_sr = c.u16(c.kdbg + 0x2f2)
     print(f"  KiProcessorBlock={ki:#x} SizePrcb={size_prcb:#x} OffCtx={off_ctx:#x} OffSpecialReg={off_sr:#x}")
     if ki:
         prcb = c.u64(ki)
@@ -193,8 +193,8 @@ def main():
             print(f"  CurrentThread/Process NOT readable: {e}")
         # KPCR: what the engine reads GdtBase from for the CS-descriptor lookup
         # (KPCR = KiProcessorBlock[n] - OffsetPcrContainedPrcb; GdtBase @ KPCR+0).
-        off_contained = c.u16(c.kdbg + 0x2e0)  # OffsetPcrContainedPrcb
-        off_selfpcr = c.u16(c.kdbg + 0x2dc)     # OffsetPcrSelfPcr
+        off_contained = c.u16(c.kdbg + 0x2e6)  # OffsetPcrContainedPrcb
+        off_selfpcr = c.u16(c.kdbg + 0x2e2)     # OffsetPcrSelfPcr
         if off_contained:
             kpcr = prcb - off_contained
             kpcr_gdt = c.u64(kpcr + 0x00)

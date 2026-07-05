@@ -572,13 +572,15 @@ pub fn set_processor_state(
         put_rest_u16(d, 0x2b0, core::mem::size_of::<Kprcb>() as u16); // SizePrcb
         put_rest_u16(d, 0x2b4, PRCB_CURRENT_THREAD as u16); // OffsetPrcbCurrentThread
         put_rest_u16(d, 0x2bc, (PRCB_PROCESSOR_STATE + core::mem::size_of::<KspecialRegisters>()) as u16); // OffsetPrcbProcStateContext
-        put_rest_u16(d, 0x2ec, PRCB_PROCESSOR_STATE as u16); // OffsetPrcbProcStateSpecialReg
+        put_rest_u16(d, 0x2f2, PRCB_PROCESSOR_STATE as u16); // OffsetPrcbProcStateSpecialReg
         // KPCR shape so the engine locates the GDT/IDT for descriptor lookups
-        // (KPCR = KiProcessorBlock[n] - OffsetPcrContainedPrcb).
-        put_rest_u16(d, 0x2da, core::mem::size_of::<Kpcr>() as u16); // SizePcr
-        put_rest_u16(d, 0x2dc, 0x18); // OffsetPcrSelfPcr
-        put_rest_u16(d, 0x2de, 0x20); // OffsetPcrCurrentPrcb
-        put_rest_u16(d, 0x2e0, KPCR_PRCB_OFFSET as u16); // OffsetPcrContainedPrcb
+        // (KPCR = KiProcessorBlock[n] - OffsetPcrContainedPrcb). NOTE: an 8-byte
+        // alignment pad after SizeEThread (0x2c0) shifts every field from here on
+        // by +6 vs a naively packed layout - these are the true offsets.
+        put_rest_u16(d, 0x2e0, core::mem::size_of::<Kpcr>() as u16); // SizePcr
+        put_rest_u16(d, 0x2e2, 0x18); // OffsetPcrSelfPcr
+        put_rest_u16(d, 0x2e4, 0x20); // OffsetPcrCurrentPrcb
+        put_rest_u16(d, 0x2e6, KPCR_PRCB_OFFSET as u16); // OffsetPcrContainedPrcb
         // Thread/process shape so !process can walk from the current thread and
         // decode each EPROCESS (matches our compact _EPROCESS layout).
         put_rest_u16(d, 0x2a0, KTHREAD_APC_PROCESS as u16); // OffsetKThreadApcProcess
