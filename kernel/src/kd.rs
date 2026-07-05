@@ -300,6 +300,15 @@ pub static mut PsLoadedModuleList: ListEntry = ListEntry::zero();
 #[no_mangle]
 pub static mut PsActiveProcessHead: ListEntry = ListEntry::zero();
 
+/// `PsInitialSystemProcess` / `PsIdleProcess` — `PEPROCESS` pointers the engine
+/// reads to anchor the System/Idle process. `!process` dereferences
+/// `PsInitialSystemProcess` before walking the list; unresolved it reads as 0
+/// ("Error reading _EPROCESS at 0"), so point both at our first process.
+#[no_mangle]
+pub static mut PsInitialSystemProcess: u64 = 0;
+#[no_mangle]
+pub static mut PsIdleProcess: u64 = 0;
+
 const MAX_MODULES: usize = 16;
 const MAX_PROCS: usize = 16;
 
@@ -467,6 +476,11 @@ pub fn commit() {
             let last =
                 addr(&raw const (*(&raw const KdProcessEntries))[nprocs - 1].active_process_links);
             PsActiveProcessHead = ListEntry { flink: first, blink: last };
+            // Anchor the System/Idle process at our first EPROCESS so `!process`
+            // (which reads PsInitialSystemProcess up front) doesn't hit a null.
+            let p0 = addr(&raw const (*(&raw const KdProcessEntries))[0]);
+            PsInitialSystemProcess = p0;
+            PsIdleProcess = p0;
         }
 
         // ---- Debugger data block ----
