@@ -212,7 +212,16 @@ oracles (`conformance` against iced-x86, `diff_unicorn` against Unicorn).
 
 ## Write-ups & specs
 
-- **Fable 5 — building a Windows kernel in Rust, Part I**:
+- **A Windows Kernel in a Browser Tab, Part I: Cold Boot, Fast Boot, and Four
+  Megabytes**: https://www.msuiche.com/posts/nanokrnl-cold-boot-fast-boot/
+- **Part II: A Filesystem Over 9P, From a JavaScript Object**:
+  https://www.msuiche.com/posts/nanokrnl-9p-host-filesystem/
+- **Running Unmodified Microsoft Console Tools**:
+  https://www.msuiche.com/posts/nanokrnl-windows-console-tools/
+- **Part III: Debugging It, and the Crash Dumps It Writes Itself** (lldb, the ELF
+  core, and the native MEMORY.DMP WinDbg opens):
+  https://www.msuiche.com/posts/nanokrnl-debugging-crash-dump/
+- **Fable 5: building a Windows kernel in Rust, Part I**:
   https://www.msuiche.com/posts/fable-5-windows-kernel/
 - **Part II**:
   https://www.msuiche.com/posts/fable-5-windows-kernel-part-2/

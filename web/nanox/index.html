@@ -335,7 +335,7 @@
       <button id="restart" disabled>Restart</button>
       <button id="shutdown" disabled>Shut Down</button>
       <button id="debug" disabled title="Attach lldb/gdb via tools/gdb-bridge.py">Debug</button>
-      <button id="bsod-dump" style="display:none" title="Save the ELF core nanokrnl wrote to H:\ (open with gdb kernel.bin nanokrnl.core)">Download nanokrnl.core</button>
+      <button id="bsod-dump" style="display:none" title="Save the Windows crash dump nanokrnl wrote to H:\ (open MEMORY.DMP in WinDbg)">Download MEMORY.DMP</button>
       <span class="hint" id="bootHint">Boot runs the real cold boot; Fast Boot resumes a saved snapshot instantly.</span>
     </div>
     <div class="statusbar">
@@ -402,7 +402,8 @@
 </div>
 
 <!-- A tiny Explorer view of the H:\ share (the 9P host filesystem). Lists the
-     files the browser serves, plus nanokrnl.core once a crash writes one. -->
+     files the browser serves, plus MEMORY.DMP (and nanokrnl.core) once a crash
+     writes them. -->
 <div id="explorer">
   <div class="rm-title" id="ex-drag">Explorer: H:\<span class="x" id="ex-close" title="Close">&times;</span></div>
   <div class="ex-body">
@@ -743,14 +744,14 @@ const p9 = new P9Server({
     "Hello from the host filesystem. These bytes crossed the 9P wire from\r\n" +
     "JavaScript into the emulated kernel and back out to your console.\r\n",
 });
-// When nanokrnl writes a file to H:\ (a crash writes nanokrnl.core), the server
-// hands us the bytes here - the page only transports/serves them, it never
-// builds the dump itself.
+// When nanokrnl writes a file to H:\ (a crash writes MEMORY.DMP and nanokrnl.core),
+// the server hands us the bytes here - the page only transports/serves them, it
+// never builds the dump itself.
 p9.onFinalize = (name, bytes) => {
-  if (name === "nanokrnl.core") {
+  if (name === "MEMORY.DMP") {
     dumpBytes = bytes.slice();          // copy out of the server's growable buffer
     btnDump.style.display = "";
-    if (bsod) setStatus("stop", `bugcheck · ${(dumpBytes.length / 1048576).toFixed(0)} MB core on H:\\`);
+    if (bsod) setStatus("stop", `bugcheck · ${(dumpBytes.length / 1048576).toFixed(0)} MB dump on H:\\`);
   } else {
     p9.files[name] = bytes.slice();     // small host-written files show up in H:\
   }
@@ -758,7 +759,7 @@ p9.onFinalize = (name, bytes) => {
 };
 
 let e = null, running = false, raf = 0;
-let dumpBytes = null;   // the ELF core nanokrnl wrote to H:\ (received via p9.onFinalize)
+let dumpBytes = null;   // the Windows crash dump (MEMORY.DMP) nanokrnl wrote to H:\ (received via p9.onFinalize)
 // GDB remote debugging: bytes flow page <-> ws bridge <-> lldb/gdb. `gdbIn`
 // buffers debugger bytes for the run loop to feed into the wasm stub.
 let gdbAttached = false, gdbWs = null;
@@ -845,13 +846,14 @@ document.getElementById("readme-close").onclick = () => document.getElementById(
 dragWindow(document.getElementById("readme"), document.getElementById("readme-drag"));
 
 // H:\ Explorer: a live view of the 9P host share. Lists the files the page
-// serves, plus nanokrnl.core once a crash writes one. Click a row to download.
+// serves, plus MEMORY.DMP (and nanokrnl.core) once a crash writes them. Click a
+// row to download.
 function renderExplorer() {
   const ul = document.getElementById("ex-list");
   if (!ul) return;
   ul.innerHTML = "";
   const rows = Object.entries(p9.files).map(([n, d]) => [n, d]);
-  if (dumpBytes) rows.push(["nanokrnl.core", dumpBytes]);
+  if (dumpBytes) rows.push(["MEMORY.DMP", dumpBytes]);
   // The kernel image (ELF + DWARF) is the symbol file for the core:
   //   gdb kernel.bin nanokrnl.core
   // It is already fetched to boot the machine, so offer it here too.
@@ -941,10 +943,10 @@ function drainUart() {
     if (!bsodStopped && term.includes("*** STOP:")) {
       bsodStopped = true;
       const name = (term.match(/\*\*\* ([A-Z0-9_]+)\s*$/m) || [])[1];
-      // nanokrnl wrote the core to H:\ over 9P before printing STOP; the button
+      // nanokrnl wrote the dump to H:\ over 9P before printing STOP; the button
       // appears once the server handed us the bytes.
       btnDump.style.display = dumpBytes ? "" : "none";
-      setStatus("stop", "bugcheck" + (name ? " · " + name : "") + (dumpBytes ? " · core on H:\\" : ""));
+      setStatus("stop", "bugcheck" + (name ? " · " + name : "") + (dumpBytes ? " · dump on H:\\" : ""));
       running = false; refreshButtons();
     }
   }
@@ -1152,7 +1154,7 @@ btnDebug.onclick = toggleDebug;
 btnDump.onclick = () => {
   if (!dumpBytes) return;
   const url = URL.createObjectURL(new Blob([dumpBytes], { type: "application/octet-stream" }));
-  const a = document.createElement("a"); a.href = url; a.download = "nanokrnl.core"; a.click();
+  const a = document.createElement("a"); a.href = url; a.download = "MEMORY.DMP"; a.click();
   setTimeout(() => URL.revokeObjectURL(url), 10000);
 };
 btnShutdown.onclick = () => { stop(); if (gdbWs) gdbWs.close(); setStatus("stop", "halted by user"); refreshButtons(); term += "\n[machine powered off]\n"; render(); };
