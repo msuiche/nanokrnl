@@ -23,6 +23,17 @@ import zlib
 
 KERNEL_VIRT_BASE = 0xFFFF_8000_0000_0000
 
+# The fixed compile-time RSDS GUID the kernel stamps into every MEMORY.DMP
+# (kernel/src/dump.rs `RSDS_GUID`, {01234567-89AB-CDEF-0123-456789ABCDEF}). A
+# dump produced live in the browser is never post-processed by patch_dump_guid,
+# so a PDB served alongside it must carry THIS identity, not a per-build one.
+# `--fixed-guid` emits the PDB/exe with it (and skips patching any local dump).
+# Wire order: Data1 (LE u32), Data2/Data3 (LE u16), Data4 (8 bytes as-is).
+DUMP_RSDS_GUID = bytes([
+    0x67, 0x45, 0x23, 0x01, 0xAB, 0x89, 0xEF, 0xCD,
+    0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+])
+
 
 def compute_pdb_guid(kernel_bytes):
     """A per-build PDB GUID derived from the kernel image plus the type records.
@@ -469,14 +480,21 @@ def main():
         i = args.index("-o")
         out_pdb = args[i + 1]
         del args[i : i + 2]
+    # --fixed-guid: stamp the PDB/exe with the kernel's compile-time RSDS GUID
+    # instead of a per-build content hash, so they pair with any live-produced
+    # dump (the browser demo, which never runs patch_dump_guid). Skips patching.
+    fixed_guid = "--fixed-guid" in args
+    if fixed_guid:
+        args.remove("--fixed-guid")
     # Dump(s) whose masquerade-PE RSDS GUID we sync to this PDB. Defaults to
-    # /tmp/MEMORY.DMP (the local emulator's output) when present.
+    # /tmp/MEMORY.DMP (the local emulator's output) when present. With a fixed
+    # GUID there is nothing to sync - the dump already carries that identity.
     dumps = []
     while "--dump" in args:
         i = args.index("--dump")
         dumps.append(args[i + 1])
         del args[i : i + 2]
-    if not dumps and os.path.exists("/tmp/MEMORY.DMP"):
+    if not fixed_guid and not dumps and os.path.exists("/tmp/MEMORY.DMP"):
         dumps.append("/tmp/MEMORY.DMP")
     kernel = args[0] if args else "target/x86_64-unknown-none/debug/kernel"
     if not os.path.exists(kernel):
@@ -491,7 +509,7 @@ def main():
     if not syms:
         sys.exit("no symbols found in kernel ELF")
 
-    guid = compute_pdb_guid(open(kernel, "rb").read())
+    guid = DUMP_RSDS_GUID if fixed_guid else compute_pdb_guid(open(kernel, "rb").read())
     guid_str = guid_string(guid)
 
     yaml = [
@@ -570,7 +588,7 @@ def main():
 
     print(f"wrote {out_pdb}: {n_pub} public symbols (of {len(syms)} defined), {n_types} TPI type hashes")
     print(f"wrote {exe_path}: ntoskrnl.exe PE stub (RSDS -> ntoskrnl.pdb)")
-    print(f"PDB GUID (per-build): {guid_str}")
+    print(f"PDB GUID ({'fixed, matches kernel dump' if fixed_guid else 'per-build'}): {guid_str}")
     print("WinDbg: put BOTH on a local path (e.g. C:\\sym), then in the dump:")
     print("  .exepath+ C:\\sym ; .sympath+ C:\\sym ; .reload /f")
     print("  (symbols resolve as KERNEL_VIRT_BASE + RVA; the kernel links at 0)")

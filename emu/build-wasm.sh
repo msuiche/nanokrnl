@@ -27,6 +27,18 @@ if [ -f "$KERNEL" ]; then
   echo "staged kernel: $KERNEL"
   ls -lh "$OUT/kernel.bin"
 
+  # Stage matching WinDbg symbols so a visitor who downloads MEMORY.DMP can open
+  # it *with symbols*. gen_pdb stamps ntoskrnl.pdb + its ntoskrnl.exe stub with
+  # the same fixed RSDS GUID the kernel writes into every dump (kernel/src/dump.rs),
+  # so they always pair - no per-dump patching needed. Needs llvm-pdbutil + nm.
+  echo "generating WinDbg symbols (ntoskrnl.pdb + ntoskrnl.exe)..."
+  if python3 ../tools/gen_pdb.py "$OUT/kernel.bin" --fixed-guid -o "$OUT/ntoskrnl.pdb"; then
+    rm -f "$OUT/ntoskrnl.pdb.yaml"
+    ls -lh "$OUT/ntoskrnl.pdb" "$OUT/ntoskrnl.exe"
+  else
+    echo "note: symbol generation skipped (need llvm-pdbutil + nm); dump opens without symbols"
+  fi
+
   # Capture a boot-to-prompt snapshot so the page can resume at C:\> instantly
   # instead of interpreting the whole boot. Gzip it (the page gunzips via
   # DecompressionStream). Falls back to a normal boot if this step is skipped.

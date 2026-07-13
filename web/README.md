@@ -20,7 +20,11 @@ static file host. See [`../emu/README.md`](../emu/README.md) and
   - `index.html` — terminal UI with Boot / Restart / Shutdown controls and a
     keyboard bridge (keystrokes → COM1).
   - `nanox.wasm` — the emulator module.
-  - `kernel` — the staged kernel ELF that nanox boots.
+  - `kernel.bin` — the staged kernel ELF that nanox boots.
+  - `ntoskrnl.pdb` + `ntoskrnl.exe` — WinDbg symbols for the crash dump. A crash
+    writes `MEMORY.DMP` to `H:\`; download it plus these two from the H:\ Explorer
+    to open the dump with symbols. `gen_pdb.py --fixed-guid` stamps them with the
+    same RSDS GUID the kernel writes into every dump, so they always pair.
   - `background.js`, `chiptune/`, `tracks/` — an animated ASCII backdrop and a
     chiptune soundtrack played through an AudioWorklet.
 

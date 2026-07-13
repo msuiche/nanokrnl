@@ -349,7 +349,7 @@
       <button id="restart" disabled>Restart</button>
       <button id="shutdown" disabled>Shut Down</button>
       <button id="debug" disabled title="Attach lldb/gdb via tools/gdb-bridge.py">Debug</button>
-      <button id="bsod-dump" style="display:none" title="Save the Windows crash dump nanokrnl wrote to H:\ (open MEMORY.DMP in WinDbg)">Download MEMORY.DMP</button>
+      <button id="bsod-dump" style="display:none" title="Save the Windows crash dump nanokrnl wrote to H:\ (open MEMORY.DMP in WinDbg; grab ntoskrnl.pdb + ntoskrnl.exe from the H:\ Explorer for symbols)">Download MEMORY.DMP</button>
       <span class="hint" id="bootHint">Boot runs the real cold boot; Fast Boot resumes a saved snapshot instantly.</span>
     </div>
     <div class="statusbar">
@@ -874,9 +874,44 @@ dragWindow(document.getElementById("links"), document.getElementById("lk-drag"))
 document.getElementById("readme-close").onclick = () => document.getElementById("readme").classList.add("hidden");
 dragWindow(document.getElementById("readme"), document.getElementById("readme-drag"));
 
+// WinDbg symbols for the crash dump. These static files sit next to the page:
+// a visitor who downloads MEMORY.DMP needs ntoskrnl.pdb (nanokrnl's public
+// symbols + NT type records) and its ntoskrnl.exe stub (carries the RSDS record
+// that pairs the two) to open the dump *with symbols* in WinDbg. gen_pdb.py
+// stamps both with the same fixed RSDS GUID the kernel writes into every dump
+// (kernel/src/dump.rs), so they always match. Fetched lazily on click - no
+// download cost unless wanted. A HEAD at startup learns their sizes and whether
+// they were staged at all (a plain kernel build ships without them).
+const SYM_FILES = ["ntoskrnl.pdb", "ntoskrnl.exe"];
+const symSizes = {};   // name -> byte size (or -1 if present but size unknown)
+Promise.all(SYM_FILES.map(async (name) => {
+  try {
+    const r = await fetch(name, { method: "HEAD", cache: "no-store" });
+    if (r.ok) symSizes[name] = +r.headers.get("content-length") || -1;
+  } catch {}
+})).then(() => { if (typeof renderExplorer === "function") renderExplorer(); });
+
 // H:\ Explorer: a live view of the 9P host share. Lists the files the page
-// serves, plus MEMORY.DMP (and nanokrnl.core) once a crash writes them. Click a
-// row to download.
+// serves, plus MEMORY.DMP (and nanokrnl.core) once a crash writes them, plus the
+// kernel image and the WinDbg symbols. Click a row to download.
+function fmtSize(size) {
+  return size >= 1024 ? (size / 1024).toFixed(0) + " KB" : size + " B";
+}
+function addExplorerRow(ul, name, size, download) {
+  const li = document.createElement("li");
+  const label = document.createElement("span"); label.textContent = "📄 " + name;
+  const sz = document.createElement("span"); sz.className = "sz";
+  sz.textContent = size >= 0 ? fmtSize(size) : "sym";
+  li.append(label, sz);
+  li.title = "Download " + name;
+  li.onclick = download;
+  ul.appendChild(li);
+}
+function downloadBytes(name, data) {
+  const url = URL.createObjectURL(new Blob([data], { type: "application/octet-stream" }));
+  const a = document.createElement("a"); a.href = url; a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
 function renderExplorer() {
   const ul = document.getElementById("ex-list");
   if (!ul) return;
@@ -888,19 +923,14 @@ function renderExplorer() {
   // It is already fetched to boot the machine, so offer it here too.
   if (kernelBytes) rows.push(["kernel.bin", kernelBytes]);
   for (const [name, data] of rows) {
-    const size = data.length;
-    const kb = size >= 1024 ? (size / 1024).toFixed(0) + " KB" : size + " B";
-    const li = document.createElement("li");
-    const label = document.createElement("span"); label.textContent = "📄 " + name;
-    const sz = document.createElement("span"); sz.className = "sz"; sz.textContent = kb;
-    li.append(label, sz);
-    li.title = "Download " + name;
-    li.onclick = () => {
-      const url = URL.createObjectURL(new Blob([data], { type: "application/octet-stream" }));
-      const a = document.createElement("a"); a.href = url; a.download = name; a.click();
-      setTimeout(() => URL.revokeObjectURL(url), 10000);
-    };
-    ul.appendChild(li);
+    addExplorerRow(ul, name, data.length, () => downloadBytes(name, data));
+  }
+  // WinDbg symbols (static files), shown only when actually staged.
+  for (const name of SYM_FILES) {
+    if (!(name in symSizes)) continue;
+    addExplorerRow(ul, name, symSizes[name], async () => {
+      try { downloadBytes(name, await fetchBytes(name)); } catch {}
+    });
   }
 }
 renderExplorer();
