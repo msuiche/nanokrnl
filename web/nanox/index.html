@@ -62,10 +62,19 @@
   .reflect b { color: #000082; font-style: normal; font-weight: 700; }
 
   /* --- Windows 95 "Command Prompt" window --- */
-  .terminal { background: #c0c0c0; padding: 3px;
+  .terminal { position: relative; background: #c0c0c0; padding: 3px;
     font-family: Tahoma, "MS Sans Serif", Geneva, Verdana, sans-serif;
     box-shadow: inset 1px 1px #fff, inset -1px -1px #404040,
                 inset 2px 2px #dfdfdf, inset -2px -2px #808080, 6px 6px 0 rgba(0,0,0,.4); }
+  /* Hidden text field that is the real keyboard sink. A <pre> can't summon a
+     phone's on-screen keyboard; a focused <textarea> can. Tapping the console
+     focuses this, bytes are mirrored to COM1, and the shell's echo is what shows
+     on screen — so this field itself stays empty and invisible. font-size:16px
+     keeps iOS from zooming the viewport when it gains focus. */
+  #kbd { position: absolute; top: 30px; left: 12px; width: 2px; height: 16px;
+    opacity: 0; z-index: -1; pointer-events: none; resize: none; border: 0; padding: 0;
+    margin: 0; background: transparent; color: transparent; caret-color: transparent;
+    font-size: 16px; white-space: pre; overflow: hidden; }
   .titlebar { display: flex; align-items: center; gap: 5px; padding: 2px 2px 3px 3px;
     background: linear-gradient(90deg, #000082 0%, #1083d2 100%); color: #fff; cursor: move; }
   /* Once grabbed by the title bar, the window "tears off" into a free-floating
@@ -97,7 +106,7 @@
     background: #000; color: #c4c4c4; font-family: ui-monospace, "Consolas", "Courier New", monospace;
     font-size: 12px; line-height: 1.4;
     box-shadow: inset 1px 1px #808080, inset -1px -1px #fff, inset 2px 2px #404040; }
-  #screen:focus { color: #dcdcdc; }
+  .terminal:focus-within #screen { color: #dcdcdc; }
   /* Kernel bugcheck: the classic blue screen. */
   #screen.bsod { background: #0000aa; color: #fff; box-shadow: none; }
   #screen.bsod .cursor { background: #fff; }
@@ -291,10 +300,14 @@
   #links.hidden { display: none; }
 
   /* On small screens the side/corner windows can't float without overlapping, so
-     drop them into the normal column flow (stacked, centered) below the console. */
+     drop every one of them into the normal column flow (stacked, centered) below
+     the console. Any window left as position:fixed here floats over the page on a
+     phone (this is exactly what the H:\ Explorer used to do), so the list must
+     cover them all: winamp, resmon, explorer, links, readme, and the debug panel. */
   @media (max-width: 900px) {
-    #winamp, #resmon, #links, #readme {
+    #winamp, #resmon, #explorer, #links, #readme, #dbgpanel {
       position: static; left: auto; right: auto; top: auto; bottom: auto;
+      transform: none; resize: none;
       width: min(100%, 340px); margin: 12px auto 0; z-index: 1;
     }
     .terminal.floating { position: static; left: auto; top: auto; width: auto !important; }
@@ -328,7 +341,8 @@
         <button id="winclose" class="b-close" tabindex="-1" title="Close (shut down)"></button>
       </span>
     </div>
-    <pre id="screen" tabindex="0"></pre>
+    <pre id="screen"></pre>
+    <textarea id="kbd" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" aria-hidden="true"></textarea>
     <div class="toolbar">
       <button class="primary" id="boot">Boot</button>
       <button id="fastboot">Fast Boot</button>
@@ -668,6 +682,9 @@
       lcdTrack.textContent = tracks.length + " track(s)"; renderList();
       // Warm the module decoder now (idle time) so it's ready before interaction.
       if (tracks.some((t) => MOD_EXT.test(t))) initChip();
+      // A gesture already happened while the playlist was still loading: start now
+      // (the audio context was resumed during that gesture, so it's already live).
+      if (pendingStart) kickstart();
     } else lcdTrack.textContent = "no tracks in tracks/";
   })();
 
@@ -677,18 +694,30 @@
   // gesture leaves it suspended, and priming the module into a suspended worklet
   // then just resuming it does not reliably start playback. Instead we run the
   // exact same play(0) the Play button does, into a now-live context.
-  let autoStarted = false;
+  // Two mobile hazards the old {once:true} version tripped on:
+  //   1. If the first gesture lands BEFORE the playlist has been fetched (likely
+  //      on a phone: big kernel/wasm/snapshot downloads compete with the tiny
+  //      manifest), {once:true} threw that gesture away and the listeners were
+  //      gone for good, so music never started. We instead resume the (silent)
+  //      context now and remember to start the moment the tracks arrive.
+  //   2. The context must be resumed synchronously inside a gesture; playback can
+  //      then begin a beat later (once the module decoder warms up) into the
+  //      now-running context. So we keep listening across several gesture types
+  //      until audio has genuinely begun, rather than firing exactly once.
+  let autoStarted = false, pendingStart = false;
   function kickstart() {
-    if (autoStarted || !tracks.length) return;
-    autoStarted = true;
+    if (autoStarted) return;
     setupAudioGraph();
-    if (actx.state === "suspended") actx.resume();
+    if (actx.state === "suspended") actx.resume();   // "unlocks" audio on mobile
+    if (!tracks.length) { pendingStart = true; return; }  // honored once the playlist lands
+    autoStarted = true; detachKick();
     if (cur < 0) play(0);
     else if (modActive && chip) chip.unpause();
     else if (audio.paused) audio.play().catch(() => {});
   }
-  document.addEventListener("pointerdown", kickstart, { once: true });
-  document.addEventListener("keydown", kickstart, { once: true });
+  const KICK_EVENTS = ["pointerdown", "touchend", "click", "keydown"];
+  function detachKick() { for (const ev of KICK_EVENTS) document.removeEventListener(ev, kickstart); }
+  for (const ev of KICK_EVENTS) document.addEventListener(ev, kickstart);
 })();
 </script>
 
@@ -1015,7 +1044,7 @@ async function boot(image) {
   const ptr = e.nanox_image_alloc(image.length);
   new Uint8Array(e.memory.buffer, ptr, image.length).set(image);
   if (e.nanox_boot_kernel() !== 1) { setStatus("stop", "failed to load kernel image"); return; }
-  running = true; refreshButtons(); screen.focus();
+  running = true; refreshButtons(); kbd.focus();
   loop();
 }
 
@@ -1040,7 +1069,7 @@ async function resume(snap) {
     "and user-mode bring-up -- was captured earlier and restored here instantly.\n" +
     "Click Restart to watch nanokrnl boot for real.\n\n";
   col = 0;
-  running = true; refreshButtons(); screen.focus();
+  running = true; refreshButtons(); kbd.focus();
   setStatus("run", "running · resumed from snapshot");
   e.nanox_uart_write(13);   // nudge the shell to redraw its C:\> prompt
   loop();
@@ -1161,14 +1190,37 @@ btnShutdown.onclick = () => { stop(); if (gdbWs) gdbWs.close(); setStatus("stop"
 document.getElementById("winclose").onclick = () => { if (running) btnShutdown.click(); };
 
 // Keyboard → COM1: the shell reads typed bytes from the UART. Enter → CR,
-// Backspace → DEL (what the cmd line editor expects).
-screen.addEventListener("keydown", (ev) => {
+// Backspace → DEL (what the cmd line editor expects). A <pre> can't raise a
+// phone's on-screen keyboard, so a hidden <textarea> (#kbd) is the actual input
+// sink: tapping the console focuses it (inside the tap gesture, which is what
+// summons the keyboard), and we mirror its keystrokes to the UART.
+const kbd = document.getElementById("kbd");
+const sendKeys = (s) => { if (running) for (const ch of s) e.nanox_uart_write(ch.charCodeAt(0)); };
+screen.addEventListener("pointerdown", () => { if (running) kbd.focus(); });
+// Physical keyboards (and soft keyboards that report real keys) arrive as
+// keydown. preventDefault here also cancels the matching beforeinput below, so a
+// key is never sent twice. iOS fires only keydown for Backspace on an empty
+// field, so keeping Backspace here is what makes it work on the phone.
+kbd.addEventListener("keydown", (ev) => {
   if (!running) return;
   let s = null;
   if (ev.key === "Enter") s = "\r";
   else if (ev.key === "Backspace") s = "\x7f";
-  else if (ev.key.length === 1 && !ev.ctrlKey && !ev.metaKey) s = ev.key;
-  if (s !== null) { for (const ch of s) e.nanox_uart_write(ch.charCodeAt(0)); ev.preventDefault(); }
+  else if (ev.key.length === 1 && !ev.ctrlKey && !ev.metaKey && !ev.altKey) s = ev.key;
+  if (s !== null) { sendKeys(s); ev.preventDefault(); }
+});
+// Soft keyboards / IME frequently fire keydown with key "Unidentified" and carry
+// the real text only in beforeinput. This runs only when the keydown above did
+// NOT preventDefault (i.e. it didn't recognise the key), so the two never double.
+kbd.addEventListener("beforeinput", (ev) => {
+  const t = ev.inputType;
+  if (running) {
+    if ((t === "insertText" || t === "insertReplacementText" || t === "insertFromPaste") && ev.data) sendKeys(ev.data);
+    else if (t === "insertLineBreak" || t === "insertParagraph") sendKeys("\r");
+    else if (t === "deleteContentBackward") sendKeys("\x7f");
+  }
+  ev.preventDefault();   // keep the textarea empty; the console's echo is the display
+  kbd.value = "";
 });
 
 btnFast.disabled = !snapshotBytes;
