@@ -221,10 +221,20 @@ extern "C" fn ki_dispatch_trap(frame: &mut KtrapFrame) {
             {
                 return;
             }
-            // A page fault from ring 3 (saved CS RPL 3) is a user-program bug,
-            // not a kernel one: terminate the faulting thread instead of
-            // bugchecking, so one bad process doesn't take down the system.
+            // A page fault from ring 3 (saved CS RPL 3) that demand commit
+            // couldn't resolve is an access violation *the program may
+            // handle*: deliver it to user mode (EXCEPTION_RECORD + CONTEXT
+            // on the user stack, resume at KiUserExceptionDispatcher). Only
+            // if delivery itself fails (e.g. the stack is the faulting
+            // page) do we terminate the thread, as before.
             if frame.cs & 3 == 3 {
+                let delivered = crate::ke::exception::exception_code_for(vector, frame.error_code, cr2)
+                    .is_some_and(|(code, info, n)| {
+                        crate::ke::exception::dispatch_exception(frame, code, info, n)
+                    });
+                if delivered {
+                    return;
+                }
                 kd_println!(
                     "!! user page fault: va={:#018X} err={:#X} rip={:#018X} -> terminating thread",
                     cr2,
@@ -273,13 +283,20 @@ extern "C" fn ki_dispatch_trap(frame: &mut KtrapFrame) {
             crate::ke::debug::on_breakpoint(frame);
         }
         v if v < 32 => {
-            // An architectural exception. If it came from ring 3 (saved CS has
-            // RPL 3), it is a fault in a user program: terminate that thread
-            // rather than crashing the kernel (no SEH dispatch yet). A real OS
-            // would raise an exception the program could handle; for us, an
-            // unhandled user fault ends the process thread and its join object
-            // signals, so the launcher wakes. Kernel-mode faults stay fatal.
+            // An architectural exception. If it came from ring 3 (saved CS
+            // has RPL 3), the program gets it first: deliver the exception
+            // to user mode (the SEH/VEH machinery lives there); an
+            // unhandled one terminates the thread from the dispatcher side.
+            // Only when delivery itself is impossible do we kill the thread
+            // here, the historical behavior. Kernel-mode faults stay fatal.
             if frame.cs & 3 == 3 {
+                let delivered = crate::ke::exception::exception_code_for(vector, frame.error_code, 0)
+                    .is_some_and(|(code, info, n)| {
+                        crate::ke::exception::dispatch_exception(frame, code, info, n)
+                    });
+                if delivered {
+                    return;
+                }
                 kd_println!(
                     "!! user fault vec={} err={:#X} rip={:#018X} rsp={:#018X} rcx={:#x} rdx={:#x} r8={:#x} r9={:#x} -> terminating thread",
                     v,

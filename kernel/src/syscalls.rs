@@ -76,6 +76,9 @@ pub const SVC_DUPLICATE_OBJECT: usize = 40;
 /// `GetFileType` - classify a handle as Win32 disk/char/pipe. cmd checks this on
 /// its stdout at startup; a pipe must report PIPE, not UNKNOWN, or cmd bails.
 pub const SVC_QUERY_FILE_TYPE: usize = 41;
+/// `NtContinue` - resume the calling thread at a user-supplied CONTEXT (the
+/// return path of a handled exception; see `ke::exception`).
+pub const SVC_NT_CONTINUE: usize = 42;
 
 /// A shared kernel counter incremented atomically by [`SVC_INCREMENT_COUNTER`].
 /// Used to prove concurrent ring-3 threads both make progress through the
@@ -147,6 +150,7 @@ pub fn register_all() {
     register_service(SVC_SET_STD_HANDLE, nt_set_std_handle);
     register_service(SVC_DUPLICATE_OBJECT, nt_duplicate_object);
     register_service(SVC_QUERY_FILE_TYPE, nt_query_file_type);
+    register_service(SVC_NT_CONTINUE, nt_continue);
 }
 
 /// `GetFileType` backend: classify `handle` into a Win32 file type
@@ -767,9 +771,17 @@ extern "C" fn nt_terminate_thread(exit_code: u64, _a2: u64, _a3: u64, _a4: u64) 
     }
 }
 
+/// `NtContinue(Context)` — `a1` = user `CONTEXT` VA. Resumes the thread at
+/// that register state (the return path a handled exception takes; see
+/// `ke::exception`). Returns an NTSTATUS only when the context is rejected.
+extern "C" fn nt_continue(a1: u64, _a2: u64, _a3: u64, _a4: u64) -> u64 {
+    crate::ke::exception::nt_continue(a1)
+}
+
 /// `DbgPrint`-from-user: `a1` = buffer VA, `a2` = length. Echoes to the debug
 /// port. (A convenience service for bring-up; not an NT export.)
 extern "C" fn dbg_write_string(a1: u64, a2: u64, _a3: u64, _a4: u64) -> u64 {
+
     let (ptr, len) = (a1 as *const u8, a2 as usize);
     // Reject a bogus/kernel pointer up front (confused-deputy guard).
     if crate::mm::virt::probe_for_read(a1, len.min(4096), 1).is_err() {

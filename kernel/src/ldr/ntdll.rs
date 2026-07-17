@@ -40,10 +40,24 @@ static EXPORTS: &[(&str, usize)] = &[
     ("NtAllocateVirtualMemory", syscalls::SVC_NT_ALLOCATE_VIRTUAL_MEMORY),
     ("NtFreeVirtualMemory", syscalls::SVC_NT_FREE_VIRTUAL_MEMORY),
     ("NtProtectVirtualMemory", syscalls::SVC_NT_PROTECT_VIRTUAL_MEMORY),
+    ("NtContinue", syscalls::SVC_NT_CONTINUE),
 ];
 
 /// Base VA of the trampoline page (0 until [`init`] runs).
 static TRAMPOLINE_BASE: AtomicU64 = AtomicU64::new(0);
+
+/// Offset of the `KiUserExceptionDispatcher` thunk inside the trampoline
+/// page. Unlike the syscall stubs this is *called by the kernel* (via a
+/// rewritten trap frame — see `ke::exception`): it tail-jumps to the real
+/// dispatcher with the record/context arguments already in rcx/rdx.
+///
+/// ```text
+///   mov rax, <dispatcher VA>   ; absolute, patched at kernel32 load
+///   jmp rax
+/// ```
+const KUED_OFFSET: usize = 0xF00;
+/// Bytes of the `mov rax, imm64 ; jmp rax` thunk (10 + 2).
+const KUED_LEN: usize = 12;
 
 /// Build the ring-3 syscall-stub page. Phase-1, single-threaded. Allocates a
 /// user-accessible executable page and writes one stub per service number
@@ -54,7 +68,7 @@ pub fn init() {
 
     // Highest service index we need a stub for.
     let max_svc = EXPORTS.iter().map(|&(_, n)| n).max().unwrap_or(0);
-    assert!((max_svc + 1) * STUB_STRIDE <= crate::mm::PAGE_SIZE, "too many stubs for one page");
+    assert!((max_svc + 1) * STUB_STRIDE <= KUED_OFFSET, "too many stubs before the KUED slot");
 
     for svc in 0..=max_svc {
         let off = svc * STUB_STRIDE;
@@ -78,12 +92,49 @@ pub fn init() {
     // Make the whole page user-accessible + executable.
     unsafe { crate::mm::virt::mm_set_user_executable(va as u64, crate::mm::PAGE_SIZE) };
     TRAMPOLINE_BASE.store(va as u64, Ordering::Release);
+    // Default the exception-dispatcher target at the svc-0 stub
+    // (NtTerminateThread): an exception raised before kernel32 installs the
+    // real dispatcher terminates the thread — the pre-SEH fate, kept.
+    set_exception_dispatcher(va as u64);
 }
 
 /// Base VA of the trampoline page (the value Win32 treats as ntdll's
 /// `HMODULE`); 0 until [`init`] runs.
 pub fn trampoline_base() -> u64 {
     TRAMPOLINE_BASE.load(Ordering::Acquire)
+}
+
+/// VA of the `KiUserExceptionDispatcher` thunk (0 before [`init`]). The
+/// kernel redirects user-mode exceptions here (`ke::exception`).
+pub fn user_exception_dispatcher_va() -> u64 {
+    let base = TRAMPOLINE_BASE.load(Ordering::Acquire);
+    if base == 0 { 0 } else { base + KUED_OFFSET as u64 }
+}
+
+/// Point the `KiUserExceptionDispatcher` thunk at `target` (called once the
+/// kernel32 shim is loaded, with its dispatcher export's VA).
+pub fn set_exception_dispatcher(target: u64) {
+    let base = TRAMPOLINE_BASE.load(Ordering::Acquire);
+    if base == 0 || target == 0 {
+        return;
+    }
+    // mov rax, imm64 ; jmp rax
+    let mut thunk = [0u8; KUED_LEN];
+    thunk[0] = 0x48;
+    thunk[1] = 0xB8;
+    thunk[2..10].copy_from_slice(&target.to_le_bytes());
+    thunk[10] = 0xFF;
+    thunk[11] = 0xE0;
+    // The page is user-accessible; bracket the supervisor write (SMAP).
+    crate::mm::virt::user_access_begin();
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            thunk.as_ptr(),
+            (base as usize + KUED_OFFSET) as *mut u8,
+            KUED_LEN,
+        );
+    }
+    crate::mm::virt::user_access_end();
 }
 
 /// Resolve an imported `ntdll` name to its ring-3 stub address. Used by the

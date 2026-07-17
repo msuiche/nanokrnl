@@ -21,7 +21,7 @@
 
 use crate::ke::pcr;
 use crate::ke::selectors::{KGDT64_R3_CODE, KGDT64_R3_DATA};
-use core::arch::asm;
+use core::arch::{asm, naked_asm};
 
 const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
 
@@ -80,4 +80,82 @@ pub unsafe fn ki_enter_user_mode(user_rip: u64, user_rsp: u64, teb: u64) -> ! {
             options(noreturn),
         );
     }
+}
+
+/// Resume user mode with a complete register state — the tail of
+/// `NtContinue`. Unlike [`ki_enter_user_mode`] (which starts a fresh thread
+/// with zeroed GPRs), this restores all fifteen GPRs from `ctx` before the
+/// `iretq`, so an exception handler can resume the faulting instruction
+/// stream with modified registers.
+///
+/// The kernel stack is **reset** to the current thread's stack top first:
+/// the syscall that led here never returns, and abandoning its frames is
+/// exactly how the per-thread stack stays bounded across arbitrarily many
+/// dispatch/continue round trips.
+///
+/// # Safety
+/// `ctx` must be validated and sanitized by the caller (ring-3 segments,
+/// user RIP/RSP, masked RFLAGS — see `ke::exception`).
+pub unsafe fn ki_continue_user_mode(ctx: &super::exception::UserResume) -> ! {
+    unsafe {
+        let top = (*pcr::ke_get_current_thread()).stack_top;
+        ki_continue_asm(ctx, top)
+    }
+}
+
+/// The register-restore half of [`ki_continue_user_mode`]. Naked with a
+/// fixed convention (`rdi` = context, `rsi` = kernel stack top) because the
+/// compiler cannot be allowed to choose the registers: every one of them is
+/// repurposed by the restore, with `rdi` itself restored last.
+#[unsafe(naked)]
+unsafe extern "C" fn ki_continue_asm(ctx: &super::exception::UserResume, stack_top: u64) -> ! {
+    use super::exception::UserResume as U;
+    naked_asm!(
+        "cli",                    // the swapgs;iretq window must stay atomic
+        "mov rsp, rsi",           // reset the kernel stack (syscall frames die)
+        // iretq frame, top-down: SS, RSP, RFLAGS, CS, RIP
+        "push qword ptr [rdi + {ss}]",
+        "push qword ptr [rdi + {rsp}]",
+        "push qword ptr [rdi + {rflags}]",
+        "push qword ptr [rdi + {cs}]",
+        "push qword ptr [rdi + {rip}]",
+        // Restore the GPRs; rdi (the context pointer) goes last.
+        "mov r15, [rdi + {r15}]",
+        "mov r14, [rdi + {r14}]",
+        "mov r13, [rdi + {r13}]",
+        "mov r12, [rdi + {r12}]",
+        "mov r11, [rdi + {r11}]",
+        "mov r10, [rdi + {r10}]",
+        "mov r9,  [rdi + {r9}]",
+        "mov r8,  [rdi + {r8}]",
+        "mov rbp, [rdi + {rbp}]",
+        "mov rdx, [rdi + {rdx}]",
+        "mov rcx, [rdi + {rcx}]",
+        "mov rbx, [rdi + {rbx}]",
+        "mov rax, [rdi + {rax}]",
+        "mov rsi, [rdi + {rsi}]",
+        "mov rdi, [rdi + {rdi}]",
+        "swapgs",                 // active GS base -> user value (KPCR parked)
+        "iretq",
+        ss = const core::mem::offset_of!(U, ss),
+        rsp = const core::mem::offset_of!(U, rsp),
+        rflags = const core::mem::offset_of!(U, rflags),
+        cs = const core::mem::offset_of!(U, cs),
+        rip = const core::mem::offset_of!(U, rip),
+        r15 = const core::mem::offset_of!(U, r15),
+        r14 = const core::mem::offset_of!(U, r14),
+        r13 = const core::mem::offset_of!(U, r13),
+        r12 = const core::mem::offset_of!(U, r12),
+        r11 = const core::mem::offset_of!(U, r11),
+        r10 = const core::mem::offset_of!(U, r10),
+        r9 = const core::mem::offset_of!(U, r9),
+        r8 = const core::mem::offset_of!(U, r8),
+        rbp = const core::mem::offset_of!(U, rbp),
+        rdx = const core::mem::offset_of!(U, rdx),
+        rcx = const core::mem::offset_of!(U, rcx),
+        rbx = const core::mem::offset_of!(U, rbx),
+        rax = const core::mem::offset_of!(U, rax),
+        rsi = const core::mem::offset_of!(U, rsi),
+        rdi = const core::mem::offset_of!(U, rdi),
+    )
 }

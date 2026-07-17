@@ -32,6 +32,8 @@ pub mod dispatcher;
 #[cfg(target_arch = "x86_64")]
 pub mod dpc;
 #[cfg(target_arch = "x86_64")]
+pub mod exception;
+#[cfg(target_arch = "x86_64")]
 pub mod gdt;
 #[cfg(target_arch = "x86_64")]
 pub mod idt;

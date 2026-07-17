@@ -47,6 +47,12 @@ pub fn load_kernel32(image: &[u8]) -> Result<(), NtStatus> {
     KERNEL32_BASE.store(loaded.base as u64, Ordering::Release);
     KERNEL32_SIZE.store(loaded.size, Ordering::Release);
     register_shim_data(image, loaded.base as u64);
+    // Point the ntdll-page exception-dispatcher thunk at the shim's
+    // KiUserExceptionDispatcher, so user-mode exceptions (ke::exception)
+    // reach the vectored-handler machinery instead of the terminate stub.
+    if let Some(va) = resolve_export_in(loaded.base as u64, loaded.size, "KiUserExceptionDispatcher") {
+        ntdll::set_exception_dispatcher(va as u64);
+    }
     crate::kd_println!(
         "LDR: loaded kernel32.dll @ {:p} ({} bytes)",
         loaded.base,

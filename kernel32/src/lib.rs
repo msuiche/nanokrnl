@@ -56,6 +56,7 @@ const NT_SET_STARTUP_HANDLES: u32 = 38;
 const NT_SET_STD_HANDLE: u32 = 39;
 const NT_DUPLICATE_OBJECT: u32 = 40;
 const NT_QUERY_FILE_TYPE: u32 = 41;
+const NT_CONTINUE: u32 = 42;
 
 // A couple of Win32 error codes used by the shim.
 const ERROR_SUCCESS: u32 = 0;
@@ -4694,3 +4695,209 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 /// MSVC floating-point CRT marker (referenced by core under `/nodefaultlib`).
 #[no_mangle]
 pub static _fltused: i32 = 0;
+
+
+// --- Vectored exception handling (the user-mode exception front door) -----
+//
+// The kernel delivers a user-mode exception by resuming the faulting thread
+// at this DLL's `KiUserExceptionDispatcher` (via the ntdll-page thunk) with
+// an EXCEPTION_RECORD and CONTEXT on the user stack — the real NT contract.
+// The dispatcher walks the vectored list; a handled exception resumes the
+// thread through `NtContinue`, an unhandled one terminates the thread with
+// the exception code, which is the fate unhandled exceptions always had
+// here. (Frame-based SEH — `.pdata` unwind — builds on this same delivery.)
+
+/// `EXCEPTION_CONTINUE_EXECUTION` — handler fixed it; resume via `NtContinue`.
+pub const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
+/// `EXCEPTION_CONTINUE_SEARCH` — pass the exception to the next handler.
+pub const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+
+/// `CONTEXT` (winnt.h, x64) — the register state the kernel builds on the
+/// user stack at dispatch time. Fields at their real offsets.
+#[repr(C)]
+pub struct Context {
+    pub p1_home: u64,
+    pub p2_home: u64,
+    pub p3_home: u64,
+    pub p4_home: u64,
+    pub p5_home: u64,
+    pub p6_home: u64,
+    pub context_flags: u32,
+    pub mx_csr: u32,
+    pub seg_cs: u16,
+    pub seg_ds: u16,
+    pub seg_es: u16,
+    pub seg_fs: u16,
+    pub seg_gs: u16,
+    pub seg_ss: u16,
+    pub eflags: u32,
+    pub dr0: u64,
+    pub dr1: u64,
+    pub dr2: u64,
+    pub dr3: u64,
+    pub dr6: u64,
+    pub dr7: u64,
+    pub rax: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rbx: u64,
+    pub rsp: u64,
+    pub rbp: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub rip: u64,
+    pub flt_save: [u8; 512],
+    pub vector_register: [u64; 52],
+    pub vector_control: u64,
+    pub debug_control: u64,
+    pub last_branch_to_rip: u64,
+    pub last_branch_from_rip: u64,
+    pub last_exception_to_rip: u64,
+    pub last_exception_from_rip: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<Context>() == 0x4D0);
+const _: () = assert!(core::mem::offset_of!(Context, rip) == 0xF8);
+const _: () = assert!(core::mem::offset_of!(Context, rax) == 0x78);
+
+/// `EXCEPTION_RECORD` (winnt.h, x64).
+#[repr(C)]
+pub struct ExceptionRecord {
+    pub code: u32,
+    pub flags: u32,
+    pub record: u64,
+    pub address: u64,
+    pub number_parameters: u32,
+    pub _pad: u32,
+    pub information: [u64; 15],
+}
+
+const _: () = assert!(core::mem::size_of::<ExceptionRecord>() == 0x98);
+
+/// `EXCEPTION_POINTERS` — what a vectored handler actually receives.
+#[repr(C)]
+pub struct ExceptionPointers {
+    pub record: *const ExceptionRecord,
+    pub context: *mut Context,
+}
+
+/// `PVECTORED_EXCEPTION_HANDLER`.
+pub type VectoredHandler = unsafe extern "C" fn(*const ExceptionPointers) -> i32;
+
+const MAX_VEH: usize = 8;
+
+/// Sparse handler slots with a registration sequence number, so dispatch can
+/// run most-recent-first (the LIFO order the `First=1` convention implies;
+/// the `First=0` tail insert is a documented simplification — it just gets a
+/// sequence number like everyone else).
+static mut VEH_SLOTS: [(u32, Option<VectoredHandler>); MAX_VEH] = [(0, None), (0, None), (0, None), (0, None), (0, None), (0, None), (0, None), (0, None)];
+static mut VEH_SEQ: u32 = 0;
+static VEH_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+fn veh_lock_acquire() {
+    use core::sync::atomic::Ordering;
+    while VEH_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+}
+
+#[inline]
+fn veh_lock_release() {
+    VEH_LOCK.store(false, core::sync::atomic::Ordering::Release);
+}
+
+/// `AddVectoredExceptionHandler(First, Handler)` — register a handler;
+/// returns a nonzero handle (0 = list full). `First` is advisory here: every
+/// registration gets the next sequence number and dispatch is
+/// most-recent-first (see `VEH_SLOTS`).
+#[no_mangle]
+pub unsafe extern "C" fn AddVectoredExceptionHandler(_first: u32, handler: VectoredHandler) -> u64 {
+    veh_lock_acquire();
+    let mut handle = 0u64;
+    for (i, slot) in (&raw mut VEH_SLOTS).as_mut_unchecked().iter_mut().enumerate() {
+        if slot.1.is_none() {
+            VEH_SEQ += 1;
+            *slot = (VEH_SEQ, Some(handler));
+            handle = (i + 1) as u64;
+            break;
+        }
+    }
+    veh_lock_release();
+    handle
+}
+
+/// `RemoveVectoredExceptionHandler(Handle)` — unregister; nonzero on success.
+#[no_mangle]
+pub unsafe extern "C" fn RemoveVectoredExceptionHandler(handle: u64) -> i32 {
+    veh_lock_acquire();
+    let mut ok = 0;
+    if handle >= 1 && (handle as usize) <= MAX_VEH {
+        let slot = &mut (&raw mut VEH_SLOTS).as_mut_unchecked()[handle as usize - 1];
+        if slot.1.is_some() {
+            *slot = (0, None);
+            ok = 1;
+        }
+    }
+    veh_lock_release();
+    ok
+}
+
+/// `KiUserExceptionDispatcher` — the kernel redirects a user-mode exception
+/// here (rcx = record, rdx = context, the real entry contract). Exported so
+/// the kernel can point the ntdll-page thunk at it. Never returns: a handled
+/// exception resumes via `NtContinue`, an unhandled one terminates the
+/// thread with the exception code.
+#[no_mangle]
+pub unsafe extern "C" fn KiUserExceptionDispatcher(
+    record: *const ExceptionRecord,
+    context: *mut Context,
+) -> ! {
+    let ptrs = ExceptionPointers { record, context };
+    // Snapshot under the lock (a handler may itself add/remove), then invoke
+    // most-recent-first.
+    let mut handlers = [(0u32, None); MAX_VEH];
+    veh_lock_acquire();
+    handlers.clone_from_slice((&raw const VEH_SLOTS).as_ref_unchecked());
+    veh_lock_release();
+
+    let mut called_seq = u32::MAX;
+    loop {
+        // The highest-sequence live handler not yet called.
+        let mut pick: Option<VectoredHandler> = None;
+        let mut pick_seq = 0u32;
+        for &(seq, h) in handlers.iter() {
+            if let Some(h) = h {
+                if seq < called_seq && seq >= pick_seq {
+                    pick = Some(h);
+                    pick_seq = seq;
+                }
+            }
+        }
+        let Some(h) = pick else { break };
+        called_seq = pick_seq;
+        if h(&ptrs) == EXCEPTION_CONTINUE_EXECUTION {
+            // Resumes the thread at the (possibly modified) context; only
+            // returns if the kernel rejected the context.
+            syscall3(NT_CONTINUE, context as u64, 0, 0);
+            break;
+        }
+    }
+    // Unhandled: terminate with the exception code as the exit status — the
+    // same fate an unhandled user fault always had in this kernel.
+    let code = (*record).code as u64;
+    loop {
+        syscall3(NT_TERMINATE_THREAD, code, 0, 0);
+    }
+}

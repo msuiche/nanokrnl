@@ -109,10 +109,123 @@ extern "C" {
     fn _strnicmp(a: *const u8, b: *const u8, n: usize) -> i32;
     fn fprintf(stream: *mut c_void, fmt: *const u8, ...) -> i32;
     fn ReportTestResult(code: u64);
+    fn AddVectoredExceptionHandler(first: u32, handler: VectoredHandler) -> u64;
     fn ExitProcess(code: u32) -> !;
 }
 
 static mut ENVBUF: [u8; 64] = [0; 64];
+
+// --- Vectored exception handling (SEH delivery + NtContinue) --------------
+
+/// `CONTEXT` (winnt.h, x64) — must match the kernel32 shim's layout.
+#[repr(C)]
+pub struct Context {
+    pub p_home: [u64; 6],
+    pub context_flags: u32,
+    pub mx_csr: u32,
+    pub seg_cs: u16,
+    pub seg_ds: u16,
+    pub seg_es: u16,
+    pub seg_fs: u16,
+    pub seg_gs: u16,
+    pub seg_ss: u16,
+    pub eflags: u32,
+    pub dr: [u64; 6],
+    pub rax: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rbx: u64,
+    pub rsp: u64,
+    pub rbp: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub rip: u64,
+    pub rest: [u8; 0x4D0 - 0x100],
+}
+
+const _: () = assert!(core::mem::size_of::<Context>() == 0x4D0);
+const _: () = assert!(core::mem::offset_of!(Context, rip) == 0xF8);
+
+/// `EXCEPTION_RECORD` (winnt.h, x64).
+#[repr(C)]
+pub struct ExceptionRecord {
+    pub code: u32,
+    pub flags: u32,
+    pub record: u64,
+    pub address: u64,
+    pub number_parameters: u32,
+    pub _pad: u32,
+    pub information: [u64; 15],
+}
+
+/// `EXCEPTION_POINTERS`.
+#[repr(C)]
+pub struct ExceptionPointers {
+    pub record: *const ExceptionRecord,
+    pub context: *mut Context,
+}
+
+/// `PVECTORED_EXCEPTION_HANDLER`.
+pub type VectoredHandler = unsafe extern "C" fn(*const ExceptionPointers) -> i32;
+
+static mut VEH_HITS: u32 = 0;
+static mut VEH_CODE: u32 = 0;
+/// The address the handler resumes at (stashed just before the fault).
+static mut VEH_RESUME: u64 = 0;
+
+/// The test's vectored handler: prove the record is an access violation,
+/// then resume at the recovery address (abandoning the faulting
+/// instruction), the way a real handler edits `ContextRecord->Rip`.
+unsafe extern "C" fn veh_handler(p: *const ExceptionPointers) -> i32 {
+    let (hits, code, resume) = (
+        &raw mut VEH_HITS,
+        &raw mut VEH_CODE,
+        &raw const VEH_RESUME,
+    );
+    *hits += 1;
+    *code = (*(*p).record).code;
+    (*(*p).context).rip = *resume;
+    -1 // EXCEPTION_CONTINUE_EXECUTION
+}
+
+/// Register `veh_handler`, take a deliberate read fault on address 0, and
+/// verify the handler ran and the full dispatch/continue round trip landed.
+unsafe fn veh_test(out: u64) -> bool {
+    VEH_HITS = 0;
+    VEH_CODE = 0;
+    let h = AddVectoredExceptionHandler(1, veh_handler);
+    if h == 0 {
+        print(out, b"APP: AddVectoredExceptionHandler FAILED\n");
+        return false;
+    }
+    core::arch::asm!(
+        "lea rax, [rip + 2f]",
+        "mov qword ptr [rip + {resume}], rax",
+        "xor ecx, ecx",
+        "mov rax, qword ptr [rcx]", // read [0] -> #PF -> STATUS_ACCESS_VIOLATION
+        "2:",
+        resume = sym VEH_RESUME,
+        out("rax") _,
+        out("rcx") _,
+        options(nostack),
+    );
+    let ok = VEH_HITS == 1 && VEH_CODE == 0xC000_0005;
+    if ok {
+        print(out, b"APP: vectored exception handler recovered from AV\n");
+    } else {
+        print(out, b"APP: VEH FAILED (hits/code wrong)\n");
+    }
+    ok
+}
+
 
 /// Comparator for `qsort` over `i32` elements (ascending).
 extern "C" fn cmp_i32(a: *const u8, b: *const u8) -> i32 {
@@ -461,6 +574,9 @@ unsafe fn main(argc: i32, argv: *const *const u8) -> i32 {
         print(out, b"APP: CreateProcessW FAILED\n");
     }
 
+    // Vectored exception handling: deliberate AV, handler recovery, NtContinue.
+    let veh_ok = veh_test(out);
+
     ReportTestResult(
         if reuse_ok
             && createproc_ok
@@ -479,6 +595,7 @@ unsafe fn main(argc: i32, argv: *const *const u8) -> i32 {
             && version_ok
             && msvcrt_ok
             && fs_ok
+            && veh_ok
         {
             0xABCD
         } else {

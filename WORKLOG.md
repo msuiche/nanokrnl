@@ -1013,3 +1013,50 @@ returns the frame, probe rejects the freed range, VAD list empty), and the
 whole ring-3 suite (userapp/userapp2/worker pair/CreateProcess/sort/choice/
 where/cmd) now runs on per-process demand-paged heaps. `ALL SELF TESTS
 PASSED`, exit 33.
+
+### 2026-07-17 - SEH groundwork: exceptions reach user mode (VEH + NtContinue)
+
+First slice of structured exception handling: user-mode exceptions are now
+*delivered* to ring 3 instead of terminating the thread outright.
+
+**Kernel side.** New `ke/exception.rs`: on a user exception (any vector the
+demand-commit path can't resolve), `dispatch_exception` builds an
+`EXCEPTION_RECORD` and a `CONTEXT` (real winnt.h offsets, 0x4D0 bytes,
+integer+control+segments; FP state stays zeroed, documented) on the user
+stack and rewrites the trap frame so the normal epilogue "returns" to a
+`KiUserExceptionDispatcher` thunk in the ntdll stub page
+(`rcx` = record, `rdx` = context — the real entry contract). The thunk
+(`mov rax, imm; jmp rax`, patched when kernel32 loads) lands in the shim.
+`NtContinue` (new svc 42) validates a context and resumes it with a full
+15-GPR restore: a naked `ki_continue_asm` resets the kernel stack and
+`iretq`s, which also bounds the stack across dispatch/continue round trips.
+Segments and RFLAGS are forced, not trusted; RIP/RSP must probe
+user-executable/user-writable. If delivery itself is impossible (e.g. the
+stack is the faulting page), the old terminate path runs — no regression.
+
+**Shim side (kernel32).** `AddVectoredExceptionHandler` /
+`RemoveVectoredExceptionHandler` over a sparse, sequence-numbered list
+(most-recent-first dispatch), and `KiUserExceptionDispatcher`: a handled
+exception (`EXCEPTION_CONTINUE_EXECUTION`) resumes via `NtContinue`, an
+unhandled one terminates the thread with the exception code — the exact
+fate unhandled faults always had here.
+
+**Test.** userapp registers a handler, reads `[0]` (deliberate AV), the
+handler records the code (`0xC0000005`) and redirects `Rip` to a recovery
+label; success folds into the existing `ReportTestResult(0xABCD)` gate, so
+the boot suite fails if any link in the chain breaks.
+
+**Bugs caught by the suite.** The CONTEXT offsets were first written 8
+bytes off from winnt.h (the six Dr registers sit at 0x48..0x70, pushing
+Rax to 0x78 and Rip to 0xF8), and `EXCEPTION_RECORD` was sized 0x50
+instead of 0x98 — both fixed before they bit, worth a conformance test
+later. The real failure was subtler: validation assumed user addresses are
+low-half, but kernel-AS user threads run on high-half window-backed stacks
+— the kernel-AS userapp run died at dispatch while the isolated one worked.
+Validation now goes through the probes (U/S bit), which are half-agnostic.
+
+**Verified.** Boot suite 76/76, exit 33, with the AV recovery printed in
+BOTH address-space models (kernel-AS and isolated process runs); host
+tests 18 unit + 2 proptest + 7 conformance; emu suite 36/36. Frame-based
+SEH (.pdata unwind, `__C_specific_handler`) now has its delivery
+foundation; per the roadmap, that or async IRP completion/APCs is next.
