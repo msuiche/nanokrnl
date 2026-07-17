@@ -5,12 +5,16 @@ on:
     branches: [main]
   pull_request:
 
-# The emulator (nanox, in emu/) builds from a clean checkout and is what CI
-# guards. The kernel itself is intentionally not built here: its image embeds
-# third-party Microsoft binaries (winbin/, gitignored), so it cannot be built
-# from a fresh clone. The instruction-level differential (diff_unicorn /
-# diff_trace, feature "oracle") needs cmake + Unicorn and a kernel image, so it
-# stays a local gate; see emu/examples/.
+# CI guards two things from a clean checkout:
+#   - nanox (emu/): unit tests, wasm build, advisory clippy.
+#   - the kernel: host ABI-conformance/proptest suites, then a full QEMU boot
+#     of the boot self-test suite (exit 33 = all passed). The kernel's build.rs
+#     embeds PEs with empty placeholders when absent, so the Microsoft binaries
+#     in winbin/ (gitignored, non-redistributable) just make their tests SKIP;
+#     every in-tree PE (driver, kernel32/msvcrt shims, ring-3 apps) is built
+#     below so the suite runs with real coverage.
+# The instruction-level differential (diff_unicorn / diff_trace, feature
+# "oracle") needs cmake + Unicorn, so it stays a local gate; see emu/examples/.
 jobs:
   nanox:
     name: nanox (build, test, wasm)
@@ -31,3 +35,46 @@ jobs:
       - name: Clippy (advisory)
         continue-on-error: true
         run: cargo clippy --release
+
+  kernel:
+    name: kernel (host tests + QEMU boot self-tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Kernel proper: stable + x86_64-unknown-none (also pinned by
+      # rust-toolchain.toml at the repo root).
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-none
+      # Nightly for the boot-image builder and the PE shim/app builds
+      # (-Zbuild-std); llvm-tools for the bootloader crate's boot stages.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rust-src, llvm-tools
+      - uses: Swatinem/rust-cache@v2
+      - name: Install QEMU + LLD
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 lld llvm
+          # llvm-dlltool lives under /usr/lib/llvm-*/bin on Ubuntu; put it on
+          # PATH so scripts/*.sh can find it (their default is a Homebrew path).
+          command -v llvm-dlltool >/dev/null || \
+            sudo ln -s "$(ls /usr/lib/llvm-*/bin/llvm-dlltool | head -1)" /usr/local/bin/llvm-dlltool
+      - name: Host tests (ABI conformance + allocator proptests)
+        run: cargo test -p kernel
+      - name: Build in-tree PEs (driver, shim DLLs, ring-3 apps)
+        env:
+          DLLTOOL: llvm-dlltool
+        run: |
+          sh scripts/build-driver.sh
+          sh scripts/build-kernel32.sh
+          sh scripts/build-msvcrt.sh
+          sh scripts/build-userapp.sh
+          sh scripts/build-userapp2.sh
+          sh scripts/build-worker.sh
+          sh scripts/build-crash.sh
+      # Boots the kernel with every in-tree PE embedded; the self-test suite
+      # exits 33 on success (winbin/-dependent tests SKIP gracefully).
+      - name: Boot self-tests under QEMU (exit 33 = all passed)
+        run: sh scripts/qemu-test.sh
