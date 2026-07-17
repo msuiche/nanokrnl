@@ -360,7 +360,17 @@ fn spawn_process_thread(
     teb: u64,
 ) -> Result<*mut ps::Ethread, crate::rtl::NtStatus> {
     let start = ex::ex_allocate_object(UserStart { rip, rsp, cr3, teb }, pool_tag(b"UStr"))?;
-    ps::ps_create_system_thread(user_thread_entry, start as *mut core::ffi::c_void)
+    let t = ps::ps_create_system_thread(user_thread_entry, start as *mut core::ffi::c_void)?;
+    // Record the address space at spawn, not at first run: the scheduler's
+    // very first switch into this thread must already see its CR3 — both to
+    // load it and to swap in the process's private shim CRT state. (Setting
+    // it in user_thread_entry left the first switch-in seeing cr3 == 0, so a
+    // process booted on the *stale shared* CRT arena and, with per-process
+    // demand-paged heaps, touched chunk VAs its own address space never
+    // backed.) The thread cannot run until we block, so this is race-free —
+    // same argument as the std_handles/cmdline writes at the call sites.
+    unsafe { (*t).tcb.cr3 = cr3 };
+    Ok(t)
 }
 
 /// Record the command line a freshly-spawned thread's program will see
@@ -496,13 +506,8 @@ pub(crate) fn create_user_process(image: &[u8], cmdline: &[u8], std_handles: [u6
         Ok(p) => p,
         Err(_) => return 0,
     };
-    // Give this process its own copy of the shims' C-runtime data (msvcrt's fd
-    // table, cached standard handles). The shim code is shared high-half code,
-    // but this state must be per-process or a concurrent child's CRT init would
-    // corrupt this process's - the root cause of `dir | sort` handing the wrong
-    // handle to `sort`. The scheduler swaps this buffer in whenever the process
-    // runs. Freed in on_user_thread_exit.
-    crate::ldr::loaded::alloc_shim_data(proc.cr3.0);
+    // (The process's private copy of the shims' C-runtime data — kernel32's
+    // heap arena, msvcrt's fd table — was set up by load_user_process itself.)
     // Patch the PEB command line with the real invocation so a tool that reads
     // PEB.ProcessParameters.CommandLine directly (e.g. ulib's more.com) sees its
     // arguments. The per-thread cmdline (for the GetCommandLine syscall) is set
@@ -592,6 +597,18 @@ pub(crate) fn on_user_thread_exit(thread: u64) {
     if cr3 != 0 {
         crate::ob::handle::ob_free_table(cr3);
         crate::ldr::loaded::free_shim_data(cr3);
+        // Reclaim the address space itself (image, stack, control block, and
+        // every demand-faulted heap page). Switch to the kernel address space
+        // first: freeing the live PML4 under our own translations would
+        // corrupt the trap/scheduler path between here and the context
+        // switch. The dying thread never runs again, and the next thread's
+        // switch-in loads its own CR3.
+        let pml4 = crate::mm::PhysAddr(cr3);
+        unsafe {
+            crate::mm::virt::mm_switch_address_space(crate::mm::virt::mm_kernel_address_space());
+            crate::mm::vad::vad_teardown(pml4);
+            crate::mm::virt::mm_free_user_address_space(pml4);
+        }
     }
 }
 
@@ -700,12 +717,12 @@ extern "C" fn user_thread_entry(ctx: *mut core::ffi::c_void) -> ! {
     unsafe {
         // Switch into this process's address space (if any) before dropping
         // to ring 3. The kernel half is shared, so the code/stack executing
-        // here stay mapped across the switch.
+        // here stay mapped across the switch. (The scheduler already loaded
+        // this CR3 on switch-in — tcb.cr3 is set at spawn — so this is a
+        // reassertion; the field write keeps the same value.)
         let cur = ke::pcr::ke_get_current_thread();
         if cr3 != 0 {
             mm::virt::mm_switch_address_space(mm::PhysAddr(cr3));
-            // Record it so the scheduler restores this address space whenever
-            // the thread is switched back in (e.g. after a blocking syscall).
             (*cur).cr3 = cr3;
         }
         // This thread's kernel stack must be the one the syscall path switches
@@ -844,6 +861,61 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
         let expect = (probe as u64) - (mm::phys_to_virt(mm::PhysAddr(0)) as u64);
         check!("Mm: page-table walk translates pool VA", pa == Some(mm::PhysAddr(expect)));
         mm::pool::pool_free(probe, pool_tag(b"Tst3"));
+    }
+
+    // --- Mm: VADs + demand commit ----------------------------------------
+    // The whole cycle on the current (kernel) address space: allocate a
+    // committed range, watch it start unmapped, fault it in by touching it
+    // (the kernel's own #PF resolve path), probe an unbacked neighbour,
+    // reprotect the backed page, then free everything and count frames.
+    {
+        let as_now = mm::virt::mm_current_address_space();
+        let va = mm::vad::vad_allocate(as_now, 4, true, false);
+        check!("Mm: VAD allocates a committed user range", va.is_some());
+        if let Some(va) = va {
+            check!(
+                "Mm: VAD range starts unmapped (demand-paged)",
+                mm::virt::mm_get_physical_address(va).is_none()
+            );
+            // First touch: write page 0 from the kernel through the SMAP
+            // bracket — this takes a real #PF and resolves it.
+            mm::virt::user_access_begin();
+            unsafe { core::ptr::write_bytes(va as *mut u8, 0x5A, mm::PAGE_SIZE) };
+            let first = unsafe { (va as *const u8).read() };
+            mm::virt::user_access_end();
+            let backed = mm::virt::mm_get_physical_address(va).is_some();
+            check!("Mm: demand fault backed the page on first touch", backed);
+            check!(
+                "Mm: demand-faulted page reads back what was written",
+                backed && first == 0x5A
+            );
+            // The next page over is committed but untouched: probe must
+            // accept it (VAD-covered), the page tables must not have it.
+            check!(
+                "Mm: probe accepts a committed, unbacked VAD page",
+                mm::virt::probe_for_read(va + 0x1000, 1, 1).is_ok()
+                    && mm::virt::mm_get_physical_address(va + 0x1000).is_none()
+            );
+            // NtProtect semantics on the backed page: drop write.
+            let ro = mm::vad::vad_protect(as_now, va, 0x1000, false, false).is_ok()
+                && mm::virt::mm_debug_pte(va).is_some_and(|pte| pte & (1 << 1) == 0);
+            check!("Mm: VAD protect makes a backed page read-only", ro);
+            let free_before = mm::phys::mm_free_page_count();
+            let freed = mm::vad::vad_free(as_now, va, 4 * mm::PAGE_SIZE as u64).is_ok();
+            check!(
+                "Mm: VAD free unmaps and returns the one backed page",
+                freed && mm::virt::mm_get_physical_address(va).is_none()
+                    && mm::phys::mm_free_page_count() == free_before + 1
+            );
+            check!(
+                "Mm: probe rejects the freed range again",
+                mm::virt::probe_for_read(va, 16, 1).is_err()
+            );
+            check!(
+                "Mm: VAD list is empty after the free",
+                mm::vad::vad_count(as_now) == 0
+            );
+        }
     }
 
     // --- Ke: clock + timers ---------------------------------------------

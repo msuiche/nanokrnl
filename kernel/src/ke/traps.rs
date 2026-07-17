@@ -207,6 +207,20 @@ extern "C" fn ki_dispatch_trap(frame: &mut KtrapFrame) {
             unsafe {
                 core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack));
             }
+            // Demand commit (`MmAccessFault` in miniature): a *not-present*
+            // fault (error-code P bit clear) on a VAD-committed user range
+            // gets a zeroed page and a retry. Only at PASSIVE_LEVEL —
+            // resolution allocates, and anyone holding a lock on this CPU is
+            // running at DISPATCH or above, so a fault there must never try.
+            // A protection fault (P set, e.g. a write to a read-only VAD
+            // page) is deliberately not resolvable: it falls through to the
+            // same access-violation fate as an unmapped address.
+            if frame.error_code & 1 == 0
+                && crate::ke::irql::ke_get_current_irql() == crate::ke::irql::PASSIVE_LEVEL
+                && crate::mm::vad::vad_resolve(cr2)
+            {
+                return;
+            }
             // A page fault from ring 3 (saved CS RPL 3) is a user-program bug,
             // not a kernel one: terminate the faulting thread instead of
             // bugchecking, so one bad process doesn't take down the system.

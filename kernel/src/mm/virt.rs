@@ -19,7 +19,7 @@
 //! bootloader didn't provide; the read-side walker below already covers
 //! diagnostics and `MmGetPhysicalAddress`.
 
-use super::{phys::mm_allocate_page, phys_to_virt, PhysAddr};
+use super::{phys::mm_allocate_page, phys::mm_free_contiguous_pages, phys_to_virt, PhysAddr};
 use core::arch::asm;
 
 const ENTRY_PRESENT: u64 = 1 << 0;
@@ -135,13 +135,22 @@ pub fn probe_user_buffer(
     let end = address
         .checked_add(length as u64)
         .ok_or(crate::rtl::NtStatus::ACCESS_VIOLATION)?;
-    // Every page the range touches must be present and user-accessible.
+    // Every page the range touches must be present and user-accessible — or,
+    // failing that, covered by a committed VAD: a committed page that simply
+    // hasn't been touched yet is a valid buffer whose first access faults in
+    // (demand commit, `mm::vad`). Outside every VAD it's the access
+    // violation it always was.
     let mut page = address & !0xFFF;
+    let mut all_present = true;
     while page < end {
         if !page_present_and_user(page) {
-            return Err(crate::rtl::NtStatus::ACCESS_VIOLATION);
+            all_present = false;
+            break;
         }
         page += 0x1000;
+    }
+    if !all_present && !crate::mm::vad::vad_covers(current_pml4(), address, length) {
+        return Err(crate::rtl::NtStatus::ACCESS_VIOLATION);
     }
     Ok(())
 }
@@ -498,4 +507,135 @@ pub fn mm_get_physical_address(va: u64) -> Option<PhysAddr> {
         return None;
     }
     Some(PhysAddr((pte & ADDR_MASK) | (va & 0xFFF)))
+}
+
+
+// ---------------------------------------------------------------------------
+// Write-side single-page operations (VAD demand-commit / free / protect)
+// ---------------------------------------------------------------------------
+
+/// Invalidate the TLB entry for the page containing `va` (current AS).
+unsafe fn invlpg(va: u64) {
+    unsafe { asm!("invlpg [{}]", in(reg) va, options(nostack)) };
+}
+
+/// Walk the current address space to the 4 KiB leaf PTE for `va`. Returns
+/// `None` on any not-present level, and on a large-page leaf: the user low
+/// half is only ever mapped at 4 KiB granularity by us, so a large leaf here
+/// is a supervisor mapping (identity/window) we must not touch.
+unsafe fn leaf_pte(va: u64) -> Option<*mut u64> {
+    unsafe {
+        let idx = |shift: u64| ((va >> shift) & 0x1FF) as usize;
+        let p4 = entry(current_pml4(), idx(39));
+        if p4 & ENTRY_PRESENT == 0 {
+            return None;
+        }
+        let p3 = entry(PhysAddr(p4 & ADDR_MASK), idx(30));
+        if p3 & ENTRY_PRESENT == 0 || p3 & ENTRY_LARGE != 0 {
+            return None;
+        }
+        let p2 = entry(PhysAddr(p3 & ADDR_MASK), idx(21));
+        if p2 & ENTRY_PRESENT == 0 || p2 & ENTRY_LARGE != 0 {
+            return None;
+        }
+        Some(entry_ptr(PhysAddr(p2 & ADDR_MASK), idx(12)))
+    }
+}
+
+/// Unmap the 4 KiB page at `va` from the **current** address space,
+/// returning the frame it mapped (`None` when it was never backed).
+/// Intermediate tables are left in place — they are shared with neighboring
+/// mappings and reclaimed wholesale at address-space teardown.
+///
+/// # Safety
+/// `va` must be a user page this address space owns (a VAD-backed range).
+pub unsafe fn mm_unmap_user_page(va: u64) -> Option<PhysAddr> {
+    unsafe {
+        let pte = leaf_pte(va)?;
+        if *pte & ENTRY_PRESENT == 0 {
+            return None;
+        }
+        let pa = PhysAddr(*pte & ADDR_MASK);
+        *pte = 0;
+        invlpg(va);
+        Some(pa)
+    }
+}
+
+/// Change the write/execute bits of the page at `va` in the **current**
+/// address space. A no-op when the page isn't backed — an unbacked VAD page
+/// picks up its protection from the descriptor at fault time instead.
+///
+/// # Safety
+/// `va` must be a user page this address space owns.
+pub unsafe fn mm_protect_user_page(va: u64, writable: bool, executable: bool) {
+    unsafe {
+        let Some(pte) = leaf_pte(va) else { return };
+        if *pte & ENTRY_PRESENT == 0 {
+            return;
+        }
+        *pte = (*pte & !ENTRY_RW & !ENTRY_NX)
+            | if writable { ENTRY_RW } else { 0 }
+            | if executable { 0 } else { ENTRY_NX };
+        invlpg(va);
+    }
+}
+
+/// Raw PTE for `va` in the current address space — self-test surface for
+/// asserting protection bits (`NtProtectVirtualMemory` made it read-only?).
+pub fn mm_debug_pte(va: u64) -> Option<u64> {
+    unsafe {
+        let pte = leaf_pte(va)?;
+        if *pte & ENTRY_PRESENT == 0 {
+            return None;
+        }
+        Some(*pte)
+    }
+}
+
+/// Free an entire per-process user address space: every low-half leaf's
+/// backing frame, the intermediate page tables, and the PML4 itself.
+///
+/// The low half of a per-process space only ever holds mappings this kernel
+/// created — the loaded image, the user stack, the TEB/PEB block, and
+/// VAD-backed heap — all 4 KiB leaves, all owned by the process, so every
+/// present leaf frame is reclaimed here (VAD-backed or not).
+///
+/// # Safety
+/// The caller must **not** be running on `pml4` — switch to the kernel
+/// address space first; the PML4 is freed. No TLB flush is needed: the
+/// space is never loaded into CR3 again.
+pub unsafe fn mm_free_user_address_space(pml4: PhysAddr) {
+    unsafe {
+        let t = phys_to_virt(pml4) as *mut u64;
+        for i in 0..256 {
+            let e = *t.add(i);
+            if e & ENTRY_PRESENT != 0 {
+                free_table_level(PhysAddr(e & ADDR_MASK), 3);
+            }
+        }
+        mm_free_contiguous_pages(pml4, 1);
+    }
+}
+
+/// Recursive walk-and-free under a table (`level` 3 = PDPT, 2 = PD, 1 = PT):
+/// frees every present leaf's backing frame, then the table page itself.
+unsafe fn free_table_level(table: PhysAddr, level: u8) {
+    unsafe {
+        let t = phys_to_virt(table) as *mut u64;
+        for i in 0..512 {
+            let e = *t.add(i);
+            if e & ENTRY_PRESENT == 0 {
+                continue;
+            }
+            debug_assert!(e & ENTRY_LARGE == 0, "large page in user low half");
+            let child = PhysAddr(e & ADDR_MASK);
+            if level > 1 {
+                free_table_level(child, level - 1);
+            } else {
+                mm_free_contiguous_pages(child, 1);
+            }
+        }
+        mm_free_contiguous_pages(table, 1);
+    }
 }

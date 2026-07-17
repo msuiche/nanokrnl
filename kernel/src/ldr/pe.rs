@@ -371,6 +371,14 @@ pub fn load_user_process(data: &[u8]) -> Result<LoadedProcess, NtStatus> {
         real_entry
     };
 
+    // Give this process its own copy of the shims' C-runtime data (kernel32's
+    // heap arena, msvcrt's fd table, cached standard handles). The shim *code*
+    // is shared high-half code, but this state must be per-process: with the
+    // heap now demand-paged into each process's own low-half VAD arena, a
+    // shared arena would hand one process pointers that only another address
+    // space backs. Idempotent; freed in on_user_thread_exit.
+    super::loaded::alloc_shim_data(cr3.0);
+
     Ok(LoadedProcess {
         cr3,
         entry_va,

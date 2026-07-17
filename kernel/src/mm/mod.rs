@@ -7,7 +7,11 @@
 //! * [`pool`] — the NonPagedPool: tagged variable-size kernel heap,
 //!   also wired up as Rust's `#[global_allocator]` so `alloc::` types
 //!   (Box/Vec/String) draw from pool exactly like `ExAllocatePoolWithTag`.
-//! * [`virt`] — page-table introspection (`MmGetPhysicalAddress`).
+//! * [`virt`] — page-table introspection (`MmGetPhysicalAddress`) and
+//!   per-process address spaces.
+//! * [`vad`] — per-address-space VADs and the demand-commit fault path:
+//!   `NtAllocateVirtualMemory` records a descriptor, the #PF handler backs
+//!   the page on first touch (`MmAccessFault` in miniature).
 //!
 //! ## The physical-memory window
 //!
@@ -20,14 +24,17 @@
 //! 2. Page tables themselves are readable the same way, which is what
 //!    makes [`virt::mm_get_physical_address`] a simple walk.
 //!
-//! Paged pool, VADs, working sets and the fault-driven paths are future
-//! work; everything here is the resident, never-paged core that the rest
-//! of the kernel boots on.
+//! Paged pool, working sets, and paging to disk are future work; everything
+//! here is the resident, never-paged core that the rest of the kernel boots
+//! on. (User anonymous memory *is* demand-committed via [`vad`], but nothing
+//! is ever written out — there is no pagefile to write to.)
 
 #[cfg(target_arch = "x86_64")]
 pub mod phys;
 #[cfg(target_arch = "x86_64")]
 pub mod pool;
+#[cfg(target_arch = "x86_64")]
+pub mod vad;
 #[cfg(target_arch = "x86_64")]
 pub mod virt;
 

@@ -693,64 +693,65 @@ extern "C" fn report_test_result(code: u64, _a2: u64, _a3: u64, _a4: u64) -> u64
     NtStatus::SUCCESS.0 as u64
 }
 
-/// Window base: the virtual address physical page 0 maps to. The user heap
-/// lives in the shared high-half physical-memory window (`window_base +
-/// physical_address`), so this converts between the two for alloc/free.
-///
-/// NOTE: a *per-process* heap (mapping each allocation into the calling
-/// process's own low-half address space) is blocked on per-process `kernel32`
-/// instances — the shared `kernel32` keeps its heap arena (`BUMP`/free-list)
-/// in shared `.data`, so a chunk it allocates while one address space is
-/// active gets sub-allocated to a different process whose address space never
-/// mapped it. Until `kernel32` is loaded per-process, the heap stays in the
-/// shared window.
-fn window_base() -> u64 {
-    crate::mm::phys_to_virt(crate::mm::PhysAddr(0)) as u64
-}
-
-/// `NtAllocateVirtualMemory` (simplified): `a1` = byte size. Allocates the
-/// rounded-up page count from the physical allocator, maps it
-/// user-accessible, and returns the base VA in RAX (0 on failure). A user
-/// heap allocator (in a future ntdll/CRT) layers on top of this.
+/// `NtAllocateVirtualMemory` (simplified): `a1` = byte size. Records a
+/// committed VAD in the calling process's own (low-half) address space and
+/// returns the base VA in RAX (0 on failure). No page is mapped — the first
+/// touch faults one in on demand (`mm::vad` + the #PF path). Per-process
+/// now that every process carries its own copy of the shims' C-runtime data
+/// (the historical shared-window heap, and its cross-process W^X coarsening,
+/// is gone). Protection is `PAGE_READWRITE` — an NX heap.
 extern "C" fn nt_allocate_virtual_memory(size: u64, _a2: u64, _a3: u64, _a4: u64) -> u64 {
-    if size == 0 {
+    if size == 0 || size > MAX_IO_LEN as u64 {
         return 0;
     }
     let pages = (size as usize).div_ceil(crate::mm::PAGE_SIZE);
-    match crate::mm::phys::mm_allocate_contiguous_pages(pages) {
-        Some(pa) => {
-            let va = crate::mm::phys_to_virt(pa) as u64;
-            // Make the region user-accessible (and executable — heap W^X is a
-            // documented coarsening of the shared-address-space model).
-            unsafe { crate::mm::virt::mm_set_user_executable(va, pages * crate::mm::PAGE_SIZE) };
-            va
-        }
-        None => 0,
-    }
+    crate::mm::vad::vad_allocate(
+        crate::mm::virt::mm_current_address_space(),
+        pages,
+        true,
+        false,
+    )
+    .unwrap_or(0)
 }
 
 /// `NtFreeVirtualMemory` (simplified): `a1` = base VA, `a2` = byte size.
-/// Returns the pages to the physical allocator. Returns STATUS_SUCCESS.
+/// Drops the range from the process's VADs, unmapping and freeing whatever
+/// pages were backed. Returns STATUS_SUCCESS.
 extern "C" fn nt_free_virtual_memory(base: u64, size: u64, _a3: u64, _a4: u64) -> u64 {
     if base == 0 || size == 0 {
         return NtStatus::INVALID_PARAMETER.0 as u64;
     }
-    let pages = (size as usize).div_ceil(crate::mm::PAGE_SIZE);
-    let phys = base.wrapping_sub(window_base());
-    crate::mm::phys::mm_free_contiguous_pages(crate::mm::PhysAddr(phys), pages);
-    NtStatus::SUCCESS.0 as u64
+    match crate::mm::vad::vad_free(crate::mm::virt::mm_current_address_space(), base, size) {
+        Ok(()) => NtStatus::SUCCESS.0 as u64,
+        Err(e) => e.0 as u64,
+    }
 }
 
-/// `NtProtectVirtualMemory` (simplified): ensures the range is
-/// user-accessible + executable + writable and returns STATUS_SUCCESS.
-/// Permissive (it never *removes* access) — enough for a CRT's
-/// `VirtualProtect` calls not to fail; real per-page W^X protection is
-/// future work in the single-address-space model.
-extern "C" fn nt_protect_virtual_memory(base: u64, size: u64, _protect: u64, _a4: u64) -> u64 {
-    if base != 0 && size != 0 {
-        unsafe { crate::mm::virt::mm_set_user_executable(base, size as usize) };
+/// `NtProtectVirtualMemory` (simplified): `a1` = base VA, `a2` = byte size,
+/// `a3` = a Win32 `PAGE_*` value. Real per-page protection: the VADs record
+/// it (pages not yet backed inherit it at fault time) and already-backed
+/// pages get their PTE RW/NX bits rewritten.
+extern "C" fn nt_protect_virtual_memory(base: u64, size: u64, protect: u64, _a4: u64) -> u64 {
+    // Win32 PAGE_* (winnt.h), low byte selects the protection. Our two-bit
+    // (write, execute) model can't express no-access-on-read: NOACCESS and
+    // READONLY both land on read-only/NX, and a stray *write* still faults.
+    let (w, x) = match protect & 0xFF {
+        0x01 | 0x02 => (false, false), // PAGE_NOACCESS / PAGE_READONLY
+        0x04 | 0x08 => (true, false),  // PAGE_READWRITE / PAGE_WRITECOPY
+        0x10 | 0x20 => (false, true),  // PAGE_EXECUTE / PAGE_EXECUTE_READ
+        0x40 | 0x80 => (true, true),   // PAGE_EXECUTE_READWRITE / PAGE_EXECUTE_WRITECOPY
+        _ => return NtStatus::INVALID_PARAMETER.0 as u64,
+    };
+    match crate::mm::vad::vad_protect(
+        crate::mm::virt::mm_current_address_space(),
+        base,
+        size,
+        w,
+        x,
+    ) {
+        Ok(()) => NtStatus::SUCCESS.0 as u64,
+        Err(e) => e.0 as u64,
     }
-    NtStatus::SUCCESS.0 as u64
 }
 
 /// `NtTerminateThread` (self): end the calling thread. Never returns to user.

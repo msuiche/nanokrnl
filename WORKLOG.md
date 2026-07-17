@@ -921,3 +921,95 @@ not an fd-layer tweak; every incremental fd change either scrambles the ends or
 regresses redirect. Reverted to the known-good state so **redirection stays
 working** and there is no regression. Pipes remain the one shell feature that
 waits on that rework.
+
+### 2026-07-17 - CI: the kernel now has a gate (host tests + QEMU boot self-tests)
+
+CI previously guarded only nanox, on the premise (in the workflow comment) that
+the kernel "cannot be built from a fresh clone" because its image embeds the
+gitignored Microsoft binaries in winbin/. That premise was stale: build.rs has
+always resolved every embedded PE through its empty-placeholder fallback, so a
+clean checkout builds fine - only the winbin/ binaries and drivers/null.sys are
+non-redistributable, and their tests report SKIP rather than FAIL.
+
+Proved it before wiring it up: `git clone` into a scratch dir, built all seven
+in-tree PEs from source with the repo's own scripts (driver, kernel32, msvcrt,
+userapp, userapp2, worker, crash - nightly, x86_64-pc-windows-msvc, lld-link,
+llvm-dlltool), then `scripts/qemu-test.sh`: full boot, ALL SELF TESTS PASSED,
+exit 33, including the PE-driver load/IOCTL/unload cycle and the multi-process
+ring-3 tests. Host side: `cargo test -p kernel` green (7 ABI-conformance +
+2 allocator proptests).
+
+`.github/workflows/ci.yml` gains a `kernel` job next to `nanox`:
+
+- stable + x86_64-unknown-none for the kernel proper; nightly with rust-src /
+  llvm-tools / x86_64-pc-windows-msvc for the boot-image builder and PE builds.
+- `apt install qemu-system-x86 lld llvm`; Ubuntu hides llvm-dlltool under
+  /usr/lib/llvm-*/bin, so the job symlinks it onto PATH (the scripts' default
+  DLLTOOL path is Homebrew-only; the job also exports DLLTOOL=llvm-dlltool).
+- Steps: `cargo test -p kernel` -> build the seven PEs -> `sh
+  scripts/qemu-test.sh` as the pass/fail gate, with rust-cache for speed.
+
+Verified locally end to end on macOS (fresh clone, exact script sequence);
+the one thing only a real runner can exercise is the Ubuntu apt layer, which
+the first CI run will confirm. The emulator job and the local-only Unicorn
+differential gate are unchanged.
+
+### 2026-07-17 - VADs + demand paging: the heap goes per-process, and two latent bugs surface
+
+Phase A of the memory-manager roadmap: per-address-space VADs and a
+fault-driven commit path, replacing the shared physical-window heap.
+
+**What changed.** New `kernel/src/mm/vad.rs`: a sorted, non-overlapping list
+of committed ranges per address space (keyed by PML4, since threads carry
+`cr3` and there is no EPROCESS yet). `NtAllocateVirtualMemory` now just
+inserts a descriptor in a low-half arena (`0x0000_7000_0000_0000`+); no page
+is mapped until first touch. The #PF handler (`ke/traps.rs`) resolves a
+*not-present* fault at PASSIVE_LEVEL against the current space's VADs — a
+hit gets a zeroed frame mapped with the VAD's protection and the CPU retries;
+anything else keeps its old fate (thread kill from ring 3, bugcheck from
+ring 0). Protection faults (P bit set) are deliberately unresolvable, which
+is how a write to a read-only VAD page stays an access violation.
+`NtFreeVirtualMemory` unmaps/frees backed pages and splits/shrinks VADs;
+`NtProtectVirtualMemory` is real now (VAD split + per-page RW/NX rewrite)
+instead of a permissive no-op; the heap is NX (`PAGE_READWRITE`) instead of
+the old documented RWX coarsening. `ProbeForRead/Write` keep their PTE walk
+but take a VAD second chance, so a committed-but-unbacked buffer is valid
+(the access faults it in) while anything outside every VAD is still
+`STATUS_ACCESS_VIOLATION`. Process exit now reclaims the whole address
+space: `on_user_thread_exit` switches to the kernel AS, drops the VADs, and
+`mm_free_user_address_space` walks the low half freeing every leaf frame,
+the tables, and the PML4 (previously all leaked).
+
+**Two latent bugs this exposed** (both invisible while heap VAs were
+window-backed and valid in every address space):
+
+1. *Self-test processes shared the CRT heap arena.* `alloc_shim_data` (the
+   per-process copy of kernel32/msvcrt `.data`) was only called on the
+   `create_user_process` path; the boot harness's direct
+   `load_user_process`+spawn sites (isolated userapp, worker pair, sort,
+   choice, where, cmd) shared the kernel's arena. A stale `BUMP` then handed
+   a process a chunk VA its own AS never backed: user #PF, thread killed,
+   and the kernel32 `HEAP_LOCK` it died holding wedged every later heap user
+   (watchdog timeout). Fixed by moving `alloc_shim_data` into
+   `load_user_process` itself (idempotent per cr3), so *every* process gets
+   private CRT data.
+2. *`Kthread.cr3` was only set at first run* (in `user_thread_entry`), so
+   the scheduler's first switch into a process thread saw `cr3 == 0` and
+   skipped the shim-data swap — the process booted on the stale shared arena
+   even with a slot allocated. Debug prints showed zero `swap` lines for the
+   faulting process while the preempted worker pair swapped fine. Fixed by
+   setting `tcb.cr3` in `spawn_process_thread` (race-free: the child can't
+   run until the spawner blocks).
+
+Diagnosis was print-driven: temporary `VAD:`/`SHIM:` kd prints showed the
+faulting process's VAD space never existed and its arena swap never ran,
+respectively; prints removed after the fix.
+
+**Verified.** `cargo test -p kernel`: 18 unit + 2 proptest + 7 ABI
+conformance, all green. Boot self-tests: 67 -> **76 checks** (9 new: VAD
+alloc-starts-unmapped, demand fault on first touch incl. read-back, probe of
+an unbacked committed page, protect-to-read-only PTE bit, free unmaps and
+returns the frame, probe rejects the freed range, VAD list empty), and the
+whole ring-3 suite (userapp/userapp2/worker pair/CreateProcess/sort/choice/
+where/cmd) now runs on per-process demand-paged heaps. `ALL SELF TESTS
+PASSED`, exit 33.
