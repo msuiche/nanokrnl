@@ -31,6 +31,14 @@ pub struct ObjectType {
     /// Called when the last reference drops, before the pool free, to
     /// tear down type-specific state (close hardware, unlink lists…).
     pub delete: Option<fn(body: *mut u8)>,
+    /// Called after each new reference is taken. Lets a type mirror its
+    /// live-reference count elsewhere — the pipe write end counts its open
+    /// writers this way, so a reader sees EOF exactly when the last writer
+    /// closes (across handle dups and cross-process inheritance).
+    pub on_reference: Option<fn(body: *mut u8)>,
+    /// Called on each dereference *before* the count drops. Pair of
+    /// [`ObjectType::on_reference`].
+    pub on_dereference: Option<fn(body: *mut u8)>,
 }
 
 /// `OBJECT_HEADER` — lives immediately before every object body.
@@ -85,6 +93,9 @@ pub unsafe fn ob_reference_object(body: *mut u8) {
     unsafe {
         let prev = (*body_to_header(body)).ref_count.fetch_add(1, Ordering::Relaxed);
         debug_assert!(prev > 0, "referencing a dead object");
+        if let Some(on_ref) = (*body_to_header(body)).object_type.on_reference {
+            on_ref(body);
+        }
     }
 }
 
@@ -96,6 +107,9 @@ pub unsafe fn ob_reference_object(body: *mut u8) {
 pub unsafe fn ob_dereference_object(body: *mut u8) {
     unsafe {
         let hdr = body_to_header(body);
+        if let Some(on_deref) = (*hdr).object_type.on_dereference {
+            on_deref(body);
+        }
         // Release ordering so all writes to the object happen-before the
         // destruction observed by whichever thread does the final drop.
         let prev = (*hdr).ref_count.fetch_sub(1, Ordering::Release);

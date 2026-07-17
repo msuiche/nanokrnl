@@ -55,6 +55,8 @@ pub static FILES: &[RamFile] = &[
 pub static FILE_TYPE: ob::ObjectType = ob::ObjectType {
     name: UnicodeString::from_units(w!("File")),
     delete: None,
+    on_reference: None,
+    on_dereference: None,
 };
 
 /// A read-only open file: its bytes plus a read cursor.
@@ -346,6 +348,8 @@ unsafe impl Sync for WritableFile {}
 pub static WRITABLE_FILE_TYPE: ob::ObjectType = ob::ObjectType {
     name: UnicodeString::from_units(w!("WritableFile")),
     delete: None,
+    on_reference: None,
+    on_dereference: None,
 };
 
 /// Registry of created writable files (path -> shared buffer).
@@ -411,11 +415,13 @@ pub unsafe fn is_writable_file(body: *mut u8) -> bool {
 /// # Safety
 /// `file` is a live `WritableFile`; `src` valid for `len` bytes.
 pub unsafe fn write(file: *mut WritableFile, src: *const u8, len: usize) -> usize {
+    // Stage the user buffer into kernel memory at PASSIVE_LEVEL first: the
+    // append runs under the file spinlock (DISPATCH_LEVEL), and a demand
+    // fault on a fresh VAD-backed page of `src` can only resolve at PASSIVE.
+    let chunk = unsafe { core::slice::from_raw_parts(src, len) }.to_vec();
     let sh = unsafe { &*(*file).shared };
     let mut d = sh.data.lock();
-    for i in 0..len {
-        d.push(unsafe { *src.add(i) });
-    }
+    d.extend_from_slice(&chunk);
     len
 }
 
@@ -425,13 +431,19 @@ pub unsafe fn write(file: *mut WritableFile, src: *const u8, len: usize) -> usiz
 /// `file` is a live `WritableFile`; `dst` valid for `max` bytes.
 pub unsafe fn read_writable(file: *mut WritableFile, dst: *mut u8, max: usize) -> usize {
     let sh = unsafe { &*(*file).shared };
-    let d = sh.data.lock();
-    let pos = unsafe { (*file).pos.load(Ordering::Acquire) };
-    let n = d.len().saturating_sub(pos).min(max);
-    for i in 0..n {
-        unsafe { *dst.add(i) = d[pos + i] };
+    // Copy out under the spinlock (DISPATCH_LEVEL), then into the user
+    // buffer after releasing it: a demand fault on a fresh VAD-backed page
+    // of `dst` must resolve, and resolution is PASSIVE-only.
+    let (chunk, n) = {
+        let d = sh.data.lock();
+        let pos = unsafe { (*file).pos.load(Ordering::Acquire) };
+        let n = d.len().saturating_sub(pos).min(max);
+        (d[pos..pos + n].to_vec(), n)
+    };
+    unsafe {
+        core::ptr::copy_nonoverlapping(chunk.as_ptr(), dst, n);
+        (*file).pos.fetch_add(n, Ordering::AcqRel);
     }
-    unsafe { (*file).pos.store(pos + n, Ordering::Release) };
     n
 }
 

@@ -28,6 +28,10 @@ struct HandleEntry {
     object: *mut u8,
     #[allow(dead_code)]
     granted_access: u32,
+    /// Open copies of this handle value. A `DuplicateHandle` shares the
+    /// value and bumps this; `NtClose` drops it, and the entry (with the
+    /// object reference it owns) dies only when the last copy closes.
+    refs: u32,
 }
 
 struct TableSlot {
@@ -101,7 +105,7 @@ fn create_in(cr3: u64, object: *mut u8, granted_access: u32) -> u64 {
     // Index 0 is reserved for the NULL handle; allocate from 1 up.
     for i in 1..MAX_HANDLES {
         if t.slots[s].entries[i].is_none() {
-            t.slots[s].entries[i] = Some(HandleEntry { object, granted_access });
+            t.slots[s].entries[i] = Some(HandleEntry { object, granted_access, refs: 1 });
             drop(t);
             // The handle owns a reference for as long as it is open.
             unsafe { ob::ob_reference_object(object) };
@@ -143,19 +147,39 @@ pub fn ob_reference_object_by_handle(handle: u64) -> Result<*mut u8, NtStatus> {
     Err(NtStatus::INVALID_HANDLE)
 }
 
-/// Create a second handle (in the caller's table) referring to the same object
-/// as `handle`, taking a new reference (0 if invalid). Independent of the
-/// source: closing one keeps the object alive for the other. Backs
-/// `DuplicateHandle`.
+/// Create a second reference to the handle **value** itself: share
+/// semantics. The duplicate names the same value (with the entry's
+/// reference count bumped), so a handle value is a stable identity of its
+/// object for as long as any copy is open — the property cmd's redirect
+/// save/restore choreography depends on (`saved = _dup(1); ...;
+/// _dup2(saved, 1); _close(saved)`), where a *fresh* value per dup would
+/// invalidate every copy of the old value a CRT fd table or a cmd local
+/// still holds. Closing any single copy keeps the object alive for the
+/// rest; the last close drops the object reference. Backs `DuplicateHandle`.
 pub fn duplicate_handle(handle: u64) -> u64 {
-    match ob_reference_object_by_handle(handle) {
-        Ok(obj) => ob_create_handle(obj, 0),
-        Err(_) => 0,
+    let cr3 = current_cr3();
+    let i = handle_to_index(handle);
+    let mut t = TABLES.lock();
+    if i >= 1 && i < MAX_HANDLES {
+        for s in 0..MAX_TABLES {
+            if t.slots[s].in_use && t.slots[s].cr3 == cr3 {
+                if let Some(e) = &mut t.slots[s].entries[i] {
+                    e.refs += 1;
+                    // The new copy's reference on the object.
+                    unsafe { ob::ob_reference_object(e.object) };
+                    return handle;
+                }
+                break;
+            }
+        }
     }
+    0
 }
 
-/// `NtClose`: remove the handle from the calling process's table and drop the
-/// reference it held.
+/// `NtClose`: close one copy of the handle. Each copy holds an object
+/// reference (taken at dup time), so every close drops one — the entry dies
+/// with the last copy, and with it the object's type-level accounting (a
+/// pipe's writer count) stays balanced.
 pub fn ob_close_handle(handle: u64) -> NtStatus {
     let cr3 = current_cr3();
     let i = handle_to_index(handle);
@@ -163,9 +187,25 @@ pub fn ob_close_handle(handle: u64) -> NtStatus {
     if i >= 1 && i < MAX_HANDLES {
         for s in 0..MAX_TABLES {
             if t.slots[s].in_use && t.slots[s].cr3 == cr3 {
+                let object = if let Some(e) = &mut t.slots[s].entries[i] {
+                    if e.refs > 1 {
+                        e.refs -= 1;
+                        Some(e.object)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(object) = object {
+                    // A dup copy closed: the entry lives on for the others.
+                    drop(t);
+                    unsafe { ob::ob_dereference_object(object) };
+                    return NtStatus::SUCCESS;
+                }
                 if let Some(e) = t.slots[s].entries[i].take() {
-                    // Drop the lock before dereferencing: the object's delete
-                    // routine could itself touch the object manager.
+                    // Last copy: drop the lock before dereferencing — the
+                    // object's delete routine could itself touch the manager.
                     drop(t);
                     unsafe { ob::ob_dereference_object(e.object) };
                     return NtStatus::SUCCESS;

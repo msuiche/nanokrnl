@@ -187,16 +187,15 @@ extern "C" fn nt_set_std_handle(which: u64, new_handle: u64, _a3: u64, _a4: u64)
     1
 }
 
-/// `DuplicateHandle` - create a second handle referring to the same object as
-/// `src_handle`, returning the new handle (0 on failure). Each handle owns its
-/// own reference, so closing the source keeps the object alive for the copy —
-/// exactly what cmd relies on when it hands a pipe end to a child and then
-/// closes its own copy (the pipe stays open until the child is done).
+/// `DuplicateHandle` - a second open reference to the *same handle value*
+/// (share semantics: the value stays a stable identity of its object while
+/// any copy is open, and the last close drops the object reference). cmd's
+/// redirect choreography depends on this: its CRT fd table and its own
+/// locals hold handle values across dup/close sequences, so a fresh value
+/// per duplicate would alias them onto whatever object next recycled the
+/// freed slot — the `dir | sort` blocker.
 extern "C" fn nt_duplicate_object(src_handle: u64, _a2: u64, _a3: u64, _a4: u64) -> u64 {
-    match handle::ob_reference_object_by_handle(src_handle) {
-        Ok(obj) => handle::ob_create_handle(obj, 0),
-        Err(_) => 0,
-    }
+    handle::duplicate_handle(src_handle)
 }
 
 /// `CreatePipe` - create an anonymous pipe and write its two handles (read then
@@ -210,6 +209,14 @@ extern "C" fn nt_create_pipe(out_ptr: u64, _a2: u64, _a3: u64, _a4: u64) -> u64 
     };
     let rh = handle::ob_create_handle(r as *mut u8, 0);
     let wh = handle::ob_create_handle(w as *mut u8, 0);
+    // The handles now own the references; drop the create-time ones so the
+    // writer count reaches zero when the last *handle* closes (otherwise EOF
+    // on the read end would never fire — a leaked reference kept a phantom
+    // writer alive forever).
+    unsafe {
+        crate::ob::ob_dereference_object(r as *mut u8);
+        crate::ob::ob_dereference_object(w as *mut u8);
+    }
     crate::mm::virt::user_access_begin();
     unsafe {
         *(out_ptr as *mut u64) = rh;
@@ -704,8 +711,15 @@ extern "C" fn report_test_result(code: u64, _a2: u64, _a3: u64, _a4: u64) -> u64
 /// now that every process carries its own copy of the shims' C-runtime data
 /// (the historical shared-window heap, and its cross-process W^X coarsening,
 /// is gone). Protection is `PAGE_READWRITE` — an NX heap.
+///
+/// No size ceiling here: with demand commit, a huge reservation costs only
+/// a VAD until touched (sort.exe sizes its input buffer from total physical
+/// memory — tens of MB — and a flat rejection is fatal to it). The arena
+/// bounds ([`mm::vad`]'s base/limit) and the PFN allocator on touch are the
+/// real limits; `MAX_IO_LEN` still guards the read/write paths, where the
+/// kernel would otherwise walk an absurd buffer length.
 extern "C" fn nt_allocate_virtual_memory(size: u64, _a2: u64, _a3: u64, _a4: u64) -> u64 {
-    if size == 0 || size > MAX_IO_LEN as u64 {
+    if size == 0 {
         return 0;
     }
     let pages = (size as usize).div_ceil(crate::mm::PAGE_SIZE);

@@ -57,10 +57,14 @@ pub fn from_abi(status: Ntstatus) -> NtStatus {
 pub static DEVICE_TYPE: ob::ObjectType = ob::ObjectType {
     name: crate::rtl::string::UnicodeString::from_units(w!("Device")),
     delete: None,
+    on_reference: None,
+    on_dereference: None,
 };
 pub static DRIVER_TYPE: ob::ObjectType = ob::ObjectType {
     name: crate::rtl::string::UnicodeString::from_units(w!("Driver")),
     delete: None,
+    on_reference: None,
+    on_dereference: None,
 };
 
 /// `IoCreateDriver` — allocate the driver object and let `init` (a

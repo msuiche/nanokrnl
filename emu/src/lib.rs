@@ -97,6 +97,10 @@ pub struct Cpu {
     pub paging: mmu::Paging,
     /// CR2 — the linear address of the most recent page fault.
     pub cr2: u64,
+    /// The MMU-computed error code of the most recent page fault (P/WR/US/ID
+    /// bits). The guest's #PF handler consumes this — a demand-paging kernel
+    /// distinguishes not-present faults from protection violations by it.
+    pub pf_code: u32,
     /// CR8 — the task priority register, aliased to IRQL on x86-64. A pending
     /// interrupt vector `v` is delivered only when `v >> 4 > cr8`.
     pub cr8: u64,
@@ -131,7 +135,12 @@ pub struct Cpu {
     /// `syscall` and (0xFFFF_FFFF, RAX) at each `sysret`, so a host tool can see
     /// the syscall/return sequence.
     pub trace_sys: bool,
-    pub sys_log: alloc::vec::Vec<(u32, u64)>,
+    /// Syscall trace: `(svc, [a1..a4])` per call, `(0xFFFF_FFFF, [rax, ..])`
+    /// per return. Args are the Windows ABI slots (r10, rdx, r8, r9).
+    pub sys_log: alloc::vec::Vec<(u32, [u64; 4])>,
+    /// The last syscall's number and args (used by sysret-time dumpers).
+    pub last_svc: u32,
+    pub last_svc_args: [u64; 4],
     /// When set (a GDB stub is attached), an `int3` traps to the debugger
     /// instead of being ignored — so a kernel bugcheck breaks into it.
     pub debug_break: bool,
@@ -202,6 +211,7 @@ impl Default for Cpu {
             machine_mode: false,
             paging: mmu::Paging::default(),
             cr2: 0,
+            pf_code: 0,
             cr8: 0,
             cpl: 0,
             dev: devices::Devices::new(),
@@ -218,6 +228,8 @@ impl Default for Cpu {
             icount: 0,
             trace_sys: false,
             sys_log: alloc::vec::Vec::new(),
+            last_svc: 0,
+            last_svc_args: [0; 4],
             debug_break: false,
         }
     }
@@ -303,12 +315,13 @@ impl Cpu {
     // so these behave exactly like the original flat accessors.
 
     /// Translate a virtual address to physical (identity unless long-mode
-    /// paging is active). Records CR2 on fault.
+    /// paging is active). Records CR2 and the MMU's error code on fault.
     fn xlate(&mut self, mem: &[u8], vaddr: u64, access: mmu::Access) -> Option<u64> {
         match mmu::translate(mem, &self.paging, vaddr, access, self.cpl == 3) {
             Ok(p) => Some(p),
             Err(f) => {
                 self.cr2 = f.addr;
+                self.pf_code = f.code;
                 None
             }
         }
@@ -1445,7 +1458,10 @@ impl Cpu {
                         if self.machine_mode && self.lstar != 0 {
                             if self.trace_sys {
                                 let svc = self.regs[RAX] as u32;
-                                self.sys_log.push((svc, self.regs[10]));
+                                let args = [self.regs[10], self.regs[RDX], self.regs[8], self.regs[9]];
+                                self.sys_log.push((svc, args));
+                                self.last_svc = svc;
+                                self.last_svc_args = args;
                                 #[cfg(not(target_arch = "wasm32"))]
                                 if svc == 3 {
                                     let (ptr, len) = (self.regs[10], (self.regs[RDX] as usize).min(64));
@@ -2017,6 +2033,16 @@ impl Cpu {
                         pc += 2;
                         let (ext, rm, npc) = self.decode_modrm(mem, pc, rex_r, rex_x, rex_b);
                         pc = npc;
+                        // invlpg (/7): the memory operand names a page whose
+                        // translation to invalidate — but it never touches
+                        // memory architecturally (no fault even if unmapped),
+                        // and nanox has no TLB: every access re-walks the
+                        // guest page tables. Nothing to do; just don't fall
+                        // into the descriptor loads below.
+                        if ext & 7 == 7 {
+                            self.rip = pc as u64;
+                            return StepResult::Ok;
+                        }
                         let addr = match rm {
                             Rm::Mem(a) => a,
                             Rm::Reg(_) => return StepResult::Unknown { rip: start, byte: 0x01 },
@@ -2047,7 +2073,20 @@ impl Cpu {
                     // sysret: return to ring 3 — RIP from RCX, RFLAGS from R11.
                     0x07 => {
                         if self.trace_sys {
-                            self.sys_log.push((0xFFFF_FFFF, self.regs[RAX]));
+                            self.sys_log.push((0xFFFF_FFFF, [self.regs[RAX], 0, 0, 0]));
+                            // CreatePipe (svc 36) wrote the two pipe handles to
+                            // the user buffer at a1 — dump them at sysret, when
+                            // the kernel side has populated them.
+                            if self.last_svc == 36 {
+                                let p = self.last_svc_args[0];
+                                let rd = |o: u64| {
+                                    mmu::translate(mem, &self.paging, p + o, mmu::Access::Read, false)
+                                        .ok()
+                                        .and_then(|pa| mem.get(pa as usize..pa as usize + 8))
+                                        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+                                };
+                                eprintln!("[svc36 CreatePipe read={:#x} write={:#x}]", rd(0).unwrap_or(0), rd(8).unwrap_or(0));
+                            }
                         }
                         self.rip = self.regs[RCX];
                         self.rflags = self.regs[11];

@@ -75,11 +75,14 @@ fn main() {
         if trace && cmd.contains('|') {
             m.cpu.trace_sys = false;
             out.push_str("\n--- syscall trace ---\n");
-            for &(svc, val) in &m.cpu.sys_log {
+            for &(svc, args) in &m.cpu.sys_log {
                 if svc == 0xFFFF_FFFF {
-                    out.push_str(&format!("   -> {val:#x}\n"));
+                    out.push_str(&format!("   -> {:#x}\n", args[0]));
                 } else {
-                    out.push_str(&format!("svc {svc:>3} arg1={val:#x}\n"));
+                    out.push_str(&format!(
+                        "svc {svc:>3} a1={:#x} a2={:#x} a3={:#x} a4={:#x}\n",
+                        args[0], args[1], args[2], args[3]
+                    ));
                 }
             }
         }

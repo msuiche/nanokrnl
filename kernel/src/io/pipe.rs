@@ -40,15 +40,25 @@ unsafe impl Sync for PipeEnd {}
 pub static PIPE_READ_TYPE: ob::ObjectType = ob::ObjectType {
     name: UnicodeString::from_units(w!("PipeRead")),
     delete: None,
+    on_reference: None,
+    on_dereference: None,
 };
 pub static PIPE_WRITE_TYPE: ob::ObjectType = ob::ObjectType {
     name: UnicodeString::from_units(w!("PipeWrite")),
-    delete: Some(write_end_deleted),
+    delete: None,
+    on_reference: Some(writer_referenced),
+    on_dereference: Some(writer_dereferenced),
 };
 
-/// Closing (final deref of) a write end drops the writer count; when it reaches
-/// zero, a subsequent read of an empty pipe returns EOF.
-fn write_end_deleted(body: *mut u8) {
+/// Every reference taken on a write end is a writer the reader waits on.
+fn writer_referenced(body: *mut u8) {
+    let end = body as *mut PipeEnd;
+    unsafe { (*(*end).buf).writers.fetch_add(1, Ordering::AcqRel) };
+}
+
+/// Closing (a reference of) a write end drops the writer count; when it
+/// reaches zero, a subsequent read of an empty pipe returns EOF.
+fn writer_dereferenced(body: *mut u8) {
     let end = body as *mut PipeEnd;
     unsafe { (*(*end).buf).writers.fetch_sub(1, Ordering::AcqRel) };
 }
@@ -84,11 +94,13 @@ pub unsafe fn is_write_end(body: *mut u8) -> bool {
 /// # Safety
 /// `end` is a live write end; `src` valid for `len` bytes.
 pub unsafe fn write(end: *mut PipeEnd, src: *const u8, len: usize) -> usize {
+    // Stage the user buffer into kernel memory at PASSIVE_LEVEL first: the
+    // append runs under the pipe spinlock (DISPATCH_LEVEL), and a demand
+    // fault on a fresh VAD-backed page of `src` can only resolve at PASSIVE.
+    let chunk = unsafe { core::slice::from_raw_parts(src, len) }.to_vec();
     let pb = unsafe { &*(*end).buf };
     let mut d = pb.data.lock();
-    for i in 0..len {
-        d.buf.push(unsafe { *src.add(i) });
-    }
+    d.buf.extend_from_slice(&chunk);
     len
 }
 
@@ -100,15 +112,23 @@ pub unsafe fn write(end: *mut PipeEnd, src: *const u8, len: usize) -> usize {
 /// `end` is a live read end; `dst` valid for `max` bytes.
 pub unsafe fn try_read(end: *mut PipeEnd, dst: *mut u8, max: usize) -> (usize, bool) {
     let pb = unsafe { &*(*end).buf };
-    let mut d = pb.data.lock();
-    let avail = d.buf.len() - d.pos;
-    if avail == 0 {
-        return (0, pb.writers.load(Ordering::Acquire) == 0);
+    // Drain into a kernel buffer under the spinlock (DISPATCH_LEVEL), then
+    // copy to the user buffer after releasing it: a demand fault on a fresh
+    // VAD-backed page of `dst` must resolve, and resolution is PASSIVE-only.
+    let (chunk, eof) = {
+        let mut d = pb.data.lock();
+        let avail = d.buf.len() - d.pos;
+        if avail == 0 {
+            (Vec::new(), pb.writers.load(Ordering::Acquire) == 0)
+        } else {
+            let n = avail.min(max);
+            let chunk = d.buf[d.pos..d.pos + n].to_vec();
+            d.pos += n;
+            (chunk, false)
+        }
+    };
+    if !chunk.is_empty() {
+        unsafe { core::ptr::copy_nonoverlapping(chunk.as_ptr(), dst, chunk.len()) };
     }
-    let n = avail.min(max);
-    for i in 0..n {
-        unsafe { *dst.add(i) = d.buf[d.pos + i] };
-    }
-    d.pos += n;
-    (n, false)
+    (chunk.len(), eof)
 }

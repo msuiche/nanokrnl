@@ -278,21 +278,27 @@ fn echo_mode() -> bool {
 /// line; in raw mode it drains everything available. Returns the count.
 fn drain_input(dst: *mut u8, max: usize) -> usize {
     let line = line_mode();
-    let mut input = INPUT.lock();
-    let mut n = 0;
-    while n < max {
-        match input.pop() {
-            Some(b) => {
-                // SAFETY: caller guarantees dst is valid for `max` bytes.
-                unsafe { *dst.add(n) = b };
-                n += 1;
-                if line && b == b'\n' {
-                    break; // one line per read in cooked mode
+    // Drain under the input spinlock (DISPATCH_LEVEL), then copy to the user
+    // buffer after releasing it: a demand fault on a fresh VAD-backed page
+    // of `dst` must resolve, and resolution is PASSIVE-only.
+    let mut chunk = alloc::vec::Vec::new();
+    {
+        let mut input = INPUT.lock();
+        while chunk.len() < max {
+            match input.pop() {
+                Some(b) => {
+                    chunk.push(b);
+                    if line && b == b'\n' {
+                        break; // one line per read in cooked mode
+                    }
                 }
+                None => break,
             }
-            None => break,
         }
     }
+    let n = chunk.len();
+    // SAFETY: caller guarantees dst is valid for `max` bytes.
+    unsafe { core::ptr::copy_nonoverlapping(chunk.as_ptr(), dst, n) };
     n
 }
 

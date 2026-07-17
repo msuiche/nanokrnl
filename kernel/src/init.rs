@@ -1050,6 +1050,8 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
         static DUMMY_TYPE: crate::ob::ObjectType = crate::ob::ObjectType {
             name: crate::rtl::string::UnicodeString::from_units(crate::w!("Dummy")),
             delete: None,
+            on_reference: None,
+            on_dereference: None,
         };
         let obj = crate::ob::ob_create_object(&DUMMY_TYPE, 0xC0FFEEu64);
         check!("Ob: ObCreateObject", obj.is_ok());

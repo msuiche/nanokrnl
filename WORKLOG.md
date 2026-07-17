@@ -1060,3 +1060,59 @@ BOTH address-space models (kernel-AS and isolated process runs); host
 tests 18 unit + 2 proptest + 7 conformance; emu suite 36/36. Frame-based
 SEH (.pdata unwind, `__C_specific_handler`) now has its delivery
 foundation; per the roadmap, that or async IRP completion/APCs is next.
+
+### 2026-07-17 - `dir | sort` works: the pipe blocker, closed end to end
+
+The CFP's "still-open cmd.exe pipe blocker" is fixed. Five distinct bugs
+stood between the prompt and a working pipe; each was found by tracing, not
+guessing (nanox syscall tracer upgraded to log all four args + a sysret-time
+CreatePipe handle dump, and temporary kd prints in the msvcrt fd layer, the
+CreateProcess inheritance path, and the pipe writer count — all removed
+after).
+
+**1. nanox delivered a hardcoded page-fault error code** (`P`, always).
+`xlate` computed the real P/WR/US/ID bits in `mmu::translate` and threw them
+away. Cosmetic until VADs made the code load-bearing (`traps.rs` resolves
+only not-present faults): every demand fault bugchecked. Now `Cpu::pf_code`
+carries the real code to `deliver_interrupt`. Also added `invlpg` (0F 01 /7)
+to the decoder — the kernel's VAD work uses it; nanox has no TLB, so it's a
+documented no-op.
+
+**2. Handle values weren't stable identities (the actual pipe blocker).**
+Every `DuplicateHandle` allocated a *fresh* value, so a value cmd or the CRT
+held went stale the moment a freed slot recycled — cmd moved its pipe read
+end via Win32 DuplicateHandle+CloseHandle, the CRT's fd still named the old
+value, and `_dup2(rfd, 0)` aliased the *console* into sort's stdin (proven
+by instrumenting the CRT's fd table: `FD dup2 src 3 10` with 0x10 recycled).
+Fix: `DuplicateHandle` is share semantics — same value, per-entry refcount;
+distinct opens still get distinct values. Handle values are now stable
+object identities, which is the invariant cmd's choreography assumes.
+
+**3. Dup/close reference imbalance.** Each dup took an object reference but
+closes only decremented the entry count, leaking one object reference per
+dup copy. `ob_close_handle` now dereferences per close.
+
+**4. EOF never fired.** The pipe writer count tracked nothing (create-time
+only), and `pipe::create`'s initial object reference leaked — a phantom
+writer forever, so sort's second read blocked forever. `nt_create_pipe`
+drops the create-time refs; new `ObjectType::on_reference/on_dereference`
+hooks make the writer count mirror live write-end references exactly
+(dups, cross-process inheritance, process exit).
+
+**5. User-buffer copies under DISPATCH_LEVEL spinlocks.** `pipe::try_read`/
+`write`, `ramfs::write`/`read_writable`, and `console::drain_input` all
+copied user memory while holding a DISPATCH_LEVEL lock — a demand fault on
+a fresh VAD page can only resolve at PASSIVE, so any fresh buffer bugchecked
+the machine (sort's 45 MB input buffer hit it instantly). All now stage
+through a kernel bounce buffer and copy to/from user space unlocked. Also
+removed the VirtualAlloc 16 MiB ceiling: with demand commit a 45 MB
+reservation costs a VAD until touched (sort sizes its buffer from physical
+RAM and treated the rejection as fatal -> "Unknown error").
+
+**Verified** (nanox, interactive kernel): `dir | sort` prints the sorted
+listing and returns to the prompt (writers reach 0, EOF fires, sort's 45 MB
+buffer demand-faults in); `dir > out.txt` + `type out.txt` work standalone
+*and* right after a pipe in the same session (the old corruption is gone);
+`--plain` clean. QEMU boot suite 76/76 (exit 33); host tests 18+2+7; emu
+suite 36/36. Remaining known issue, unrelated to pipes: `more.com` against
+writable (redirect-created) files errors out.

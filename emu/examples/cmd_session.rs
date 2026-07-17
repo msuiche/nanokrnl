@@ -57,11 +57,11 @@ fn main() {
         8 => "NtProtectVirtualMemory",
         _ => "?",
     };
-    for &(svc, val) in &m.cpu.sys_log {
+    for &(svc, args) in &m.cpu.sys_log {
         if svc == 0xFFFF_FFFF {
-            println!("    -> ret {:#x}", val);
+            println!("    -> ret {:#x}", args[0]);
         } else {
-            println!("  syscall {:>3} {:<24} arg1={:#x}", svc, name(svc), val);
+            println!("  syscall {:>3} {:<24} arg1={:#x}", svc, name(svc), args[0]);
         }
     }
 }

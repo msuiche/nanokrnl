@@ -365,9 +365,11 @@ impl Machine {
                     return RunStop::Halted;
                 }
                 StepResult::Fault { addr } => {
-                    // Deliver #PF (vector 14) through the guest IDT.
+                    // Deliver #PF (vector 14) through the guest IDT, with the
+                    // error code the MMU computed for this access (the guest
+                    // needs the real P/WR/US/ID bits — demand paging keys on P).
                     self.cpu.cr2 = addr;
-                    let err = mmu::PageFault::P; // best-effort error code
+                    let err = self.cpu.pf_code;
                     if !self.cpu.deliver_interrupt(&mut self.ram, 14, Some(err as u64)) {
                         self.last_rip = self.cpu.rip;
                         self.last_addr = addr;
