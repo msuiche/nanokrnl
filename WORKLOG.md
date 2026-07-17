@@ -1116,3 +1116,41 @@ buffer demand-faults in); `dir > out.txt` + `type out.txt` work standalone
 `--plain` clean. QEMU boot suite 76/76 (exit 33); host tests 18+2+7; emu
 suite 36/36. Remaining known issue, unrelated to pipes: `more.com` against
 writable (redirect-created) files errors out.
+
+### 2026-07-17 - the `more.com` investigation: two fixes, one documented mystery
+
+Follow-up to the pipe work: `more out.txt` (a redirect-created file) printed
+"Unknown error" instead of paging. The hunt went through a genuine red
+herring first: the QEMU suite had overwritten `target/debug/kernel` with the
+DEFAULT (canned-input) kernel while the nanox pipe harness boots that exact
+path expecting the INTERACTIVE build — several confusing logs ("More? " for
+everything) were the wrong kernel entirely. Worth remembering: any
+`qemu-test.sh` run clobbers the interactive binary; rebuild with
+`--features interactive` before harness runs.
+
+Then the real chain, all trace-driven:
+
+1. **`NtOpenFile` never found writable files.** The "real ntdll" open path
+   (ulib tools) consulted only the const ramfs table; `NtCreateFile` already
+   had the writable-first lookup. Fixed to match: redirect-created files now
+   open through both services.
+2. **The MUI loader only consulted the side-by-side `.mui` registry** — a
+   module's OWN inline resources were unreadable. Added image-resource
+   variants (`load_string_in_image` / `load_message_in_image`, direct-RVA
+   mode) with a `module_image` fallback in both load services, SMAP-bracketed.
+3. **The remaining "Unknown error" is understood, not fixed.** more.com
+   opens, sizes, reads, and displays `out.txt` correctly (verified line by
+   line in the trace — the file content was never the problem). At the tail
+   it fails a lookup, calls ulib's error printer, and every message load
+   (0x4e21-0x4e55) fails: the strings live in `ulib.dll.mui`, which we don't
+   ship, and ulib.dll carries NO inline message table (checked locally: only
+   a version resource). ulib falls back to its generic "Unknown error". Also
+   ruled out along the way: console double-feed (instrumented `drain_input`:
+   each command line is consumed exactly once), HKCU seeding (fine), and
+   cmd-internal-more confusion (the "More? " prompt IS more.com's own).
+   Full fix = authoring `ulib.dll.mui`/`more.com.mui` resource PEs (or
+   finding what the trailing 10-char QUERY_DIRECTORY looks for) — logged as
+   a known issue.
+
+Verified: QEMU suite 76/76 (exit 33), host 18+2+7, emu 36/36, and
+`dir | sort` still produces the sorted listing at the prompt.

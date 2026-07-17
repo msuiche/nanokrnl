@@ -43,7 +43,7 @@ fn main() {
             m.cpu.dev.uart.push_rx(b);
         }
         m.cpu.dev.uart.push_rx(b'\r');
-        pump(m, out, 20);
+        pump(m, out, 60);
     };
 
     let seq: &[&str] = if std::env::args().any(|a| a == "--plain") {
@@ -67,12 +67,12 @@ fn main() {
     };
     let trace = std::env::args().any(|a| a == "--trace");
     for cmd in seq {
-        if trace && cmd.contains('|') {
+        if trace {
             m.cpu.sys_log.clear();
             m.cpu.trace_sys = true;
         }
         run_cmd(&mut m, &mut out, cmd);
-        if trace && cmd.contains('|') {
+        if trace {
             m.cpu.trace_sys = false;
             out.push_str("\n--- syscall trace ---\n");
             for &(svc, args) in &m.cpu.sys_log {

@@ -60,8 +60,13 @@ fn u32le(b: &[u8], o: usize) -> Option<u32> {
 }
 
 /// Translate a resource RVA to a file offset within the raw `.mui`, using the
-/// section table (the file is not mapped, so RVA != file offset).
-fn rva_to_off(mui: &[u8], rva: u32) -> Option<usize> {
+/// section table (the file is not mapped, so RVA != file offset). When
+/// `direct` is set the bytes are a **mapped image** instead: sections already
+/// sit at their RVAs, so the translation is the identity (bounds-checked).
+fn rva_to_off(mui: &[u8], rva: u32, direct: bool) -> Option<usize> {
+    if direct {
+        return (rva as usize <= mui.len()).then_some(rva as usize);
+    }
     let e = u32le(mui, 0x3C)? as usize;
     let nsec = u16le(mui, e + 6)? as usize;
     let opt_size = u16le(mui, e + 20)? as usize;
@@ -126,12 +131,23 @@ pub fn load_string(module_base: u64, id: u32, out: &mut [u16]) -> usize {
     }
 }
 
+/// As [`load_string`], but against a module's **own mapped image** (a real
+/// DLL such as ulib.dll carries its resources inline — no side-by-side
+/// `.mui`). `image` is the module's mapped bytes; RVAs are direct offsets.
+pub fn load_string_in_image(image: &[u8], id: u32, out: &mut [u16]) -> usize {
+    load_string_impl(image, id, out, true)
+}
+
 /// As [`load_string`], but against `.mui` bytes given directly (the per-thread
 /// registration in the thread control block) rather than the base→mui table.
 pub fn load_string_from(mui: &[u8], id: u32, out: &mut [u16]) -> usize {
+    load_string_impl(mui, id, out, false)
+}
+
+fn load_string_impl(mui: &[u8], id: u32, out: &mut [u16], direct: bool) -> usize {
     (|| -> Option<usize> {
         let res_rva = rsrc_rva(mui)?;
-        let res_off = rva_to_off(mui, res_rva)?;
+        let res_off = rva_to_off(mui, res_rva, direct)?;
         let type_dir = dir_find(mui, res_off, 0, RT_STRING)?;
         let bundle_id = (id >> 4) + 1;
         let name_dir = dir_find(mui, res_off, type_dir, bundle_id)?;
@@ -139,7 +155,7 @@ pub fn load_string_from(mui: &[u8], id: u32, out: &mut [u16]) -> usize {
         let data_rel = (u32le(mui, res_off + name_dir + 16 + 4)? & 0x7FFF_FFFF) as usize;
         // IMAGE_RESOURCE_DATA_ENTRY: OffsetToData (an RVA), Size, ...
         let blob_rva = u32le(mui, res_off + data_rel)?;
-        let mut p = rva_to_off(mui, blob_rva)?;
+        let mut p = rva_to_off(mui, blob_rva, direct)?;
         // Walk to item (id & 15) within the 16-string bundle.
         for _ in 0..(id & 15) {
             let len = u16le(mui, p)? as usize;
@@ -170,19 +186,30 @@ pub fn load_message(module_base: u64, id: u32, out: &mut [u16]) -> usize {
     }
 }
 
+/// As [`load_message`], but against a module's own mapped image (a DLL such
+/// as ulib.dll carries its message table inline — this is how its error
+/// strings resolve when no side-by-side `.mui` exists).
+pub fn load_message_in_image(image: &[u8], id: u32, out: &mut [u16]) -> usize {
+    load_message_impl(image, id, out, true)
+}
+
 /// As [`load_message`], but against `.mui` bytes given directly (the per-thread
 /// registration in the thread control block) rather than the base→mui table.
 pub fn load_message_from(mui: &[u8], id: u32, out: &mut [u16]) -> usize {
+    load_message_impl(mui, id, out, false)
+}
+
+fn load_message_impl(mui: &[u8], id: u32, out: &mut [u16], direct: bool) -> usize {
     (|| -> Option<usize> {
         let res_rva = rsrc_rva(mui)?;
-        let res_off = rva_to_off(mui, res_rva)?;
+        let res_off = rva_to_off(mui, res_rva, direct)?;
         let type_dir = dir_find(mui, res_off, 0, RT_MESSAGETABLE)?;
         // First name entry under the type dir, then its first language entry.
         let named = u16le(mui, res_off + type_dir + 12)? as usize;
         let name_dir = (u32le(mui, res_off + type_dir + 16 + named * 8 + 4)? & 0x7FFF_FFFF) as usize;
         let data_rel = (u32le(mui, res_off + name_dir + 16 + 4)? & 0x7FFF_FFFF) as usize;
         let blob_rva = u32le(mui, res_off + data_rel)?;
-        let mdo = rva_to_off(mui, blob_rva)?; // MESSAGE_RESOURCE_DATA start
+        let mdo = rva_to_off(mui, blob_rva, direct)?; // MESSAGE_RESOURCE_DATA start
         let nblocks = u32le(mui, mdo)? as usize;
         for b in 0..nblocks {
             let bo = mdo + 4 + b * 12;

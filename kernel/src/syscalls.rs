@@ -420,6 +420,28 @@ extern "C" fn nt_query_attributes(path_ptr: u64, path_len: u64, _a3: u64, _a4: u
     io::ramfs::attributes(path) as u64
 }
 
+/// Resource-module base → its mapped image bytes, for the inline-resource
+/// fallback (a DLL that carries its own `.rsrc`, like ulib.dll). Covers the
+/// loaded DLL modules; app images are a future extension (their sizes are
+/// not centrally tracked). The bytes are user pages — callers must bracket
+/// the access (SMAP).
+fn module_image(base: u64) -> Option<&'static [u8]> {
+    let (ub, us) = crate::ldr::loaded::ulib_range();
+    if base == ub && us != 0 {
+        // SAFETY: the module stays mapped for the system's lifetime.
+        return Some(unsafe { core::slice::from_raw_parts(ub as *const u8, us) });
+    }
+    let (kb, ks) = crate::ldr::loaded::kernel32_range();
+    if base == kb && ks != 0 {
+        return Some(unsafe { core::slice::from_raw_parts(kb as *const u8, ks) });
+    }
+    let (mb, ms) = crate::ldr::loaded::msvcrt_range();
+    if base == mb && ms != 0 {
+        return Some(unsafe { core::slice::from_raw_parts(mb as *const u8, ms) });
+    }
+    None
+}
+
 /// `FormatMessage(FROM_HMODULE)` backend: load message `id` from `base`'s
 /// registered `.mui` `RT_MESSAGETABLE` into the user buffer (`buf`/`cch`).
 /// Returns the char count (excluding NUL), 0 if not found.
@@ -431,7 +453,7 @@ extern "C" fn nt_load_message(base: u64, id: u64, buf: u64, cch: u64) -> u64 {
     let mut tmp = [0u16; 512];
     let want = cch.saturating_sub(1).min(tmp.len());
     let cur = crate::ke::pcr::ke_get_current_thread();
-    let n = unsafe {
+    let mut n = unsafe {
         let (mp, ml) = ((*cur).mui_ptr, (*cur).mui_len as usize);
         if mp != 0 && ml != 0 {
             let bytes = core::slice::from_raw_parts(mp as *const u8, ml);
@@ -440,6 +462,16 @@ extern "C" fn nt_load_message(base: u64, id: u64, buf: u64, cch: u64) -> u64 {
             crate::ldr::mui::load_message(base, id as u32, &mut tmp[..want])
         }
     };
+    if n == 0 {
+        // No side-by-side `.mui`: fall back to the module's OWN resources —
+        // a real DLL (ulib.dll) carries its message table inline, which is
+        // how its error strings (and any tool's inline resources) resolve.
+        if let Some(img) = module_image(base) {
+            crate::mm::virt::user_access_begin();
+            n = crate::ldr::mui::load_message_in_image(img, id as u32, &mut tmp[..want]);
+            crate::mm::virt::user_access_end();
+        }
+    }
     if n == 0 {
         return 0;
     }
@@ -996,10 +1028,18 @@ extern "C" fn nt_open_file(
         path = rest;
     }
     // The virtual "H:" drive is served by a host 9P server (see io::p9).
-    let opened = if let Some(rest) = strip_host_drive(path) {
-        io::p9::read(rest).and_then(io::ramfs::open_bytes)
+    // Reads see a previously created writable file before the const FILES —
+    // the same lookup order as `nt_create_file`, so a redirect-created file
+    // (`dir > out.txt`) opens through this path too (`more out.txt`).
+    let opened: Option<*mut u8> = if let Some(rest) = strip_host_drive(path) {
+        io::p9::read(rest)
+            .and_then(io::ramfs::open_bytes)
+            .map(|f| f as *mut u8)
     } else {
-        io::ramfs::open(path)
+        match io::ramfs::open_writable(path) {
+            Some(f) => Some(f as *mut u8),
+            None => io::ramfs::open(path).map(|f| f as *mut u8),
+        }
     };
     let Some(file) = opened else {
         return STATUS_OBJECT_NAME_NOT_FOUND;
@@ -1112,7 +1152,7 @@ extern "C" fn nt_load_mui_string(base: u64, id: u64, buf: u64, cch: u64) -> u64 
     // image base, so a base→mui registry would collide between a parent and its
     // child); fall back to the base registry for threads that set none.
     let cur = crate::ke::pcr::ke_get_current_thread();
-    let n = unsafe {
+    let mut n = unsafe {
         let (mp, ml) = ((*cur).mui_ptr, (*cur).mui_len as usize);
         if mp != 0 && ml != 0 {
             let bytes = core::slice::from_raw_parts(mp as *const u8, ml);
@@ -1121,6 +1161,14 @@ extern "C" fn nt_load_mui_string(base: u64, id: u64, buf: u64, cch: u64) -> u64 
             crate::ldr::mui::load_string(base, id as u32, &mut tmp[..want])
         }
     };
+    if n == 0 {
+        // No side-by-side `.mui`: fall back to the module's OWN resources.
+        if let Some(img) = module_image(base) {
+            crate::mm::virt::user_access_begin();
+            n = crate::ldr::mui::load_string_in_image(img, id as u32, &mut tmp[..want]);
+            crate::mm::virt::user_access_end();
+        }
+    }
     if n == 0 {
         return 0;
     }
