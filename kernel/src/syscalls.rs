@@ -79,6 +79,10 @@ pub const SVC_QUERY_FILE_TYPE: usize = 41;
 /// `NtContinue` - resume the calling thread at a user-supplied CONTEXT (the
 /// return path of a handled exception; see `ke::exception`).
 pub const SVC_NT_CONTINUE: usize = 42;
+/// `QueueUserAPC` - queue a user APC (routine, argument) to a thread.
+pub const SVC_QUEUE_USER_APC: usize = 43;
+/// Pop the calling thread's oldest pending user APC into a user buffer.
+pub const SVC_NEXT_USER_APC: usize = 44;
 
 /// A shared kernel counter incremented atomically by [`SVC_INCREMENT_COUNTER`].
 /// Used to prove concurrent ring-3 threads both make progress through the
@@ -151,6 +155,8 @@ pub fn register_all() {
     register_service(SVC_DUPLICATE_OBJECT, nt_duplicate_object);
     register_service(SVC_QUERY_FILE_TYPE, nt_query_file_type);
     register_service(SVC_NT_CONTINUE, nt_continue);
+    register_service(SVC_QUEUE_USER_APC, nt_queue_user_apc);
+    register_service(SVC_NEXT_USER_APC, nt_next_user_apc);
 }
 
 /// `GetFileType` backend: classify `handle` into a Win32 file type
@@ -720,9 +726,78 @@ extern "C" fn increment_counter(_a1: u64, _a2: u64, _a3: u64, _a4: u64) -> u64 {
 }
 
 /// `NtDelayExecution`-flavored sleep: `a1` = milliseconds (≈ clock ticks).
-extern "C" fn nt_delay_execution(millis: u64, _a2: u64, _a3: u64, _a4: u64) -> u64 {
+/// `NtDelayExecutionThread`/`Sleep` (and `SleepEx`): `a1` = milliseconds,
+/// `a2` = alertable. With a pending user APC an alertable wait must not
+/// sleep past it: return `STATUS_USER_APC` immediately (the caller's CRT
+/// shim drains the queue first, so this is the belt-and-braces half; a
+/// direct ntdll caller gets the correct early return).
+/// `STATUS_USER_APC` = `WAIT_IO_COMPLETION` (0xC0).
+extern "C" fn nt_delay_execution(millis: u64, alertable: u64, _a3: u64, _a4: u64) -> u64 {
+    const STATUS_USER_APC: u64 = 0xC0;
+    if alertable != 0 && unsafe { (*crate::ke::pcr::ke_get_current_thread()).user_apc_count != 0 } {
+        return STATUS_USER_APC;
+    }
     crate::ke::scheduler::ki_delay_thread(millis.max(1));
     NtStatus::SUCCESS.0 as u64
+}
+
+/// `QueueUserAPC(routine, thread, argument)`: queue a user APC to a thread.
+/// `thread` is the GetCurrentThread pseudo-handle (-2) for the caller, or a
+/// process handle from CreateProcess (its main thread). Returns 1 on success,
+/// 0 on a bad handle or a full queue.
+extern "C" fn nt_queue_user_apc(routine: u64, thread: u64, arg: u64, _a4: u64) -> u64 {
+    if routine == 0 {
+        return 0;
+    }
+    let cur = crate::ke::pcr::ke_get_current_thread();
+    let target: *mut crate::ke::thread::Kthread = if thread == u64::MAX - 1 {
+        cur // (HANDLE)-2 = current thread
+    } else if thread == u64::MAX {
+        return 0; // (HANDLE)-1 = current process: not a thread
+    } else {
+        match crate::init::proc_ethread(thread) {
+            Some(e) => unsafe { &mut (*e).tcb },
+            None => return 0,
+        }
+    };
+    let count = unsafe { (*target).user_apc_count as usize };
+    if count >= crate::ke::thread::USER_APC_MAX {
+        return 0;
+    }
+    unsafe {
+        (*target).user_apcs[count] = (routine, arg);
+        (*target).user_apc_count += 1;
+    }
+    1
+}
+
+/// Pop the calling thread's oldest pending user APC into the user buffer at
+/// `a1` (two u64s: routine, argument). Returns 1 if one was delivered, 0 if
+/// the queue is empty. The caller's CRT shim invokes the routine in user
+/// mode — the delivery half of alertable waits.
+extern "C" fn nt_next_user_apc(buf: u64, _a2: u64, _a3: u64, _a4: u64) -> u64 {
+    if buf == 0 || crate::mm::virt::probe_for_write(buf, 16, 8).is_err() {
+        return 0;
+    }
+    let cur = crate::ke::pcr::ke_get_current_thread();
+    let count = unsafe { (*cur).user_apc_count as usize };
+    if count == 0 {
+        return 0;
+    }
+    let (routine, arg) = unsafe {
+        let q = &mut (*cur).user_apcs;
+        let first = q[0];
+        q.copy_within(1..count, 0);
+        (*cur).user_apc_count -= 1;
+        first
+    };
+    crate::mm::virt::user_access_begin();
+    unsafe {
+        *(buf as *mut u64) = routine;
+        *((buf + 8) as *mut u64) = arg;
+    }
+    crate::mm::virt::user_access_end();
+    1
 }
 
 /// Return `KeTickCount` (≈ milliseconds since boot) in RAX.

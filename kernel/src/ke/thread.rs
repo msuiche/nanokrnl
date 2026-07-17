@@ -171,7 +171,18 @@ pub struct Kthread {
     /// Standard handles staged for the *next* child this thread creates
     /// (`SetStartupHandles`, consumed by the create-process path). 0 = default.
     pub child_std_handles: [u64; 3],
+    /// Pending user APCs (`QueueUserAPC`): (routine, argument) pairs, FIFO.
+    /// Drained by alertable waits — the kernel pops them and the caller's CRT
+    /// shim invokes the routine in user mode (documented divergence from NT's
+    /// `KiUserApcDispatcher`, which delivers on the kernel's return path).
+    pub user_apcs: [(u64, u64); USER_APC_MAX],
+    /// Number of live entries in `user_apcs` (queue is 0..count, no holes).
+    pub user_apc_count: u8,
 }
+
+/// Maximum user APCs queued per thread (NT has no fixed small limit; 8 is
+/// ample for console tools and keeps `KTHREAD` compact).
+pub const USER_APC_MAX: usize = 8;
 
 /// Default quantum in clock ticks (~ms at our tick rate). NT's default on
 /// workstations is comparable after unit conversion.
@@ -210,6 +221,8 @@ impl Kthread {
             gs_base: 0,
             std_handles: [0; 3],
             child_std_handles: [0; 3],
+            user_apcs: [(0, 0); USER_APC_MAX],
+            user_apc_count: 0,
         }
     }
 

@@ -57,6 +57,8 @@ const NT_SET_STD_HANDLE: u32 = 39;
 const NT_DUPLICATE_OBJECT: u32 = 40;
 const NT_QUERY_FILE_TYPE: u32 = 41;
 const NT_CONTINUE: u32 = 42;
+const NT_QUEUE_USER_APC: u32 = 43;
+const NT_NEXT_USER_APC: u32 = 44;
 
 // A couple of Win32 error codes used by the shim.
 const ERROR_SUCCESS: u32 = 0;
@@ -768,6 +770,45 @@ pub unsafe extern "C" fn ReportTestResult(code: u64) {
 #[no_mangle]
 pub unsafe extern "C" fn Sleep(millis: u32) {
     syscall3(NT_DELAY_EXECUTION, millis as u64, 0, 0);
+}
+
+/// `WAIT_IO_COMPLETION` — `SleepEx`'s return when a user APC ran.
+pub const WAIT_IO_COMPLETION: u32 = 0xC0;
+
+/// `SleepEx(dwMilliseconds, bAlertable)` — sleep, delivering pending user
+/// APCs when alertable. Delivery is layered: the kernel pops queued APCs and
+/// we invoke each routine here in user mode (NT delivers them via
+/// `KiUserApcDispatcher` on the kernel's return path; the observable
+/// semantics — the callback runs in this thread's context during the
+/// alertable call — are the same). Returns `WAIT_IO_COMPLETION` if at least
+/// one APC ran, 0 otherwise.
+#[no_mangle]
+pub unsafe extern "C" fn SleepEx(millis: u32, alertable: i32) -> u32 {
+    if alertable != 0 {
+        let mut delivered = false;
+        loop {
+            let mut apc = [0u64; 2];
+            if syscall3(NT_NEXT_USER_APC, apc.as_mut_ptr() as u64, 0, 0) == 0 {
+                break;
+            }
+            let routine: unsafe extern "C" fn(usize) = core::mem::transmute(apc[0]);
+            routine(apc[1] as usize);
+            delivered = true;
+        }
+        if delivered {
+            return WAIT_IO_COMPLETION;
+        }
+    }
+    syscall3(NT_DELAY_EXECUTION, millis as u64, alertable as u64, 0);
+    0
+}
+
+/// `QueueUserAPC(pfnAPC, hThread, dwData)` — queue a user APC (routine +
+/// argument) to a thread. `hThread` is `GetCurrentThread()` (-2) for the
+/// caller or a process handle. Returns nonzero on success.
+#[no_mangle]
+pub unsafe extern "C" fn QueueUserAPC(routine: usize, thread: u64, arg: usize) -> u32 {
+    syscall3(NT_QUEUE_USER_APC, routine as u64, thread, arg as u64) as u32
 }
 
 /// `GetTickCount64()` — milliseconds since boot (≈ clock ticks).

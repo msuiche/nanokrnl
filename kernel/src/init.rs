@@ -612,7 +612,7 @@ pub(crate) fn on_user_thread_exit(thread: u64) {
     }
 }
 
-fn proc_ethread(handle: u64) -> Option<*mut ps::Ethread> {
+pub(crate) fn proc_ethread(handle: u64) -> Option<*mut ps::Ethread> {
     if handle < PROC_HANDLE_BASE {
         return None;
     }

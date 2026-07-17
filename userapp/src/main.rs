@@ -110,6 +110,8 @@ extern "C" {
     fn fprintf(stream: *mut c_void, fmt: *const u8, ...) -> i32;
     fn ReportTestResult(code: u64);
     fn AddVectoredExceptionHandler(first: u32, handler: VectoredHandler) -> u64;
+    fn QueueUserAPC(routine: usize, thread: u64, arg: usize) -> u32;
+    fn SleepEx(millis: u32, alertable: i32) -> u32;
     fn ExitProcess(code: u32) -> !;
 }
 
@@ -222,6 +224,47 @@ unsafe fn veh_test(out: u64) -> bool {
         print(out, b"APP: vectored exception handler recovered from AV\n");
     } else {
         print(out, b"APP: VEH FAILED (hits/code wrong)\n");
+    }
+    ok
+}
+
+// --- User APCs + alertable waits -------------------------------------------
+
+static mut APC_HITS: u32 = 0;
+static mut APC_ARG: usize = 0;
+
+/// The test's APC routine: count the call, record the argument.
+extern "C" fn test_apc(arg: usize) {
+    unsafe {
+        APC_HITS += 1;
+        APC_ARG = arg;
+    }
+}
+
+/// Queue an APC to this thread, then verify an alertable `SleepEx` runs it
+/// (returning `WAIT_IO_COMPLETION`), while a non-alertable `Sleep` leaves it
+/// alone and the queue drains on the *next* alertable call.
+unsafe fn apc_test(out: u64) -> bool {
+    APC_HITS = 0;
+    APC_ARG = 0;
+    let queued = QueueUserAPC(test_apc as usize, GetCurrentThread(), 0x5AFE);
+    // Alertable SleepEx: must run the APC now and report WAIT_IO_COMPLETION.
+    let st = SleepEx(50, 1);
+    let ok = queued != 0 && st == 0xC0 && APC_HITS == 1 && APC_ARG == 0x5AFE;
+    // No APCs left: a second alertable SleepEx must not report one.
+    let st2 = SleepEx(0, 1);
+    let ok = ok && st2 == 0 && APC_HITS == 1;
+    // Non-alertable path: a queued APC does not fire during plain Sleep…
+    let q2 = QueueUserAPC(test_apc as usize, GetCurrentThread(), 0x1234);
+    Sleep(1);
+    let ok = ok && q2 != 0 && APC_HITS == 1;
+    // …but it fires on the next alertable call.
+    let st3 = SleepEx(0, 1);
+    let ok = ok && st3 == 0xC0 && APC_HITS == 2 && APC_ARG == 0x1234;
+    if ok {
+        print(out, b"APP: user APC delivered on alertable SleepEx\n");
+    } else {
+        print(out, b"APP: APC FAILED\n");
     }
     ok
 }
@@ -576,6 +619,8 @@ unsafe fn main(argc: i32, argv: *const *const u8) -> i32 {
 
     // Vectored exception handling: deliberate AV, handler recovery, NtContinue.
     let veh_ok = veh_test(out);
+    // User APCs: QueueUserAPC + alertable SleepEx delivery.
+    let apc_ok = apc_test(out);
 
     ReportTestResult(
         if reuse_ok
@@ -596,6 +641,7 @@ unsafe fn main(argc: i32, argv: *const *const u8) -> i32 {
             && msvcrt_ok
             && fs_ok
             && veh_ok
+            && apc_ok
         {
             0xABCD
         } else {

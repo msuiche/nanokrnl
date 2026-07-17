@@ -1189,3 +1189,34 @@ text — but there is no error path left on this flow.
 Verified: QEMU suite 76/76 (exit 33); host 18+2+7; emu 36/36; interactive:
 `dir`, `dir | sort` (sorted), `dir > out.txt`, `type out.txt`,
 `more out.txt` all clean end to end.
+
+### 2026-07-17 - user APCs + alertable waits
+
+The user-facing slice of NT's async model, done as a cleanly layered pair:
+
+**Kernel.** `KTHREAD` grows a small FIFO of pending user APCs
+(routine+argument pairs, 8 max). Three services: `QueueUserAPC` (target =
+the GetCurrentThread pseudo-handle or a CreateProcess handle's main
+thread), `NextUserAPC` (pop the caller's oldest pending pair into a user
+buffer), and `NtDelayExecution` gains the alertable flag — a direct ntdll
+caller with a pending APC gets `STATUS_USER_APC` (WAIT_IO_COMPLETION, 0xC0)
+immediately instead of sleeping past it.
+
+**Shim (kernel32).** `QueueUserAPC` forwards; `SleepEx(ms, alertable)`
+drains the queue through `NextUserAPC` and invokes each routine in user
+mode, returning `WAIT_IO_COMPLETION` if at least one ran. Documented
+divergence: NT delivers via `KiUserApcDispatcher` on the kernel's return
+path — our syscall/sysret path has no trap frame to rewrite, so delivery is
+layered into the CRT shim; the observable semantics (callback runs in the
+target thread's context during the alertable call) are the same.
+
+**Test.** userapp queues an APC to itself: alertable `SleepEx` runs it and
+reports 0xC0 (hits/arg verified), a second `SleepEx` reports the queue is
+drained, plain `Sleep` doesn't fire, and the next alertable call does.
+Folded into the `ReportTestResult(0xABCD)` gate, so it runs in BOTH the
+kernel-AS and the isolated-process userapp boots.
+
+Verified: QEMU suite 76/76 (exit 33, both APC prints present); host
+18+2+7; emu 36/36. Next async-model items when wanted: kernel APCs
+(`KeInsertQueueApc`), IRP completion-routine chaining, and
+`WaitForSingleObjectEx` alertability.
