@@ -144,7 +144,8 @@ pub fn lookup(path: &str) -> Option<&'static [u8]> {
 ///
 /// A drive root (`C:`, `C:\`) or any path ending in a separator is reported as
 /// a directory so a shell's current-directory validation succeeds. A path that
-/// matches a [`FILES`] entry is a normal file. Everything else is "not found".
+/// matches a [`FILES`] entry or a writable-overlay file is a normal file.
+/// Everything else is "not found".
 pub fn attributes(path: &str) -> u32 {
     const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
@@ -161,27 +162,51 @@ pub fn attributes(path: &str) -> u32 {
     if is_drive_root || trailing_sep {
         return FILE_ATTRIBUTE_DIRECTORY;
     }
-    if lookup(path).is_some() {
+    if lookup(path).is_some() || writable_size_of(path).is_some() {
         FILE_ATTRIBUTE_NORMAL
     } else {
         INVALID
     }
 }
 
+/// Whether a writable-overlay file exists at `path` (normalized registry
+/// lookup, drive-prefix tolerant), returning its current size.
+fn writable_size_of(path: &str) -> Option<u64> {
+    // Normalize with any NT/DOS drive prefix stripped, matching how creators
+    // key bare names ("out.txt").
+    let no_nt = path.strip_prefix("\\??\\").unwrap_or(path);
+    let b = no_nt.as_bytes();
+    let stripped: &str = if b.len() >= 2 && b[1] == b':' {
+        no_nt[2..].strip_prefix(['\\', '/']).unwrap_or(&no_nt[2..])
+    } else {
+        no_nt
+    };
+    let key = norm_key(stripped);
+    WRITABLE
+        .lock()
+        .iter()
+        .find(|(k, _)| *k == key || norm_key(no_nt) == *k)
+        .map(|(_, s)| s.data.lock().len() as u64)
+}
+
 /// One result of a directory enumeration: the bare file name (no directory),
-/// its Win32 attributes, and its size in bytes.
+/// its Win32 attributes, and its size in bytes. Owned, since writable-overlay
+/// entries come from the registry's heap strings.
 pub struct DirEntry {
-    pub name: &'static str,
+    pub name: alloc::string::String,
     pub attributes: u32,
     pub size: u64,
 }
 
-/// `FindFirstFile`/`FindNextFile` backend: the `index`-th [`FILES`] entry whose
-/// path matches the wildcard `pattern` (`C:\*`, `C:\*.exe`, `C:\cmd.exe`, …).
-/// The pattern's directory part (everything up to the last separator) must
-/// equal the file's directory; the trailing name part is glob-matched (`*` and
-/// `?`, case-insensitive). Returns `None` once `index` is past the last match,
-/// which is how the caller detects `ERROR_NO_MORE_FILES`.
+/// `FindFirstFile`/`FindNextFile` backend: the `index`-th file whose path
+/// matches the wildcard `pattern` (`C:\*`, `C:\*.exe`, `C:\cmd.exe`, …),
+/// across BOTH the const [`FILES`] table and the writable overlay — a tool
+/// that glob-expands its argument (more.com's file iterator) must see
+/// redirect-created files too. The pattern's directory part (everything up
+/// to the last separator) must equal the file's directory; the trailing name
+/// part is glob-matched (`*` and `?`, case-insensitive). Returns `None` once
+/// `index` is past the last match, which is how the caller detects
+/// `ERROR_NO_MORE_FILES`.
 pub fn find(pattern: &str, index: usize) -> Option<DirEntry> {
     let (pat_dir, pat_name) = split_path(pattern);
     // A bare directory pattern ("C:\", empty name part) enumerates the whole
@@ -197,9 +222,33 @@ pub fn find(pattern: &str, index: usize) -> Option<DirEntry> {
         if dir_eq(dir, pat_dir) && glob_match(pat_name.as_bytes(), name.as_bytes()) {
             if n == index {
                 return Some(DirEntry {
-                    name,
+                    name: alloc::string::String::from(name),
                     attributes: 0x80, // FILE_ATTRIBUTE_NORMAL
                     size: f.data.len() as u64,
+                });
+            }
+            n += 1;
+        }
+    }
+    // The writable overlay (redirect-created files) enumerates after the
+    // const table. Registry keys are normalized paths; ours live in the
+    // drive root, so a pattern whose directory part is empty, ".", or a
+    // drive root matches on the name part alone.
+    let dir_matches = |dir: &str| {
+        dir.is_empty() || path_eq_norm(dir, ".") || {
+            let b = dir.as_bytes();
+            matches!(b, [_, b':'] | [_, b':', b'\\'] | [_, b':', b'/'])
+        }
+    };
+    let reg = WRITABLE.lock();
+    for (key, shared) in reg.iter() {
+        let (dir, name) = split_path(key);
+        if dir_matches(dir) && glob_match(pat_name.as_bytes(), name.as_bytes()) {
+            if n == index {
+                return Some(DirEntry {
+                    name: alloc::string::String::from(name),
+                    attributes: 0x80, // FILE_ATTRIBUTE_NORMAL
+                    size: shared.data.lock().len() as u64,
                 });
             }
             n += 1;
@@ -355,12 +404,18 @@ pub static WRITABLE_FILE_TYPE: ob::ObjectType = ob::ObjectType {
 /// Registry of created writable files (path -> shared buffer).
 static WRITABLE: SpinLock<alloc::vec::Vec<(String, &'static Shared)>> = SpinLock::new(alloc::vec::Vec::new());
 
-/// Canonical registry key: separator- and case-normalized, `.` segments dropped.
+/// Canonical registry key: separator- and case-normalized, `.` segments and
+/// any NT/drive prefix dropped (a single-root fs: "\??\C:\out.txt" ≡
+/// "C:\out.txt" ≡ "out.txt"). Creators and lookups normalize identically, so
+/// a file written as "out.txt" is found as "C:\out.txt" too.
 fn norm_key(path: &str) -> String {
     let mut out = String::new();
     for seg in path.split(|c| c == '/' || c == '\\') {
         if seg.is_empty() || seg == "." {
             continue;
+        }
+        if seg == "??" || (seg.len() == 2 && seg.as_bytes()[1] == b':') {
+            continue; // "\??\" prefix, "X:" drive letter
         }
         if !out.is_empty() {
             out.push('\\');

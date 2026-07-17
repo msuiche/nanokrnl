@@ -339,7 +339,7 @@ extern "C" fn nt_query_directory(pat_ptr: u64, pat_len: u64, index: u64, out_ptr
     let Some(entry) = io::ramfs::find(pattern, index as usize) else {
         return 0;
     };
-    write_find_data(out_ptr, entry.name, entry.attributes, entry.size)
+    write_find_data(out_ptr, &entry.name, entry.attributes, entry.size)
 }
 
 /// Fill a `WIN32_FIND_DATAW` (x64 layout) at `out_ptr` with `name`, `attributes`
@@ -1133,6 +1133,13 @@ extern "C" fn nt_read_file(handle: u64, buffer: u64, length: u64, _a4: u64) -> u
 
 /// `NtClose(Handle)` — close a handle, dropping its object reference.
 extern "C" fn nt_close(handle: u64, _a2: u64, _a3: u64, _a4: u64) -> u64 {
+    // Pseudo-handles (GetCurrentProcess() = (HANDLE)-1, GetCurrentThread() =
+    // (HANDLE)-2): closing them is a documented no-op that succeeds without
+    // touching anything — ulib closes the current-process pseudo-handle as
+    // part of its exit path and treats INVALID_HANDLE as fatal.
+    if handle == u64::MAX || handle == u64::MAX - 1 {
+        return NtStatus::SUCCESS.0 as u64;
+    }
     handle::ob_close_handle(handle).0 as u64
 }
 

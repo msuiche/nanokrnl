@@ -1463,7 +1463,7 @@ impl Cpu {
                                 self.last_svc = svc;
                                 self.last_svc_args = args;
                                 #[cfg(not(target_arch = "wasm32"))]
-                                if svc == 3 {
+                                if svc == 3 || svc == 33 {
                                     let (ptr, len) = (self.regs[10], (self.regs[RDX] as usize).min(64));
                                     let mut s = alloc::string::String::new();
                                     for i in 0..len {
@@ -1471,7 +1471,8 @@ impl Cpu {
                                             s.push(*mem.get(p as usize).unwrap_or(&b'?') as char);
                                         }
                                     }
-                                    eprintln!("[svc3 NtCreateFile ptr={:#x} len={} name={:?}]", ptr, self.regs[RDX], s);
+                                    let tag = if svc == 3 { "NtCreateFile" } else { "QueryDirectory" };
+                                    eprintln!("[svc{svc} {tag} ptr={:#x} len={} name={:?}]", ptr, self.regs[RDX], s);
                                 }
                             }
                             self.regs[RCX] = next;

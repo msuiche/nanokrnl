@@ -1154,3 +1154,38 @@ Then the real chain, all trace-driven:
 
 Verified: QEMU suite 76/76 (exit 33), host 18+2+7, emu 36/36, and
 `dir | sort` still produces the sorted listing at the prompt.
+
+### 2026-07-17 - `more out.txt` closes out: writable files are first-class
+
+The trailing "Unknown error" from the previous entry is fixed — but NOT via
+the error strings (that was the wrong branch of the diagnosis; the inline
+-resource fallback stays, it's just not what more.com needed). The real
+chain, found by dumping the QUERY_DIRECTORY patterns in the tracer:
+
+1. **Glob expansion never saw writable files.** `ramfs::find()` and
+   `ramfs::attributes()` consulted only the const `FILES` table, so a tool
+   that stats or glob-expands its argument (ulib's file iterator, any
+   `GetFileAttributesW`) couldn't see a redirect-created file — open it
+   directly and it worked, enumerate for it and it didn't exist. Both now
+   include the writable overlay (drive-root tolerant).
+2. **`CreateFile("C:\out.txt", OPEN_EXISTING)` missed writable files** when
+   the path was drive-qualified: creators key bare names ("out.txt") but
+   `norm_key` kept the drive prefix on lookups ("c:\out.txt"), so the stat
+   succeeded and the open failed one call later. `norm_key` now drops NT
+   and drive prefixes at normalization, unifying bare and qualified forms
+   everywhere (create, open, size, enumerate).
+3. **`CloseHandle((HANDLE)-1)` was INVALID_HANDLE**, and ulib closes the
+   `GetCurrentProcess()` pseudo-handle on its exit path — a documented
+   no-op on real Windows that was fatal here. `NtClose` now succeeds
+   silently for the -1/-2 pseudo-handles.
+
+Result: `more out.txt` opens, reads, pages, and exits clean; `type`/`dir`
+enumerate redirect-created files (charmingly, `dir > out.txt` lists
+`out.txt` itself at its mid-write size, like a real fs). The remaining
+gap: ulib/more message *strings* still can't render (no `ulib.dll.mui` in
+the image set), so a real error path still falls back to "Unknown error"
+text — but there is no error path left on this flow.
+
+Verified: QEMU suite 76/76 (exit 33); host 18+2+7; emu 36/36; interactive:
+`dir`, `dir | sort` (sorted), `dir > out.txt`, `type out.txt`,
+`more out.txt` all clean end to end.
