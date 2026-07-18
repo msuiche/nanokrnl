@@ -24,7 +24,7 @@ use crate::mm::pool::pool_tag;
 use crate::rtl::NtStatus;
 use crate::{ex, hal, io, ke, kd_println, mm, ps};
 use bootloader_api::BootInfo;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// Set by the self-test thread when every check has passed; the idle loop
 /// watches it to know when to report success to the host.
@@ -1020,6 +1020,54 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
         unsafe { ke::dpc::ke_insert_queue_dpc(&raw mut DPC) };
         ke_delay_execution_thread(3);
         check!("Ke: DPC queued from thread retires at DISPATCH", DPC_RAN.load(Ordering::Acquire));
+    }
+
+    // --- Ke: kernel APCs ---------------------------------------------------
+    // Queue a normal kernel APC to this thread: it must NOT run inline, must
+    // deliver at APC_LEVEL on the next dispatch interrupt (the delay rides
+    // through one), with the recorded context + arguments, and the same APC
+    // must refuse a double-insert while queued.
+    {
+        static KAPC_RAN: AtomicU32 = AtomicU32::new(0);
+        static KAPC_ARGS: AtomicU64 = AtomicU64::new(0);
+        static mut KAPC: ke::apc::Kapc = ke::apc::Kapc::new();
+        unsafe fn test_normal(ctx: u64, a1: u64, a2: u64) {
+            KAPC_ARGS.store(ctx ^ (a1 << 8) ^ a2, Ordering::Release);
+            KAPC_RAN.fetch_add(1, Ordering::AcqRel);
+        }
+        unsafe {
+            let cur = ke::pcr::ke_get_current_thread();
+            ke::apc::ke_initialize_apc(
+                &raw mut KAPC,
+                cur,
+                None,
+                Some(test_normal),
+                0xC0,
+                0xA1,
+                0xA2,
+            );
+            check!(
+                "Ke: KeInsertQueueApc queues a kernel APC",
+                ke::apc::ke_insert_queue_apc(&raw mut KAPC, cur)
+            );
+            check!(
+                "Ke: double-insert refused while queued",
+                !ke::apc::ke_insert_queue_apc(&raw mut KAPC, cur)
+            );
+            check!(
+                "Ke: kernel APC does not run inline",
+                KAPC_RAN.load(Ordering::Acquire) == 0
+            );
+            ke_delay_execution_thread(3); // ride through a dispatch interrupt
+            check!(
+                "Ke: kernel APC delivered at APC_LEVEL",
+                KAPC_RAN.load(Ordering::Acquire) == 1
+            );
+            check!(
+                "Ke: kernel APC got its context + arguments",
+                KAPC_ARGS.load(Ordering::Acquire) == (0xC0 ^ (0xA1 << 8) ^ 0xA2)
+            );
+        }
     }
 
     // --- Io: \Device\Null round trip -------------------------------------

@@ -80,6 +80,16 @@ fn release(old_irql: Kirql) {
     irql::ke_lower_irql(old_irql);
 }
 
+/// Thin dispatcher-lock pair for `ke::apc` (kernel APC queue ops), kept
+/// crate-visible so the lock itself stays an implementation detail.
+pub(crate) fn dispatcher_lock() -> Kirql {
+    acquire()
+}
+/// See [`dispatcher_lock`].
+pub(crate) fn dispatcher_unlock(old_irql: Kirql) {
+    release(old_irql);
+}
+
 // ---------------------------------------------------------------------------
 // Scheduling state (guarded by the dispatcher lock)
 // ---------------------------------------------------------------------------
@@ -507,6 +517,10 @@ pub unsafe fn ki_wait_for_objects(
         // Woken: status was set by whoever satisfied (or timed out) the wait.
         let status = (*cur).wait_status;
         release(old);
+        // Kernel APCs deliver on the thread-resume path (NT delivers on the
+        // return toward PASSIVE in thread context): this thread was just
+        // woken and is running again — deliver whatever was queued for it.
+        crate::ke::apc::ki_deliver_apcs();
         status
     }
 }
@@ -796,6 +810,10 @@ pub fn ki_dispatch_interrupt() {
         }
         release(old);
     }
+    // Deliver pending kernel APCs of the (possibly newly resumed) current
+    // thread, at APC_LEVEL: the dispatch interrupt is NT's "next time the
+    // thread runs" delivery point, and it already runs in thread context.
+    crate::ke::apc::ki_deliver_apcs();
 }
 
 /// `KeQueryTickCount`.

@@ -1246,3 +1246,37 @@ the non-alertable call then reports the child normally — folded into the
 Verified: QEMU suite 77/77 (exit 33, completion-routine check + both
 WaitEx prints); host 18+2+7; emu 36/36. Remaining async items: kernel APCs
 (`KeInsertQueueApc`) and alertability inside long kernel waits proper.
+
+### 2026-07-17 - kernel APCs (KeInitializeApc / KeInsertQueueApc / delivery)
+
+The last rung of the async-model ladder. New `ke/apc.rs`: a `KAPC` object
+(queue entry, kernel routine, normal routine + context/args, target thread),
+`KeInitializeApc` (NT's shape, collapsed to normal kernel APCs),
+`KeInsertQueueApc` (dispatcher-lock-guarded insert, double-insert refused),
+and `ki_deliver_apcs`, which drains the current thread's pending queue at
+`APC_LEVEL` — kernel routine first, then `normal(context, arg1, arg2)`.
+
+Delivery was the instructive part (two boot failures earned it):
+
+1. **IRQL direction.** `ki_dispatch_interrupt` enters with CR8 wherever the
+   interrupted code left it (PASSIVE in practice), so a hard-coded
+   `lower_irql(APC_LEVEL)` tripped the strict direction asserts — delivery
+   now raises or lowers to APC_LEVEL from either side and restores.
+2. **Delivery point.** The first hook (dispatch-interrupt epilogue) never
+   fired for a *woken* thread: a wait wake resumes the thread from its own
+   wait frame (`ki_wait_for_objects`'s switch), not through the epilogue —
+   the dispatch interrupt that readied it belonged to the idle thread. A
+   second delivery hook after `release(old)` in `ki_wait_for_objects`
+   covers the resume path, which is NT's "return toward PASSIVE in thread
+   context" delivery semantics. (Also learned: `ListEntry` heads need
+   `init()` — the `KTHREAD` queue field is lazily self-linked on first
+   touch.)
+
+Boot self-test (82 checks now): queue to self, double-insert refused, no
+inline delivery, delivered at APC_LEVEL with context + arguments intact.
+
+Verified: QEMU suite 82/82 (exit 33); host 18+2+7; emu 36/36. The APC
+story is now complete at both layers: kernel APCs for in-kernel consumers
+(suspension/context machinery can build on it), user APCs with alertable
+waits for ring 3. A driver-facing export + `ntabi` Kapc type is the small
+follow-up when a driver actually needs it.

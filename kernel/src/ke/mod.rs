@@ -26,6 +26,8 @@ pub mod spinlock;
 // so it only builds for the kernel target; host tests cover the
 // arch-independent layers beneath it (lists, IRQL rules, spinlocks).
 #[cfg(target_arch = "x86_64")]
+pub mod apc;
+#[cfg(target_arch = "x86_64")]
 pub mod debug;
 #[cfg(target_arch = "x86_64")]
 pub mod dispatcher;

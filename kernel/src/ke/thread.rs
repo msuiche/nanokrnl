@@ -178,6 +178,10 @@ pub struct Kthread {
     pub user_apcs: [(u64, u64); USER_APC_MAX],
     /// Number of live entries in `user_apcs` (queue is 0..count, no holes).
     pub user_apc_count: u8,
+    /// Pending **kernel** APCs (`KeInsertQueueApc`): a list of `Kapc`
+    /// objects delivered at `APC_LEVEL` in this thread's context by
+    /// `ke::apc::ki_deliver_apcs` (`ApcState.KernelApcPending` in NT).
+    pub kapc_queue: ListEntry,
 }
 
 /// Maximum user APCs queued per thread (NT has no fixed small limit; 8 is
@@ -223,6 +227,7 @@ impl Kthread {
             child_std_handles: [0; 3],
             user_apcs: [(0, 0); USER_APC_MAX],
             user_apc_count: 0,
+            kapc_queue: ListEntry::new(),
         }
     }
 
