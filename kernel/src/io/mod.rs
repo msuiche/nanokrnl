@@ -24,6 +24,7 @@ pub mod null;
 pub mod p9;
 pub mod pipe;
 pub mod ramfs;
+pub mod virtblk;
 
 use crate::ke::dispatcher::{ke_wait_for_single_object, DispatcherObjectType, Kevent};
 use crate::mm::pool::{pool_alloc_checked, pool_free, pool_tag};

@@ -1093,6 +1093,34 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
         }
     }
 
+    // --- Io: virtio-blk block device ---------------------------------------
+    // The storage stack's foundation: probe the legacy virtio-blk device,
+    // read sector 0 of the scratch disk (marker + boot signature), and
+    // round-trip a write to a scratch sector. Skips cleanly when no disk is
+    // attached (nanox has no block device yet).
+    if io::virtblk::init() {
+        let mut sector = [0u8; 512];
+        check!(
+            "Vblk: read sector 0 from the scratch disk",
+            io::virtblk::read_sector(0, &mut sector)
+        );
+        check!(
+            "Vblk: sector 0 carries the marker + boot signature",
+            &sector[..8] == b"NANOBLK1" && sector[510] == 0x55 && sector[511] == 0xAA
+        );
+        let mut w = [0x5Au8; 512];
+        w[0] = 0x42;
+        let wrote = io::virtblk::write_sector(2, &w);
+        let mut back = [0u8; 512];
+        let read_back = io::virtblk::read_sector(2, &mut back);
+        check!(
+            "Vblk: write sector + read-back round-trips",
+            wrote && read_back && back[0] == 0x42 && back[1] == 0x5A && back[511] == 0x5A
+        );
+    } else {
+        kd_println!("  [SKIP] Vblk: no virtio-blk device attached");
+    }
+
     // --- Ob: reference counting ------------------------------------------
     {
         static DUMMY_TYPE: crate::ob::ObjectType = crate::ob::ObjectType {

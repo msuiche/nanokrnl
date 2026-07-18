@@ -45,6 +45,43 @@ pub unsafe fn outl(port: u16, value: u32) {
     }
 }
 
+/// Read a 32-bit doubleword from an I/O port (`READ_PORT_ULONG`).
+///
+/// # Safety
+/// The caller must own the device decoding `port`.
+#[inline]
+pub unsafe fn inl(port: u16) -> u32 {
+    let value: u32;
+    unsafe {
+        asm!("in eax, dx", out("eax") value, in("dx") port, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+/// Write a 16-bit word to an I/O port.
+///
+/// # Safety
+/// The caller must own the device decoding `port`.
+#[inline]
+pub unsafe fn outw(port: u16, value: u16) {
+    unsafe {
+        asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// Read a 16-bit word from an I/O port.
+///
+/// # Safety
+/// The caller must own the device decoding `port`.
+#[inline]
+pub unsafe fn inw(port: u16) -> u16 {
+    let value: u16;
+    unsafe {
+        asm!("in ax, dx", out("ax") value, in("dx") port, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
 /// A short, deterministic I/O delay: one write to the POST diagnostic port
 /// 0x80. Old hardware (the 8259A in particular) needs a moment between
 /// configuration writes; this is the traditional way to grant it.

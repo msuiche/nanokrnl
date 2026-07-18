@@ -10,6 +10,8 @@
 set -eu
 cd "$(dirname "$0")/.."
 
+sh scripts/gen-blkimg.sh
+
 cargo build -p kernel --target x86_64-unknown-none
 
 # Watchdog: prefer GNU timeout's --foreground (keeps the command in the

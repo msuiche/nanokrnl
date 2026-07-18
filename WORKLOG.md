@@ -1366,3 +1366,40 @@ written by one boot is read by the next.
 Verified: QEMU suite 90/90 (exit 33); host 18+2+7; emu 36/36;
 `p9_persist` three-boot PASS. Registry work is done end to end: parse,
 serialize, persist, survive reboots.
+
+### 2026-07-17 - storage I: a real virtio-blk block device
+
+The storage stack's foundation is in: PCI enumeration, the legacy
+(transitional) virtio-blk interface, and synchronous sector read/write,
+proven against a scratch disk on every boot.
+
+- `hal/pci.rs`: `CF8`/`CFC` config-space access, bus scan, BAR r/w,
+  bus-master + I/O enable.
+- `io/virtblk.rs`: probe `1AF4:1001`, reset (with the asynchronous
+  settle wait), legacy vring (desc/avail/used laid out at the
+  device-reported queue depth, volatile ring access, DMA via physical
+  addresses), 3-descriptor requests (header/data/status) with bounded
+  completion poll.
+- Wiring: `scripts/gen-blkimg.sh` stamps a 1 MiB scratch disk
+  (NANOBLK1 marker + 0x55AA), the boot crate attaches it as
+  `virtio-blk-pci,drive=scratch`, and the boot suite (93 checks now)
+  reads sector 0 and round-trips a write to sector 2. nanox has no PCI
+  emulation, so the test skips cleanly there (unknown ports read as
+  all-ones, exactly like real hardware).
+
+The bug that cost the afternoon deserves recording honestly: after every
+layout detail was re-verified correct (queue PFN, ring offsets at the
+device's own queue depth of 256, descriptor bytes dumped and decoded,
+avail.idx advancing), the device still never completed a request. QEMU's
+`-trace virtio_queue_notify,virtio_blk_req_complete` answered it in one
+line: the notifies WERE arriving, followed by `virtio-blk missing
+headers` — descriptor 0 was written with `flags=0, next=1`, so the chain
+stopped at the header. `NEXT` is a flag, not an implication; one word
+fixed it. Lesson kept: when the guest side is provably right, trace the
+host side — QEMU's trace points are as good as a kernel debugger on the
+other end of the DMA bus.
+
+Verified: QEMU suite 93/93 (exit 33); host 18+2+7; emu 36/36; nanox
+skips cleanly. Next storage rungs: a FAT32 reader on top of virtblk,
+then write support and a pagefile — real paging-out, which is what makes
+the whole memory manager honest.

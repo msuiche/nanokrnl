@@ -63,6 +63,17 @@ fn main() {
             qemu.arg("-drive")
                 .arg(format!("format=raw,file={}", bios_path.display()));
         }
+        // A scratch virtio-blk disk for the storage self-test, attached when
+        // present (scripts/gen-blkimg.sh). The kernel probes it and the test
+        // skips cleanly when it's absent. Explicitly the *transitional*
+        // device: the plain alias's disable-legacy=auto can hide the legacy
+        // I/O interface this driver uses.
+        let blk = std::path::Path::new("target/test-blk.img");
+        if blk.exists() {
+            qemu.arg("-drive")
+                .arg(format!("format=raw,if=none,id=scratch,file={}", blk.display()));
+            qemu.arg("-device").arg("virtio-blk-pci,drive=scratch,disable-modern=on");
+        }
         // COM1 -> stdio so KdPrint output lands in the terminal; the ISA debug
         // exit device gives the kernel a way to report pass/fail exit codes
         // from its phase-1 self tests (exit code = (value << 1) | 1).

@@ -18,6 +18,8 @@
 #[cfg(target_arch = "x86_64")]
 pub mod apic;
 #[cfg(target_arch = "x86_64")]
+pub mod pci;
+#[cfg(target_arch = "x86_64")]
 pub mod pic;
 #[cfg(target_arch = "x86_64")]
 pub mod port;
