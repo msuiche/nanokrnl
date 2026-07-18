@@ -1403,3 +1403,32 @@ Verified: QEMU suite 93/93 (exit 33); host 18+2+7; emu 36/36; nanox
 skips cleanly. Next storage rungs: a FAT32 reader on top of virtblk,
 then write support and a pagefile — real paging-out, which is what makes
 the whole memory manager honest.
+
+### 2026-07-17 - storage II: a real FAT32 drive (D:\)
+
+The kernel now mounts a FAT32 filesystem over the virtio-blk device and
+serves files from it through the normal Win32 path.
+
+- `tools/gen_fat32.py` builds a valid 16 MiB superfloppy (BPB with the
+  NANOBLK1 OEM marker + 0x55AA, two FATs, root `HELLO.TXT` + `README.TXT`,
+  and `SUB\NESTED.TXT` nested) — the same image the vblk test reads, so
+  one disk exercises both layers.
+- `io/fat.rs`: BPB parse + sanity, FAT chains with a one-sector cache,
+  8.3 directory walk (LFN/volume/deleted entries skipped), nested-path
+  lookup, whole-file read, directory + glob enumeration, attributes. The
+  geometry is copied out of its lock once (static after mount) — the
+  first version held it across `lookup()` and deadlocked the suite at the
+  subdirectory test, the classic own-lock-reentry bug.
+- `D:\` is wired into the same syscalls as `H:\`: `NtCreateFile` /
+  `NtOpenFile` read whole files over the block layer into in-memory file
+  objects; `NtQueryDirectory` and `GetFileAttributesW` enumerate and
+  classify (`*.TXT` globs, `SUB\` subdirectories, proper
+  NORMAL/DIRECTORY/not-found results).
+
+Boot suite (**100 checks**): BPB recognized, read `HELLO.TXT`, read
+`SUB\NESTED.TXT`, root and subdirectory enumeration, attributes, glob —
+all through the same syscalls a Win32 app uses.
+
+Verified: QEMU suite 100/100 (exit 33); host 18+2+7; emu 36/36. Next
+storage rungs: FAT32 write support, then the pagefile — real paging-out,
+the reason this stack exists.

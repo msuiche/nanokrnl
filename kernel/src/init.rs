@@ -1106,7 +1106,7 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
         );
         check!(
             "Vblk: sector 0 carries the marker + boot signature",
-            &sector[..8] == b"NANOBLK1" && sector[510] == 0x55 && sector[511] == 0xAA
+            &sector[3..11] == b"NANOBLK1" && sector[510] == 0x55 && sector[511] == 0xAA
         );
         let mut w = [0x5Au8; 512];
         w[0] = 0x42;
@@ -1117,6 +1117,43 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
             "Vblk: write sector + read-back round-trips",
             wrote && read_back && back[0] == 0x42 && back[1] == 0x5A && back[511] == 0x5A
         );
+
+        // --- Io: FAT32 on top of the block device (the D:\ drive) ---------
+        check!("FAT: FAT32 BPB recognized and mounted", io::fat::init());
+        if io::fat::mounted() {
+            check!(
+                "FAT: read HELLO.TXT from D:\\",
+                io::fat::read("HELLO.TXT")
+                    .is_some_and(|b| b.starts_with(b"Hello from the FAT32 drive"))
+            );
+            check!(
+                "FAT: read a nested file (SUB\\NESTED.TXT)",
+                io::fat::read("SUB\\NESTED.TXT")
+                    .is_some_and(|b| b.starts_with(b"a nested file"))
+            );
+            let root0 = io::fat::find("*", 0);
+            let has_readme = (0..8).any(|i| {
+                io::fat::find("*", i).is_some_and(|(n, _, _)| n == "README.TXT")
+            });
+            check!(
+                "FAT: enumerate the root directory",
+                root0.is_some() && has_readme
+            );
+            check!(
+                "FAT: enumerate a subdirectory (SUB)",
+                io::fat::find("SUB\\*", 0).is_some_and(|(n, _, _)| n == "NESTED.TXT")
+            );
+            check!(
+                "FAT: attributes (file normal, dir directory, missing invalid)",
+                io::fat::attributes("HELLO.TXT") == 0x80
+                    && io::fat::attributes("SUB") == 0x10
+                    && io::fat::attributes("NOPE.TXT") == 0xFFFF_FFFF
+            );
+            check!(
+                "FAT: glob enumeration (*.TXT)",
+                (0..8).any(|i| io::fat::find("*.TXT", i).is_some_and(|(n, _, _)| n == "HELLO.TXT"))
+            );
+        }
     } else {
         kd_println!("  [SKIP] Vblk: no virtio-blk device attached");
     }

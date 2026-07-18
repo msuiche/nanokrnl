@@ -343,6 +343,13 @@ extern "C" fn nt_query_directory(pat_ptr: u64, pat_len: u64, index: u64, out_ptr
         return write_find_data(out_ptr, fname, 0x80, bytes.len() as u64);
     }
     let Some(entry) = io::ramfs::find(pattern, index as usize) else {
+        // Not in the RAM fs: try the FAT32 drive (D:\ paths enumerate there).
+        if let Some(rest) = strip_fat_drive(pattern) {
+            return match io::fat::find(rest, index as usize) {
+                Some((name, attr, size)) => write_find_data(out_ptr, &name, attr, size),
+                None => 0,
+            };
+        }
         return 0;
     };
     write_find_data(out_ptr, &entry.name, entry.attributes, entry.size)
@@ -423,6 +430,9 @@ extern "C" fn nt_query_attributes(path_ptr: u64, path_len: u64, _a3: u64, _a4: u
     let Ok(path) = core::str::from_utf8(&abuf[..n]) else {
         return 0xFFFF_FFFF;
     };
+    if let Some(rest) = strip_fat_drive(path) {
+        return io::fat::attributes(rest) as u64;
+    }
     io::ramfs::attributes(path) as u64
 }
 
@@ -1011,6 +1021,16 @@ extern "C" fn nt_create_file(name_ptr: u64, name_len: u64, _access: u64, disposi
                 None => 0,
             };
         }
+        // The FAT32 drive (D:\): read the file over virtio-blk and hand back a
+        // read-only in-memory file object (the whole file is small; the
+        // block layer stays sector-level underneath).
+        if let Some(rest) = strip_fat_drive(bare) {
+            return match io::fat::read(rest) {
+                Some(bytes) => io::ramfs::open_bytes(bytes)
+                    .map_or(0, |f| handle::ob_create_handle(f as *mut u8, 0)),
+                None => 0,
+            };
+        }
         // Writable files: cmd implements `dir | sort` by writing dir's output to
         // a temp file, then reading it into sort; `> file` is the same shape.
         // CREATE_NEW(1)/CREATE_ALWAYS(2) make a fresh (truncated) writable file;
@@ -1039,6 +1059,17 @@ extern "C" fn nt_create_file(name_ptr: u64, name_len: u64, _access: u64, disposi
 fn strip_host_drive(p: &str) -> Option<&str> {
     let b = p.as_bytes();
     if b.len() >= 3 && b[0].eq_ignore_ascii_case(&b'h') && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/') {
+        Some(&p[3..])
+    } else {
+        None
+    }
+}
+
+/// Strip a leading `D:\` (case-insensitive) FAT-drive prefix, returning the
+/// path relative to the FAT root, or `None` if it is not a FAT path.
+fn strip_fat_drive(p: &str) -> Option<&str> {
+    let b = p.as_bytes();
+    if b.len() >= 3 && b[0].eq_ignore_ascii_case(&b'd') && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/') {
         Some(&p[3..])
     } else {
         None
@@ -1112,6 +1143,11 @@ extern "C" fn nt_open_file(
     // (`dir > out.txt`) opens through this path too (`more out.txt`).
     let opened: Option<*mut u8> = if let Some(rest) = strip_host_drive(path) {
         io::p9::read(rest)
+            .and_then(io::ramfs::open_bytes)
+            .map(|f| f as *mut u8)
+    } else if let Some(rest) = strip_fat_drive(path) {
+        // The FAT32 drive (D:\).
+        io::fat::read(rest)
             .and_then(io::ramfs::open_bytes)
             .map(|f| f as *mut u8)
     } else {

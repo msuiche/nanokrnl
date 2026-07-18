@@ -19,6 +19,7 @@
 //! shape as `IoBuildSynchronousFsdRequest` + `KeWaitForSingleObject`.
 
 pub mod console;
+pub mod fat;
 pub mod namespace;
 pub mod null;
 pub mod p9;
