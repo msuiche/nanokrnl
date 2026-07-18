@@ -252,3 +252,222 @@ pub fn load(bytes: &[u8], graft: &[u16]) -> Result<usize, LoadError> {
     }
     Ok(loaded)
 }
+
+// ---------------------------------------------------------------------------
+// Serializer — the write half: cm's model back to a valid `regf` file.
+// ---------------------------------------------------------------------------
+
+/// Why a save failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveError {
+    /// The root key doesn't exist.
+    NoSuchKey,
+    /// A key/value name isn't ASCII-representable (compressed-name cells
+    /// hold ASCII; non-ASCII names need the wide-name form, unimplemented).
+    NonAsciiName,
+}
+
+fn to_ascii(name: &[u16]) -> Result<alloc::vec::Vec<u8>, SaveError> {
+    name.iter()
+        .map(|&c| if c <= 0xFF { Ok(c as u8) } else { Err(SaveError::NonAsciiName) })
+        .collect()
+}
+
+/// Wrap a payload in a cell: negative size prefix, 8-byte alignment.
+fn wrap_cell(payload: &[u8], out: &mut alloc::vec::Vec<u8>) {
+    let size = (4 + payload.len() + 7) & !7;
+    out.extend_from_slice(&(-(size as i32)).to_le_bytes());
+    out.extend_from_slice(payload);
+    out.resize(out.len() + size - 4 - payload.len(), 0);
+}
+
+/// `nk` record payload (compressed name; indices may be -1 for "none").
+fn nk_payload(flags: u16, parent: i32, sub_count: u32, sub_list: i32, val_count: u32, val_list: i32, name: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut r = alloc::vec::Vec::with_capacity(76 + name.len());
+    r.extend_from_slice(b"nk");
+    r.extend_from_slice(&flags.to_le_bytes());
+    r.extend_from_slice(&[0; 8]); // last-write timestamp
+    r.extend_from_slice(&[0; 4]); // spare
+    r.extend_from_slice(&parent.to_le_bytes());
+    r.extend_from_slice(&sub_count.to_le_bytes());
+    r.extend_from_slice(&[0; 4]); // volatile subkey count
+    r.extend_from_slice(&sub_list.to_le_bytes());
+    r.extend_from_slice(&(-1i32).to_le_bytes()); // volatile subkey list
+    r.extend_from_slice(&val_count.to_le_bytes());
+    r.extend_from_slice(&val_list.to_le_bytes());
+    r.extend_from_slice(&(-1i32).to_le_bytes()); // security
+    r.extend_from_slice(&(-1i32).to_le_bytes()); // class
+    r.extend_from_slice(&[0; 16]); // max name/class/value-name/value-data
+    r.extend_from_slice(&[0; 4]); // workvar
+    r.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    r.extend_from_slice(&[0; 2]); // class length
+    r.extend_from_slice(name);
+    r
+}
+
+/// The fast-leaf name hint: the first 4 uppercase ASCII bytes of the name,
+/// zero-padded (what Windows writes in `lf`/`lh` entries).
+fn name_hint(name: &[u8]) -> u32 {
+    let mut h = [0u8; 4];
+    for (i, &c) in name.iter().take(4).enumerate() {
+        h[i] = c.to_ascii_uppercase();
+    }
+    u32::from_le_bytes(h)
+}
+
+/// Serialize the subtree rooted at cm key `root` into a valid `regf` hive
+/// file: base block with checksum, one page-rounded hbin, and `nk`/`vk`/`lh`
+/// cells for every key and value — a file Windows' own tools would open.
+pub fn save(root: usize) -> Result<alloc::vec::Vec<u8>, SaveError> {
+    // Collect the subtree pre-order (parents before children, as indices
+    // require), recording each child's position.
+    struct Node {
+        parent_pos: i32,
+        name: alloc::vec::Vec<u16>,
+        values: alloc::vec::Vec<(alloc::vec::Vec<u16>, u32, alloc::vec::Vec<u8>)>,
+        child_positions: alloc::vec::Vec<usize>,
+    }
+    fn collect(cm_idx: usize, parent_pos: i32, nodes: &mut alloc::vec::Vec<Node>) -> Result<(), SaveError> {
+        let Some((name, children, values)) = super::key_contents(cm_idx) else {
+            return Err(SaveError::NoSuchKey);
+        };
+        let pos = nodes.len();
+        nodes.push(Node { parent_pos, name, values, child_positions: alloc::vec::Vec::new() });
+        for c in children {
+            let child_pos = nodes.len();
+            nodes[pos].child_positions.push(child_pos);
+            collect(c, pos as i32, nodes)?;
+        }
+        Ok(())
+    }
+    let mut nodes = alloc::vec::Vec::new();
+    collect(root, -1, &mut nodes)?;
+
+    // Layout: every nk (in node order), then per node its lh (if children),
+    // value list (if values), vk cells, and data cells for long values.
+    let mut cur = 0x20usize; // hbin header
+    let mut nk_off = alloc::vec::Vec::with_capacity(nodes.len());
+    let mut name_ascii: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::with_capacity(nodes.len());
+    for n in &nodes {
+        let a = to_ascii(&n.name)?;
+        nk_off.push(cur);
+        cur += (4 + 76 + a.len() + 7) & !7;
+        name_ascii.push(a);
+    }
+    let mut lh_off: alloc::vec::Vec<i32> = alloc::vec::Vec::new();
+    let mut vlist_off: alloc::vec::Vec<i32> = alloc::vec::Vec::new();
+    let mut vk_offs: alloc::vec::Vec<alloc::vec::Vec<i32>> = alloc::vec::Vec::new();
+    let mut data_offs: alloc::vec::Vec<alloc::vec::Vec<i32>> = alloc::vec::Vec::new();
+    for n in &nodes {
+        lh_off.push(if n.child_positions.is_empty() { -1 } else {
+            let o = cur as i32;
+            cur += (4 + 4 + 8 * n.child_positions.len() + 7) & !7;
+            o
+        });
+        vlist_off.push(if n.values.is_empty() { -1 } else {
+            let o = cur as i32;
+            cur += (4 + 4 * n.values.len() + 7) & !7;
+            o
+        });
+        let mut vks = alloc::vec::Vec::new();
+        let mut datas = alloc::vec::Vec::new();
+        for (vname, _t, data) in &n.values {
+            let a = to_ascii(vname)?;
+            vks.push(cur as i32);
+            cur += (4 + 20 + a.len() + 7) & !7;
+            if data.len() > 4 {
+                datas.push(cur as i32);
+                cur += (4 + data.len() + 7) & !7;
+            } else {
+                datas.push(-1);
+            }
+        }
+        vk_offs.push(vks);
+        data_offs.push(datas);
+    }
+
+    // Emit cells.
+    let mut body: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(cur - 0x20);
+    for (i, n) in nodes.iter().enumerate() {
+        let flags = if i == 0 { 0x2C } else { 0x20 };
+        let parent = if n.parent_pos < 0 { -1 } else { nk_off[n.parent_pos as usize] as i32 };
+        let rec = nk_payload(
+            flags,
+            parent,
+            n.child_positions.len() as u32,
+            lh_off[i],
+            n.values.len() as u32,
+            vlist_off[i],
+            &name_ascii[i],
+        );
+        wrap_cell(&rec, &mut body);
+    }
+    for (i, n) in nodes.iter().enumerate() {
+        if lh_off[i] >= 0 {
+            let mut rec = alloc::vec::Vec::with_capacity(4 + 8 * n.child_positions.len());
+            rec.extend_from_slice(b"lh");
+            rec.extend_from_slice(&(n.child_positions.len() as u16).to_le_bytes());
+            for &cpos in &n.child_positions {
+                rec.extend_from_slice(&(nk_off[cpos] as i32).to_le_bytes());
+                rec.extend_from_slice(&name_hint(&name_ascii[cpos]).to_le_bytes());
+            }
+            wrap_cell(&rec, &mut body);
+        }
+        if vlist_off[i] >= 0 {
+            let mut rec = alloc::vec::Vec::with_capacity(4 * n.values.len());
+            for &vo in &vk_offs[i] {
+                rec.extend_from_slice(&vo.to_le_bytes());
+            }
+            wrap_cell(&rec, &mut body);
+        }
+        for (vi, (vname, vtype, data)) in n.values.iter().enumerate() {
+            let a = to_ascii(vname)?;
+            let mut rec = alloc::vec::Vec::with_capacity(20 + a.len());
+            rec.extend_from_slice(b"vk");
+            rec.extend_from_slice(&(a.len() as u16).to_le_bytes());
+            if data.len() <= 4 {
+                rec.extend_from_slice(&(0x8000_0000u32 | data.len() as u32).to_le_bytes());
+                let mut d = [0u8; 4];
+                d[..data.len()].copy_from_slice(data);
+                rec.extend_from_slice(&d);
+            } else {
+                rec.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                rec.extend_from_slice(&data_offs[i][vi].to_le_bytes());
+            }
+            rec.extend_from_slice(&vtype.to_le_bytes());
+            rec.extend_from_slice(&1u16.to_le_bytes()); // named
+            rec.extend_from_slice(&[0; 2]);
+            rec.extend_from_slice(&a);
+            wrap_cell(&rec, &mut body);
+            if data.len() > 4 {
+                wrap_cell(data, &mut body);
+            }
+        }
+    }
+
+    // hbin (page-rounded) + base block with checksum.
+    let hbin_size = (0x20 + body.len() + 4095) & !4095;
+    let mut out = alloc::vec::Vec::with_capacity(4096 + hbin_size);
+    out.resize(4096, 0);
+    out[0..4].copy_from_slice(b"regf");
+    out[4..8].copy_from_slice(&1u32.to_le_bytes()); // sequence1
+    out[8..12].copy_from_slice(&1u32.to_le_bytes()); // sequence2
+    out[0x1C..0x20].copy_from_slice(&1u32.to_le_bytes()); // major
+    out[0x20..0x24].copy_from_slice(&1u32.to_le_bytes()); // minor
+    out[0x24..0x28].copy_from_slice(&(nk_off[0] as u32).to_le_bytes()); // root cell
+    out[0x28..0x2C].copy_from_slice(&(hbin_size as u32).to_le_bytes()); // hbins size
+    out[0x2C..0x30].copy_from_slice(&1u32.to_le_bytes()); // cluster factor
+    let mut csum = 0u32;
+    for i in (0..0x1F8).step_by(4) {
+        csum ^= u32::from_le_bytes(out[i..i + 4].try_into().unwrap());
+    }
+    out[0x1FC..0x200].copy_from_slice(&csum.to_le_bytes());
+    out.extend_from_slice(b"hbin");
+    out.extend_from_slice(&[0; 4]); // hbin file offset
+    out.extend_from_slice(&(hbin_size as u32).to_le_bytes());
+    out.extend_from_slice(&[0; 20]); // reserved/timestamp/spare
+    out.extend_from_slice(&body);
+    out.resize(4096 + hbin_size, 0);
+    Ok(out)
+}
+

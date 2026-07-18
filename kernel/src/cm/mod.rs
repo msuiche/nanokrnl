@@ -328,3 +328,40 @@ pub(crate) fn add_value(key: usize, name: &[u16], vtype: u32, data: &[u8]) -> bo
     }
     h.set_value(key, name, vtype, data)
 }
+
+// --- Serialization surface (used by cm::hive::save) -------------------------
+
+/// Resolve a path from HKLM to a key index (read side of save).
+pub(crate) fn find_key(path: &[u16]) -> Option<usize> {
+    let mut h = HIVE.lock();
+    h.walk(2 /* HKLM */, path, false)
+}
+
+/// `RegSaveFile` in spirit: serialize the subtree at `path` (from HKLM)
+/// into a valid `regf` hive file. None if the path is missing or a name
+/// isn't ASCII-representable.
+pub fn save_hive(path: &[u16]) -> Option<alloc::vec::Vec<u8>> {
+    let root = find_key(path)?;
+    hive::save(root).ok()
+}
+
+/// A key's name, children, and values, for serialization. cm-internal.
+pub(crate) fn key_contents(key: usize) -> Option<(Vec<u16>, Vec<usize>, Vec<(Vec<u16>, u32, Vec<u8>)>)> {
+    let h = HIVE.lock();
+    let k = h.keys.get(key)?.as_ref()?;
+    let name = k.name.clone();
+    let children: Vec<usize> = h
+        .keys
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| c.as_ref().and_then(|c| (c.parent == key as i32).then_some(i)))
+        .collect();
+    let values: Vec<(Vec<u16>, u32, Vec<u8>)> = h
+        .values
+        .iter()
+        .filter_map(|v| v.as_ref())
+        .filter(|v| v.key == key as i32)
+        .map(|v| (v.name.clone(), v.vtype, v.data.clone()))
+        .collect();
+    Some((name, children, values))
+}

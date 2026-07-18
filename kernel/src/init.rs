@@ -1247,6 +1247,27 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
         let cnt = cm::enum_key(sys, 0, &mut nm);
         let name_ok = cnt == 13 && (0..13).all(|i| nm[i] == b"ControlSet001"[i] as u16);
         check!("Cm: hive subkey enumerates (ControlSet001)", name_ok);
+
+        // Round-trip: serialize HKLM\SYSTEM back to regf bytes, reload them
+        // under a second graft, and verify the content survives exactly —
+        // the write half of persistence, proven by the read half.
+        let saved = cm::save_hive(crate::w!("SYSTEM"));
+        check!(
+            "Cm: hive serializes back to regf bytes",
+            saved.as_ref().is_some_and(|b| b.len() > 4096 && b.starts_with(b"regf"))
+        );
+        if let Some(bytes) = saved {
+            let n = cm::hive::load(&bytes, crate::w!("SYSTEM2"));
+            check!("Cm: serialized hive re-loads", n.is_ok());
+            let ht2 = cm::open_key(HKLM, crate::w!("SYSTEM2\\ControlSet001\\Control\\HiveTest"));
+            let mut t2 = 0u32;
+            let mut b3 = [0u8; 32];
+            let n1 = cm::query_value(ht2, crate::w!("Signature"), &mut t2, &mut b3);
+            let rt1 = n1 == 4 && u32::from_le_bytes([b3[0], b3[1], b3[2], b3[3]]) == 0xC0FFEE;
+            let n2 = cm::query_value(ht2, crate::w!("Greeting"), &mut t2, &mut b3);
+            let rt2 = n2 == 22 && (0..10).all(|i| b3[i * 2] as u16 == b"hello hive"[i] as u16);
+            check!("Cm: round-trip preserves values exactly", rt1 && rt2);
+        }
     }
 
     // --- Ps: CreateProcess primitive -------------------------------------

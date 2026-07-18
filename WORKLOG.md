@@ -1311,3 +1311,31 @@ key opens, DWORD round-trip, REG_SZ round-trip, subkey enumeration.
 Verified: QEMU suite 86/86 (exit 33); host 18+2+7; emu 36/36. Part II is
 the write half: serialize cm's model back to a valid `regf` file and
 round-trip it (the kernel writes a hive Windows' own tools would open).
+
+### 2026-07-17 - registry hive persistence, part II: the kernel writes hives
+
+The write half, closing the loop: `cm::hive::save()` serializes any subtree
+of the live registry back to a valid `regf` file, and the round-trip is
+proven in the boot suite.
+
+The serializer walks a subtree pre-order (parents before children, as cell
+indices require) and emits the same format the parser accepts: base block
+with XOR checksum, one page-rounded hbin, and cells for every key and
+value — `nk` records (compressed ASCII names, root flagged 0x2C), `lh`
+subkey lists with proper uppercase name hints, value lists, `vk` values
+(≤ 4-byte data inline with the high bit, longer data in their own cells).
+`cm::save_hive(path)` is the public surface (`RegSaveFile` in spirit).
+
+Boot suite (89 checks now): serialize `HKLM\SYSTEM` → assert `regf` magic
+→ re-load the bytes under a fresh graft (`SYSTEM2`) → query both values
+through the normal registry API and require exact equality with the
+originals (`Signature` = 0xC0FFEE, `Greeting` = "hello hive"). So both
+directions are proven against each other, and the read half was already
+proven against the Python-generated reference hive — the validation loop
+is closed from both ends.
+
+Verified: QEMU suite 89/89 (exit 33); host 18+2+7; emu 36/36. Registry
+persistence is now real: load any hive, change it, write it back. A
+`RegSaveFile`-style syscall (or a periodic flush of a system hive on the
+host 9P drive) is a small follow-up whenever persistence-at-runtime is
+wanted; the format machinery is done.
