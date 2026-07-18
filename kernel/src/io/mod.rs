@@ -188,8 +188,29 @@ pub unsafe fn io_call_driver(device: *mut DeviceObject, irp: *mut Irp) -> NtStat
 ///
 /// # Safety
 /// `irp` must be live; `io_status` must already be filled in.
+/// `IoCompleteRequest` — finish an IRP: run the stack locations' completion
+/// routines (bottom-to-top, NT's order: the completing driver's level first,
+/// then each sender's layer above it), then signal the IRP's user event if
+/// one was set (the synchronous-request half).
 pub unsafe fn io_complete_request(irp: *mut Irp) {
     unsafe {
+        // Completion routines: recorded via IoSetCompletionRoutine. Each is
+        // `(device, irp, context) -> NTSTATUS` with the Microsoft x64 ABI,
+        // invoked with the IRP's final IoStatusBlock visible.
+        let n = (*irp).stack_count as isize;
+        let base = (irp as *mut u8).add(core::mem::size_of::<Irp>()) as *mut IoStackLocation;
+        for i in 0..n {
+            let sl = base.offset(i);
+            let routine = (*sl).completion_routine;
+            if !routine.is_null() {
+                let f: unsafe extern "win64" fn(
+                    *mut DeviceObject,
+                    *mut Irp,
+                    *mut core::ffi::c_void,
+                ) -> ntabi::Ntstatus = core::mem::transmute(routine);
+                f((*sl).device_object, irp, (*sl).context);
+            }
+        }
         let ev = (*irp).user_event as *mut crate::ke::dispatcher::DispatcherHeader;
         if !ev.is_null() {
             crate::ke::scheduler::ki_signal_object(ev);

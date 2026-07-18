@@ -100,6 +100,7 @@ extern "C" {
         pi: *mut u8,
     ) -> i32;
     fn WaitForSingleObject(handle: u64, millis: u32) -> u32;
+    fn WaitForSingleObjectEx(handle: u64, millis: u32, alertable: i32) -> u32;
     fn GetExitCodeProcess(handle: u64, code: *mut u32) -> i32;
     // msvcrt shim imports (resolved by the loader against our msvcrt.dll).
     fn atoi(s: *const u8) -> i32;
@@ -594,6 +595,7 @@ unsafe fn main(argc: i32, argv: *const *const u8) -> i32 {
     ];
     let mut pi = [0u8; 24];
     let mut createproc_ok = false;
+    let mut wait_ex_ok = false;
     if CreateProcessW(
         child_w.as_ptr(),
         core::ptr::null(),
@@ -613,6 +615,21 @@ unsafe fn main(argc: i32, argv: *const *const u8) -> i32 {
         GetExitCodeProcess(hproc, &mut code);
         createproc_ok = true;
         print(out, b"APP: CreateProcessW(child.exe) + wait + GetExitCode ok\n");
+        // WaitForSingleObjectEx alertable: a pending APC preempts the wait
+        // (WAIT_IO_COMPLETION, even though the child already exited); the
+        // non-alertable call then reports the child normally.
+        APC_HITS = 0;
+        QueueUserAPC(test_apc as usize, GetCurrentThread(), 0x77);
+        let st_ex = WaitForSingleObjectEx(hproc, 1000, 1);
+        wait_ex_ok = st_ex == 0xC0
+            && APC_HITS == 1
+            && APC_ARG == 0x77
+            && WaitForSingleObjectEx(hproc, 1000, 0) == 0;
+        if wait_ex_ok {
+            print(out, b"APP: WaitForSingleObjectEx alertable APC preemption ok\n");
+        } else {
+            print(out, b"APP: WaitForSingleObjectEx FAILED\n");
+        }
     } else {
         print(out, b"APP: CreateProcessW FAILED\n");
     }
@@ -642,6 +659,7 @@ unsafe fn main(argc: i32, argv: *const *const u8) -> i32 {
             && fs_ok
             && veh_ok
             && apc_ok
+            && wait_ex_ok
         {
             0xABCD
         } else {

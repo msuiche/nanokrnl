@@ -564,7 +564,11 @@ extern "C" fn nt_create_process(path_ptr: u64, path_len: u64, cmd_ptr: u64, cmd_
 
 /// `NtWaitForSingleObject` on a process handle (a2 = timeout ms). Returns the
 /// wait NTSTATUS (0 = the process exited).
-extern "C" fn nt_wait_process(handle: u64, timeout_ms: u64, _a3: u64, _a4: u64) -> u64 {
+extern "C" fn nt_wait_process(handle: u64, timeout_ms: u64, alertable: u64, _a4: u64) -> u64 {
+    const STATUS_USER_APC: u64 = 0xC0;
+    if alertable != 0 && unsafe { (*crate::ke::pcr::ke_get_current_thread()).user_apc_count != 0 } {
+        return STATUS_USER_APC;
+    }
     crate::init::wait_user_process(handle, timeout_ms)
 }
 

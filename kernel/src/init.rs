@@ -1247,6 +1247,47 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
                         "Ldr: loaded driver handles IOCTL (spinlock-guarded count)",
                         matches!(ioctl, Ok(iosb) if iosb.information == 8) && count >= 1
                     );
+
+                    // Completion routine: recorded in the top stack location,
+                    // it must run when the driver completes the IRP — the
+                    // IoSetCompletionRoutine → IoCompleteRequest contract.
+                    {
+                        static COMPLETED: core::sync::atomic::AtomicU64 =
+                            core::sync::atomic::AtomicU64::new(0);
+                        unsafe extern "win64" fn on_complete(
+                            _dev: *mut io::DeviceObject,
+                            _irp: *mut io::Irp,
+                            ctx: *mut core::ffi::c_void,
+                        ) -> io::Ntstatus {
+                            unsafe {
+                                (*(ctx as *mut core::sync::atomic::AtomicU64))
+                                    .store(1, Ordering::Release)
+                            };
+                            io::Ntstatus(0)
+                        }
+                        COMPLETED.store(0, Ordering::Release);
+                        let mut buf2 = [0u8; 8];
+                        unsafe {
+                            let irp = io::io_allocate_irp(1).expect("irp");
+                            (*irp).system_buffer = buf2.as_mut_ptr();
+                            let next = io::io_get_next_stack_location(irp);
+                            (*next).major_function = io::IRP_MJ_READ;
+                            (*next).device_object = device;
+                            (*next).set_read_write(io::ReadWriteParams {
+                                length: buf2.len() as u32,
+                                key: 0,
+                                byte_offset: 0,
+                            });
+                            (*next).completion_routine = on_complete as *mut core::ffi::c_void;
+                            (*next).context = (&raw const COMPLETED) as *mut core::ffi::c_void;
+                            let _ = io::io_call_driver(device, irp); // driver completes it
+                            io::io_free_irp(irp);
+                        }
+                        check!(
+                            "Io: completion routine ran at IoCompleteRequest",
+                            COMPLETED.load(Ordering::Acquire) == 1
+                        );
+                    }
                 }
 
                 // Unload: runs DriverUnload (deletes the symlink + device),

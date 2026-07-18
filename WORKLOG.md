@@ -1220,3 +1220,29 @@ Verified: QEMU suite 76/76 (exit 33, both APC prints present); host
 18+2+7; emu 36/36. Next async-model items when wanted: kernel APCs
 (`KeInsertQueueApc`), IRP completion-routine chaining, and
 `WaitForSingleObjectEx` alertability.
+
+### 2026-07-17 - async I/O, continued: IRP completion routines + alertable object waits
+
+Two more rungs of the async-model ladder, both verified:
+
+**IRP completion routines.** `IoCompleteRequest` now walks the IRP's stack
+locations bottom-to-top and invokes any recorded completion routine
+(`(device, irp, context) -> NTSTATUS`, Microsoft x64 ABI, at the real
+0x38/0x40 stack-location offsets). The `IoSetCompletionRoutine` export —
+previously storage-only ("invocation path is future work") — is now live.
+Boot self-test (77 checks now): record a completion routine on a read IRP
+to the RustDemo device, watch it fire when the driver completes the IRP.
+
+**Alertable object waits.** `WaitForSingleObjectEx` honors `bAlertable` the
+same way `SleepEx` does: the shim drains pending user APCs first and
+returns `WAIT_IO_COMPLETION` if any ran (the shim previously ignored the
+flag, with a stale "APCs we don't deliver" comment). The kernel-side
+`NtWaitProcess` mirrors it for direct ntdll callers (immediate
+`STATUS_USER_APC` when an APC is pending). userapp test: queue an APC,
+alertable wait on the already-exited child returns 0xC0 and runs the APC;
+the non-alertable call then reports the child normally — folded into the
+0xABCD gate in both address-space boots.
+
+Verified: QEMU suite 77/77 (exit 33, completion-routine check + both
+WaitEx prints); host 18+2+7; emu 36/36. Remaining async items: kernel APCs
+(`KeInsertQueueApc`) and alertability inside long kernel waits proper.

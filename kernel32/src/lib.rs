@@ -2142,14 +2142,27 @@ pub unsafe extern "C" fn WaitForSingleObject(handle: u64, millis: u32) -> u32 {
     0 // WAIT_OBJECT_0
 }
 
-/// `WaitForSingleObjectEx(hHandle, dwMilliseconds, bAlertable)` — same as
-/// `WaitForSingleObject` but with an alertable flag (for APCs, which we don't
-/// deliver). cmd waits on its child through this entry point, so leaving it an
-/// unresolved stub made the wait return immediately — the child ran
-/// concurrently with the shell, scrambling console state. Forward to the
-/// non-Ex form, ignoring `bAlertable`.
+/// `WaitForSingleObjectEx(hHandle, dwMilliseconds, bAlertable)` — wait on a
+/// process handle; when alertable, pending user APCs run first (same
+/// shim-layered delivery as `SleepEx`) and the call returns
+/// `WAIT_IO_COMPLETION`. cmd waits on its child through this entry point.
 #[no_mangle]
-pub unsafe extern "C" fn WaitForSingleObjectEx(handle: u64, millis: u32, _alertable: i32) -> u32 {
+pub unsafe extern "C" fn WaitForSingleObjectEx(handle: u64, millis: u32, alertable: i32) -> u32 {
+    if alertable != 0 {
+        let mut delivered = false;
+        loop {
+            let mut apc = [0u64; 2];
+            if syscall3(NT_NEXT_USER_APC, apc.as_mut_ptr() as u64, 0, 0) == 0 {
+                break;
+            }
+            let routine: unsafe extern "C" fn(usize) = core::mem::transmute(apc[0]);
+            routine(apc[1] as usize);
+            delivered = true;
+        }
+        if delivered {
+            return WAIT_IO_COMPLETION;
+        }
+    }
     WaitForSingleObject(handle, millis)
 }
 
