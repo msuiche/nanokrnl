@@ -135,6 +135,13 @@ fn main() {
         "no_cmd_mui.bin",
         "NTOS_CMD_MUI_IMAGE",
     );
+    // A self-authored Windows registry hive (tools/gen_hive.py) for the
+    // cm::hive loader test. Empty (skipped) when not generated.
+    resolve(
+        workspace.join("hives").join("system.hive"),
+        "no_hive.bin",
+        "NTOS_HIVE_IMAGE",
+    );
 
     println!("cargo:rerun-if-changed=build.rs");
 }

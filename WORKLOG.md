@@ -1280,3 +1280,34 @@ story is now complete at both layers: kernel APCs for in-kernel consumers
 (suspension/context machinery can build on it), user APCs with alertable
 waits for ring 3. A driver-facing export + `ntabi` Kapc type is the small
 follow-up when a driver actually needs it.
+
+### 2026-07-17 - registry hive persistence, part I: real hives load
+
+CM now mounts a real Windows registry hive from file bytes at boot.
+
+**Dynamic cm first.** The registry store was fixed-cap arrays (64 keys /
+128 values / 48-unit names / 128-byte data) — a real hive would never fit.
+Reworked `cm/mod.rs` to index-stable Vec-backed storage (`Option` slots;
+handles are indices, so nothing moves) with the public API byte-identical:
+`open_key`/`create_key`/`query_value`/`set_value`/`enum_key` and the
+predefined-root/handle scheme unchanged.
+
+**The parser** (`cm/hive.rs`): the `regf` format from base block to grafted
+tree — base block signature/sizes, `4096 + index` cell addressing with
+allocated-size and span checks, `nk` nodes (compressed-name flag, subkey
+lists `lf`/`lh`/`li`/`ri`, value lists), `vk` values (inline ≤ 4-byte data,
+data-cell data, named/default). Everything is bounds-checked and budgeted
+(recursion cap, cell budget): a corrupt or hostile hive degrades to an
+error, never a bad pointer. The tree grafts under `HKLM\SYSTEM`.
+
+**The test hive** (`tools/gen_hive.py`): a small structurally-real hive
+written by the repo — base block with checksum, one hbin, `SYSTEM →
+ControlSet001 → Control → HiveTest` with `Signature` (DWORD, inline) and
+`Greeting` (REG_SZ, data cell). Embedded via build.rs as `C:\system.hive`
+(readable for inspection like any file), loaded by `cm::init` at boot, and
+verified through the normal registry API in the boot suite (86 checks now):
+key opens, DWORD round-trip, REG_SZ round-trip, subkey enumeration.
+
+Verified: QEMU suite 86/86 (exit 33); host 18+2+7; emu 36/36. Part II is
+the write half: serialize cm's model back to a valid `regf` file and
+round-trip it (the kernel writes a hive Windows' own tools would open).

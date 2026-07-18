@@ -1216,6 +1216,39 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
         check!("Cm: enum subkey", cm::enum_key(sw, 0, &mut nm) > 0);
     }
 
+    // --- Cm: real Windows hive loaded from file bytes ---------------------
+    // The embedded self-authored hive (tools/gen_hive.py) was parsed at
+    // cm::init and grafted under HKLM\SYSTEM. Verify its tree and values
+    // through the normal registry API: this is the persistence path's read
+    // half, proven end to end.
+    if !HIVE_IMAGE.is_empty() {
+        use crate::cm;
+        const HKLM: u64 = 0x8000_0002;
+        let ht = cm::open_key(
+            HKLM,
+            crate::w!("SYSTEM\\ControlSet001\\Control\\HiveTest"),
+        );
+        check!("Cm: hive key opens (loaded from regf file)", ht != 0);
+        let mut t = 0u32;
+        let mut buf = [0u8; 32];
+        let n = cm::query_value(ht, crate::w!("Signature"), &mut t, &mut buf);
+        check!(
+            "Cm: hive DWORD value (inline-data vk)",
+            n == 4 && t == cm::REG_DWORD && u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) == 0xC0FFEE
+        );
+        let n2 = cm::query_value(ht, crate::w!("Greeting"), &mut t, &mut buf);
+        let greeting_ok = n2 == 22
+            && t == cm::REG_SZ
+            && (0..10).all(|i| buf[i * 2] as u16 == b"hello hive"[i] as u16);
+        check!("Cm: hive REG_SZ value (data-cell vk)", greeting_ok);
+        // The graft also enumerates: HKLM\SYSTEM's first subkey is ControlSet001.
+        let sys = cm::open_key(HKLM, crate::w!("SYSTEM"));
+        let mut nm = [0u16; 32];
+        let cnt = cm::enum_key(sys, 0, &mut nm);
+        let name_ok = cnt == 13 && (0..13).all(|i| nm[i] == b"ControlSet001"[i] as u16);
+        check!("Cm: hive subkey enumerates (ControlSet001)", name_ok);
+    }
+
     // --- Ps: CreateProcess primitive -------------------------------------
     // Build a brand-new process from a PE image (its own address space + ring-3
     // thread), wait for it, and read its exit code — the mechanism behind
@@ -1839,6 +1872,10 @@ pub(crate) const WHERE_IMAGE: &[u8] = include_bytes!(env!("NTOS_WHERE_IMAGE"));
 static WHERE_MUI: &[u8] = include_bytes!(env!("NTOS_WHERE_MUI_IMAGE"));
 pub(crate) const CMD_IMAGE: &[u8] = include_bytes!(env!("NTOS_CMD_IMAGE"));
 static CMD_MUI: &[u8] = include_bytes!(env!("NTOS_CMD_MUI_IMAGE"));
+/// A self-authored Windows registry hive (`tools/gen_hive.py`), loaded by cm
+/// at boot and exposed as `C:\system.hive` for inspection. Empty when not
+/// generated (loader test skips then).
+pub(crate) const HIVE_IMAGE: &[u8] = include_bytes!(env!("NTOS_HIVE_IMAGE"));
 /// `more.com` — the console pager (a PE despite the `.com` name). Needs
 /// `ulib.dll` to actually run; embedded so it can be enumerated and launched
 /// once dependent-DLL loading exists.

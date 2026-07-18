@@ -48,6 +48,9 @@ pub static FILES: &[RamFile] = &[
     RamFile { path: "C:\\cmd.exe", data: crate::init::CMD_IMAGE },
     RamFile { path: "C:\\more.com", data: crate::init::MORE_IMAGE },
     RamFile { path: "C:\\whoami.exe", data: crate::init::WHOAMI_IMAGE },
+    // A real Windows registry hive (self-authored, tools/gen_hive.py), loaded
+    // by cm at boot and openable for inspection like any other file.
+    RamFile { path: "C:\\system.hive", data: crate::init::HIVE_IMAGE },
 ];
 
 /// Object-manager type for RAM files, distinct from `DEVICE_TYPE` so the read

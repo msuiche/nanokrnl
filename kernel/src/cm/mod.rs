@@ -1,66 +1,52 @@
 //! Configuration Manager (the registry).
 //!
-//! A compact in-memory hive: a forest of keys (HKCR/HKCU/HKLM/HKU/…) each with
-//! named subkeys and named values. This is the kernel-side store; the
+//! A dynamic in-memory hive: a forest of keys (HKCR/HKCU/HKLM/HKU/…) each
+//! with named subkeys and named values. This is the kernel-side store; the
 //! `kernel32` `Reg*` shims translate the Win32 ABI onto the syscalls in
-//! `syscalls.rs` that call into here. It is enough for a modern CLI (cmd.exe
-//! reads its `Command Processor` configuration here, creates/queries keys,
-//! enumerates), without yet persisting to disk.
+//! `syscalls.rs` that call into here. It serves a modern CLI (cmd.exe reads
+//! its `Command Processor` configuration here, creates/queries keys,
+//! enumerates), and — via [`crate::cm::hive`] — loads real Windows hives
+//! from file bytes.
 //!
 //! Handles: the predefined roots are the well-known `HKEY_*` constants
 //! (`0x8000_000x`, which arrive sign-extended as `0xFFFFFFFF_8000_000x`); an
-//! opened subkey is returned as `HANDLE_BASE + key_index`. `RegCloseKey` is a
-//! no-op (keys live for the session), so no handle table is needed.
+//! opened subkey is returned as `HANDLE_BASE + key_index`. Indices are
+//! stable (the store grows, slots never move), so handles stay valid for
+//! the session; `RegCloseKey` is a no-op (keys live for the session).
+
+pub mod hive;
 
 use crate::ke::spinlock::SpinLock;
-
-const MAX_KEYS: usize = 64;
-const MAX_VALUES: usize = 128;
-const NAME_MAX: usize = 48; // UTF-16 units
-const DATA_MAX: usize = 128; // bytes
+use alloc::vec::Vec;
 
 /// Opened-subkey handles start here (predefined roots use the `HKEY_*` values).
 pub const HANDLE_BASE: u64 = 0x2000_0000;
 
-#[derive(Clone, Copy)]
 struct Key {
-    in_use: bool,
-    parent: i32, // key index, or -1 for a forest root
-    name: [u16; NAME_MAX],
-    name_len: usize,
+    /// Parent key index, or -1 for a forest root.
+    parent: i32,
+    /// Key name (UTF-16 units).
+    name: Vec<u16>,
 }
 
-#[derive(Clone, Copy)]
 struct Value {
-    in_use: bool,
+    /// Owning key index.
     key: i32,
-    name: [u16; NAME_MAX],
-    name_len: usize,
+    name: Vec<u16>,
     vtype: u32,
-    data: [u8; DATA_MAX],
-    data_len: usize,
+    data: Vec<u8>,
 }
 
 struct Hive {
-    keys: [Key; MAX_KEYS],
-    values: [Value; MAX_VALUES],
+    /// Index-stable slots: `Some` = live, `None` = free for reuse.
+    keys: Vec<Option<Key>>,
+    values: Vec<Option<Value>>,
     initialized: bool,
 }
 
-const EMPTY_KEY: Key = Key { in_use: false, parent: -1, name: [0; NAME_MAX], name_len: 0 };
-const EMPTY_VALUE: Value = Value {
-    in_use: false,
-    key: -1,
-    name: [0; NAME_MAX],
-    name_len: 0,
-    vtype: 0,
-    data: [0; DATA_MAX],
-    data_len: 0,
-};
-
 static HIVE: SpinLock<Hive> = SpinLock::new(Hive {
-    keys: [EMPTY_KEY; MAX_KEYS],
-    values: [EMPTY_VALUE; MAX_VALUES],
+    keys: Vec::new(),
+    values: Vec::new(),
     initialized: false,
 });
 
@@ -77,39 +63,30 @@ fn lc(c: u16) -> u16 {
     }
 }
 
-fn name_eq(a: &[u16], al: usize, b: &[u16]) -> bool {
-    if al != b.len() {
-        return false;
-    }
-    for i in 0..al {
-        if lc(a[i]) != lc(b[i]) {
-            return false;
-        }
-    }
-    true
+fn name_eq(a: &[u16], b: &[u16]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(&x, &y)| lc(x) == lc(y))
 }
 
 impl Hive {
-    fn alloc_key(&mut self) -> Option<usize> {
-        (0..MAX_KEYS).find(|&i| !self.keys[i].in_use)
+    fn alloc_key(&mut self) -> usize {
+        if let Some(i) = self.keys.iter().position(|k| k.is_none()) {
+            i
+        } else {
+            self.keys.push(None);
+            self.keys.len() - 1
+        }
     }
 
     /// Create a forest root (parent = -1) with the given name; returns its index.
     fn make_root(&mut self, name: &[u16]) -> usize {
-        let i = self.alloc_key().expect("registry root capacity");
-        let mut k = EMPTY_KEY;
-        k.in_use = true;
-        k.parent = -1;
-        k.name_len = name.len().min(NAME_MAX);
-        k.name[..k.name_len].copy_from_slice(&name[..k.name_len]);
-        self.keys[i] = k;
+        let i = self.alloc_key();
+        self.keys[i] = Some(Key { parent: -1, name: name.to_vec() });
         i
     }
 
     fn find_child(&self, parent: usize, seg: &[u16]) -> Option<usize> {
-        (0..MAX_KEYS).find(|&i| {
-            let k = &self.keys[i];
-            k.in_use && k.parent == parent as i32 && name_eq(&k.name, k.name_len, seg)
+        self.keys.iter().position(|k| {
+            matches!(k, Some(k) if k.parent == parent as i32 && name_eq(&k.name, seg))
         })
     }
 
@@ -137,13 +114,8 @@ impl Hive {
                     if !create {
                         return None;
                     }
-                    let ni = self.alloc_key()?;
-                    let mut k = EMPTY_KEY;
-                    k.in_use = true;
-                    k.parent = cur as i32;
-                    k.name_len = seg.len().min(NAME_MAX);
-                    k.name[..k.name_len].copy_from_slice(&seg[..k.name_len]);
-                    self.keys[ni] = k;
+                    let ni = self.alloc_key();
+                    self.keys[ni] = Some(Key { parent: cur as i32, name: seg.to_vec() });
                     cur = ni;
                 }
             }
@@ -152,37 +124,38 @@ impl Hive {
     }
 
     fn find_value(&self, key: usize, name: &[u16]) -> Option<usize> {
-        (0..MAX_VALUES).find(|&i| {
-            let v = &self.values[i];
-            v.in_use && v.key == key as i32 && name_eq(&v.name, v.name_len, name)
+        self.values.iter().position(|v| {
+            matches!(v, Some(v) if v.key == key as i32 && name_eq(&v.name, name))
         })
     }
 
     fn set_value(&mut self, key: usize, name: &[u16], vtype: u32, data: &[u8]) -> bool {
-        let idx = self.find_value(key, name).or_else(|| {
-            let slot = (0..MAX_VALUES).find(|&i| !self.values[i].in_use)?;
-            self.values[slot] = EMPTY_VALUE;
-            self.values[slot].in_use = true;
-            self.values[slot].key = key as i32;
-            self.values[slot].name_len = name.len().min(NAME_MAX);
-            let nl = self.values[slot].name_len;
-            self.values[slot].name[..nl].copy_from_slice(&name[..nl]);
-            Some(slot)
-        });
-        let Some(idx) = idx else { return false };
-        self.values[idx].vtype = vtype;
-        self.values[idx].data_len = data.len().min(DATA_MAX);
-        let dl = self.values[idx].data_len;
-        self.values[idx].data[..dl].copy_from_slice(&data[..dl]);
+        let idx = match self.find_value(key, name) {
+            Some(i) => i,
+            None => {
+                let i = if let Some(i) = self.values.iter().position(|v| v.is_none()) {
+                    i
+                } else {
+                    self.values.push(None);
+                    self.values.len() - 1
+                };
+                self.values[i] = Some(Value { key: key as i32, name: name.to_vec(), vtype, data: data.to_vec() });
+                return true;
+            }
+        };
+        if let Some(v) = &mut self.values[idx] {
+            v.vtype = vtype;
+            v.data.clear();
+            v.data.extend_from_slice(data);
+        }
         true
     }
 
     /// The nth (0-based) subkey of `key`; returns (index).
     fn enum_key(&self, key: usize, n: usize) -> Option<usize> {
         let mut count = 0;
-        for i in 0..MAX_KEYS {
-            let k = &self.keys[i];
-            if k.in_use && k.parent == key as i32 {
+        for (i, k) in self.keys.iter().enumerate() {
+            if matches!(k, Some(k) if k.parent == key as i32) {
                 if count == n {
                     return Some(i);
                 }
@@ -230,8 +203,22 @@ pub fn init() {
             REG_SZ,
             &[0x33, 0x00, 0x31, 0x00, 0x33, 0x00, 0x33, 0x00, 0x37, 0x00, 0x00, 0x00],
         );
+        let _ = zero;
     }
     h.initialized = true;
+    drop(h);
+
+    // Mount a real Windows registry hive file under HKLM\SYSTEM, if one is
+    // embedded (self-authored by `tools/gen_hive.py`; empty placeholder
+    // otherwise). This is the persistence path's read half: real `regf`
+    // bytes become live keys and values.
+    let image = crate::init::HIVE_IMAGE;
+    if !image.is_empty() {
+        match hive::load(image, crate::w!("SYSTEM")) {
+            Ok(n) => crate::kd_println!("CM: hive loaded — {} keys under HKLM\\SYSTEM", n),
+            Err(e) => crate::kd_println!("CM: hive load failed: {:?}", e),
+        }
+    }
 }
 
 /// Resolve an `HKEY` to a key index. Handles predefined roots (sign-extended
@@ -240,14 +227,14 @@ fn resolve(h: &Hive, hkey: u64) -> Option<usize> {
     // Predefined: low 32 bits are 0x8000_000x.
     if (hkey as u32) & 0xFFFF_FFF8 == 0x8000_0000 {
         let r = (hkey & 0x7) as usize;
-        if r < MAX_KEYS && h.keys[r].in_use {
+        if r < h.keys.len() && h.keys[r].is_some() {
             return Some(r);
         }
         return None;
     }
     if hkey >= HANDLE_BASE {
         let i = (hkey - HANDLE_BASE) as usize;
-        if i < MAX_KEYS && h.keys[i].in_use {
+        if i < h.keys.len() && h.keys[i].is_some() {
             return Some(i);
         }
     }
@@ -281,28 +268,63 @@ pub fn query_value(hkey: u64, name: &[u16], out_type: &mut u32, out: &mut [u8]) 
     let h = HIVE.lock();
     let Some(k) = resolve(&h, hkey) else { return -1 };
     let Some(vi) = h.find_value(k, name) else { return -1 };
-    let v = &h.values[vi];
+    let Some(v) = &h.values[vi] else { return -1 };
     *out_type = v.vtype;
-    let n = v.data_len.min(out.len());
+    let n = v.data.len().min(out.len());
     out[..n].copy_from_slice(&v.data[..n]);
-    v.data_len as i64
+    v.data.len() as i64
 }
 
-/// `RegSetValueEx` backend. Returns true on success.
+/// `RegSetValueEx` backend: create or replace a value. Returns true on success.
 pub fn set_value(hkey: u64, name: &[u16], vtype: u32, data: &[u8]) -> bool {
     let mut h = HIVE.lock();
     let Some(k) = resolve(&h, hkey) else { return false };
     h.set_value(k, name, vtype, data)
 }
 
-/// `RegEnumKeyEx` backend: name of the nth subkey into `out` (UTF-16). Returns
-/// the name length in chars, or `-1` past the end.
-pub fn enum_key(hkey: u64, index: usize, out: &mut [u16]) -> i64 {
+/// `RegEnumKeyEx` backend: copy the `n`th subkey's name into `out` (UTF-16,
+/// NUL-terminated). Returns the name's char count (excluding NUL), or -1.
+pub fn enum_key(hkey: u64, n: usize, out: &mut [u16]) -> i64 {
     let h = HIVE.lock();
     let Some(k) = resolve(&h, hkey) else { return -1 };
-    let Some(ci) = h.enum_key(k, index) else { return -1 };
-    let key = &h.keys[ci];
-    let n = key.name_len.min(out.len());
+    let Some(i) = h.enum_key(k, n) else { return -1 };
+    let Some(key) = &h.keys[i] else { return -1 };
+    let n = key.name.len().min(out.len().saturating_sub(1));
     out[..n].copy_from_slice(&key.name[..n]);
-    key.name_len as i64
+    if n < out.len() {
+        out[n] = 0;
+    }
+    key.name.len() as i64
+}
+
+// --- Hive-loading surface (used by cm::hive) --------------------------------
+
+/// Graft point for a loaded hive: create (or open) a key path from a root,
+/// returning its index. `root` is a predefined-root index (0..3).
+pub(crate) fn graft_root(root: usize, path: &[u16]) -> Option<usize> {
+    let mut h = HIVE.lock();
+    if root >= h.keys.len() || h.keys[root].is_none() {
+        return None;
+    }
+    h.walk(root, path, true)
+}
+
+/// Populate a key with a loaded subkey (name → new child index). cm-internal.
+pub(crate) fn add_key(parent: usize, name: &[u16]) -> Option<usize> {
+    let mut h = HIVE.lock();
+    if parent >= h.keys.len() || h.keys[parent].is_none() {
+        return None;
+    }
+    let i = h.alloc_key();
+    h.keys[i] = Some(Key { parent: parent as i32, name: name.to_vec() });
+    Some(i)
+}
+
+/// Populate a loaded value. cm-internal.
+pub(crate) fn add_value(key: usize, name: &[u16], vtype: u32, data: &[u8]) -> bool {
+    let mut h = HIVE.lock();
+    if key >= h.keys.len() || h.keys[key].is_none() {
+        return false;
+    }
+    h.set_value(key, name, vtype, data)
 }
