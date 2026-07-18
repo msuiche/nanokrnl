@@ -593,6 +593,63 @@ pub fn mm_debug_pte(va: u64) -> Option<u64> {
     }
 }
 
+/// Raw PTE for `va` in the address space `pml4` (present or not). Read-only
+/// walk through the physical window — the page-out engine uses this to
+/// validate and unmap pages in an address space that isn't the current one.
+pub fn mm_debug_pte_in(pml4: PhysAddr, va: u64) -> Option<u64> {
+    let idx = |shift: u64| ((va >> shift) & 0x1FF) as usize;
+    unsafe {
+        let p4 = entry(pml4, idx(39));
+        if p4 & ENTRY_PRESENT == 0 {
+            return None;
+        }
+        let p3 = entry(PhysAddr(p4 & ADDR_MASK), idx(30));
+        if p3 & ENTRY_PRESENT == 0 || p3 & ENTRY_LARGE != 0 {
+            return None;
+        }
+        let p2 = entry(PhysAddr(p3 & ADDR_MASK), idx(21));
+        if p2 & ENTRY_PRESENT == 0 || p2 & ENTRY_LARGE != 0 {
+            return None;
+        }
+        Some(entry(PhysAddr(p2 & ADDR_MASK), idx(12)))
+    }
+}
+
+/// Clear the 4 KiB leaf PTE of `va` in the address space `pml4`, returning
+/// the frame it mapped (`None` when it was never backed). Flushes the TLB
+/// entry only when `pml4` is the current address space (a CR3 reload on the
+/// next switch covers the rest).
+///
+/// # Safety
+/// `va` must be a user page owned by `pml4`.
+pub unsafe fn mm_unmap_user_page_in(pml4: PhysAddr, va: u64) -> Option<PhysAddr> {
+    unsafe {
+        let idx = |shift: u64| ((va >> shift) & 0x1FF) as usize;
+        let p4 = entry(pml4, idx(39));
+        if p4 & ENTRY_PRESENT == 0 {
+            return None;
+        }
+        let p3 = entry(PhysAddr(p4 & ADDR_MASK), idx(30));
+        if p3 & ENTRY_PRESENT == 0 || p3 & ENTRY_LARGE != 0 {
+            return None;
+        }
+        let p2 = entry(PhysAddr(p3 & ADDR_MASK), idx(21));
+        if p2 & ENTRY_PRESENT == 0 || p2 & ENTRY_LARGE != 0 {
+            return None;
+        }
+        let pte = entry_ptr(PhysAddr(p2 & ADDR_MASK), idx(12));
+        if *pte & ENTRY_PRESENT == 0 {
+            return None;
+        }
+        let pa = PhysAddr(*pte & ADDR_MASK);
+        *pte = 0;
+        if pml4 == current_pml4() {
+            invlpg(va);
+        }
+        Some(pa)
+    }
+}
+
 /// Free an entire per-process user address space: every low-half leaf's
 /// backing frame, the intermediate page tables, and the PML4 itself.
 ///

@@ -12,6 +12,9 @@
 //! * [`vad`] — per-address-space VADs and the demand-commit fault path:
 //!   `NtAllocateVirtualMemory` records a descriptor, the #PF handler backs
 //!   the page on first touch (`MmAccessFault` in miniature).
+//! * [`pageout`] — the pagefile: a raw sector region on the scratch disk,
+//!   a working-set FIFO of committed pages, and the evict/page-in cycle
+//!   that lets physical memory pressure push user pages to disk.
 //!
 //! ## The physical-memory window
 //!
@@ -24,11 +27,12 @@
 //! 2. Page tables themselves are readable the same way, which is what
 //!    makes [`virt::mm_get_physical_address`] a simple walk.
 //!
-//! Paged pool, working sets, and paging to disk are future work; everything
-//! here is the resident, never-paged core that the rest of the kernel boots
-//! on. (User anonymous memory *is* demand-committed via [`vad`], but nothing
-//! is ever written out — there is no pagefile to write to.)
+//! Paged pool is future work; user anonymous memory is demand-committed via
+//! [`vad`] and, once [`pageout`] is initialized with a pagefile region,
+//! genuinely paged to disk under pressure.
 
+#[cfg(target_arch = "x86_64")]
+pub mod pageout;
 #[cfg(target_arch = "x86_64")]
 pub mod phys;
 #[cfg(target_arch = "x86_64")]

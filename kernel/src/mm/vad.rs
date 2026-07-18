@@ -10,9 +10,10 @@
 //! ranges per address space (keyed by PML4, since threads carry `cr3` and
 //! there is no `EPROCESS` yet). `NtAllocateVirtualMemory` inserts a VAD
 //! *without touching a page table*; the first access faults and
-//! [`vad_resolve`] backs the page on demand (see `ke::traps`). `NtFree` /
-//! `NtProtect` split, shrink, and drop VADs and apply to whatever pages
-//! happen to be backed.
+//! [`vad_resolve`] backs the page on demand (see `ke::traps`) — zero-filled,
+//! or paged back in from the pagefile when [`super::pageout`] evicted it
+//! earlier. `NtFree` / `NtProtect` split, shrink, and drop VADs and apply to
+//! whatever pages happen to be backed.
 //!
 //! Locking: one global lock (same shape as the dispatcher's — the list is
 //! short and faults are rare). Lock order is **VADS → PFN**: resolve and
@@ -128,10 +129,11 @@ pub fn vad_covers(pml4: PhysAddr, va: u64, len: usize) -> bool {
 }
 
 /// The #PF half of demand commit: if `va` lies in a committed VAD of the
-/// **current** address space, back its page with a zeroed frame mapped with
-/// the VAD's protection and report success (the trap returns and the CPU
-/// retries the faulting instruction). Anything else — no VAD, out of
-/// frames — returns false and the trap treats it as a fault to report.
+/// **current** address space, back its page and report success (the trap
+/// returns and the CPU retries the faulting instruction). The backing is a
+/// zeroed frame for a never-touched page, or the pagefile content when
+/// [`super::pageout`] evicted this page earlier. Anything else — no VAD, out
+/// of frames — returns false and the trap treats it as a fault to report.
 ///
 /// Only meaningful for not-present faults at `PASSIVE_LEVEL`; `ke::traps`
 /// checks both. A *protection* fault (page present) is never resolvable
@@ -143,13 +145,19 @@ pub fn vad_resolve(va: u64) -> bool {
     let mut spaces = VADS.lock();
     let Some(s) = space_mut(&mut spaces, pml4, false) else { return false };
     let Some(v) = s.vads.iter().find(|v| v.start <= page && page < v.end) else { return false };
+    let (writable, executable) = (v.writable, v.executable);
+    // Paged out earlier? Read the content back instead of zero-filling.
+    if super::pageout::page_in(pml4.0, page, writable, executable) {
+        return true;
+    }
     let phys = match mm_allocate_page() {
         Some(p) => p, // zeroed — NT's zero-page rule
         None => return false,
     };
     // SAFETY: `pml4` is the live address space; `phys` is ours; the page is
     // VAD-committed user VA space with no current mapping.
-    unsafe { virt::mm_map_user_range(pml4, page, phys, 1, v.writable, v.executable) };
+    unsafe { virt::mm_map_user_range(pml4, page, phys, 1, writable, executable) };
+    super::pageout::register_page(pml4.0, page);
     true
 }
 
@@ -163,6 +171,9 @@ pub fn vad_resolve(va: u64) -> bool {
 /// walks the live tables).
 pub fn vad_free(pml4: PhysAddr, base: u64, len: u64) -> Result<(), NtStatus> {
     let Some(end) = base.checked_add(len) else { return Err(NtStatus::INVALID_PARAMETER) };
+    // Release the pagefile slots of any paged-out pages in the range —
+    // their content dies with the allocation.
+    super::pageout::drop_range(pml4.0, base, len);
     let mut spaces = VADS.lock();
     let Some(s) = space_mut(&mut spaces, pml4, false) else { return Err(NtStatus::INVALID_PARAMETER) };
     let mut i = 0;
@@ -256,8 +267,10 @@ pub fn vad_protect(pml4: PhysAddr, base: u64, len: u64, writable: bool, executab
 
 /// Drop the VAD bookkeeping of a dying address space. The pages themselves
 /// are reclaimed by `mm_free_user_address_space`'s page-table walk, which
-/// also covers the loader's eager (non-VAD) mappings.
+/// also covers the loader's eager (non-VAD) mappings; paged-out pages have
+/// no frame to reclaim, so their pagefile slots are released here.
 pub fn vad_teardown(pml4: PhysAddr) {
+    super::pageout::drop_process(pml4.0);
     let mut spaces = VADS.lock();
     if let Some(i) = spaces.iter().position(|s| s.pml4 == pml4) {
         spaces.remove(i);

@@ -1468,3 +1468,56 @@ empty (cluster-0) file no longer underflows the cluster math.
 Verified: QEMU suite 103/103 (exit 33); host 18+2+7; emu 36/36. The
 filesystem story is complete for the demo surface; the remaining storage
 prize is the pagefile — real paging-out on top of this stack.
+
+### 2026-07-18 - the pagefile: real paging-out, both directions
+
+The memory manager now pages. User anonymous memory is demand-committed,
+evicted to a pagefile under pressure (or on demand), and paged back in on
+the next touch — content intact, through the real block device.
+
+- **`mm::pageout`** (new): a working-set FIFO registry of every
+  demand-committed page `(cr3, va)` (cap 8192; overflow evicts the oldest
+  inline), a `(cr3, va) -> slot` paged-out map (capacity reserved at init,
+  so eviction never allocates under memory pressure), and a slot bitmap
+  over the pagefile region.
+- **The pagefile is a raw disk region** (sectors 8192..32768, 3072 page
+  slots = 12 MiB), *not* a `pagefile.sys` inside FAT — paging must never
+  recurse into the filesystem it might be paging out. The scratch-disk
+  image was re-laid-out for this: the FAT32 volume shrank to 4 MiB
+  (`tools/gen_fat32.py`), leaving the last 12 MiB raw.
+- **Eviction**: validate the PTE in the target address space
+  (`mm_debug_pte_in`, dropping stale registry entries), write the 8
+  sectors straight from the physical window, record the slot, unmap
+  (`mm_unmap_user_page_in` — invlpg only when the target AS is live),
+  free the frame. **Page-in** runs inside `vad_resolve` before the
+  zero-fill path: find the record, read the slot into a fresh frame, map
+  with the VAD's protection, re-register. `vad_free`/`vad_teardown`
+  release orphaned slots (`drop_range`/`drop_process`).
+- **Pressure path**: `mm_allocate_contiguous_pages` now tries once, then
+  evicts `count` pages and retries — with the PFN lock *not* held
+  (eviction does block I/O and ends in `mm_free`; PFN stays leaf-most).
+- **Two self-deadlocks caught by the boot suite**: `register_page`
+  re-locked `REGISTRY` while its guard was still alive (wedged the very
+  first demand-commit), and `slot_free` locked `SLOT_HINT` twice in one
+  assignment statement. Non-reentrant spinlocks make this class of bug
+  loud — the boot simply stops.
+- **A latent virtio-blk race, exposed statistically**: `request()`
+  snapshotted the used-ring index *after* ringing the doorbell, so a
+  device that completes a single-sector request in microseconds (QEMU
+  does) advances the index before the baseline read — the poll then
+  waits for a *second* advance that never comes and burns its full
+  2-billion-spin escape bound (~10-20 s) per sector. The ~17 extra
+  pagefile requests per boot turned a race the suite had always won into
+  one it lost roughly every run. Fixed by snapshotting the baseline
+  before publishing the descriptor chain.
+
+Boot suite (108 checks): pagefile online, eviction writes the page out
+and frees its frame (free-page count +1), the pagefile slot holds the
+evicted page's actual bytes (read back raw from disk), and a second
+touch pages the content back in byte-exact.
+
+Verified: QEMU suite 108/108 twice in a row (exit 33) — the virtio race
+was timing-dependent, so one green run was not accepted as proof; host
+18+2+7; emu 36/36. NT's memory-management story is now complete through
+the pagefile; the remaining frontier is SMP (AP startup, per-CPU KPCR,
+IPIs, TLB shootdown) and frame-based SEH (`.pdata` unwind).

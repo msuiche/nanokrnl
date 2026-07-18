@@ -175,6 +175,14 @@ unsafe fn set_desc(vram: *mut u8, i: usize, addr: u64, len: u32, flags: u16, nex
 /// byte (0 = `VIRTIO_BLK_S_OK`).
 fn request(v: &VirtBlk, rtype: u32, lba: u64, buf: *mut u8) -> u8 {
     unsafe {
+        // Snapshot the used index BEFORE publishing anything: a single-sector
+        // request can complete within microseconds of the doorbell, so reading
+        // the baseline after the notify races with the device's own update and
+        // the poll below would wait for a second advance that never comes.
+        let used = v.vram.add(used_off(v.queue_num));
+        let used_idx_ptr = used.add(2) as *mut u16;
+        let start = used_idx_ptr.read_volatile();
+
         // Header: type + reserved + sector.
         let hdr = (&raw mut SCRATCH) as *mut u8;
         core::ptr::write_bytes(hdr, 0, 16);
@@ -200,13 +208,10 @@ fn request(v: &VirtBlk, rtype: u32, lba: u64, buf: *mut u8) -> u8 {
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         idx_ptr.write_volatile(idx.wrapping_add(1));
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        let used = v.vram.add(used_off(v.queue_num));
         port::outw(v.io_base + REG_QUEUE_NOTIFY, 0);
 
         // Wait for the used ring to advance (bounded; the device answers a
         // single-sector request essentially immediately).
-        let used_idx_ptr = used.add(2) as *mut u16;
-        let start = used_idx_ptr.read_volatile();
         let mut spins: u64 = 0;
         while used_idx_ptr.read_volatile() == start {
             spins += 1;

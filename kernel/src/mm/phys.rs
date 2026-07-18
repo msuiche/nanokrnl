@@ -110,7 +110,24 @@ pub fn init(regions: &MemoryRegions, phys_offset: u64) {
 /// frame's physical address, zero-filled (kernel allocations must never
 /// leak prior contents — NT's zero-page thread exists for this; we zero
 /// inline until we have one).
+///
+/// On a first-pass failure the pager is given one chance to free `count`
+/// frames by evicting working-set pages to the pagefile, then the search
+/// retries once. Eviction runs **before** the PFN lock is taken: page-out
+/// does block I/O and ends in `mm_free_contiguous_pages`, so the PFN lock
+/// must stay leaf-most.
 pub fn mm_allocate_contiguous_pages(count: usize) -> Option<PhysAddr> {
+    if let Some(pa) = try_alloc(count) {
+        return Some(pa);
+    }
+    if super::pageout::online() && super::pageout::evict_some(count) > 0 {
+        return try_alloc(count);
+    }
+    None
+}
+
+/// The bitmap search + zeroing half of [`mm_allocate_contiguous_pages`].
+fn try_alloc(count: usize) -> Option<PhysAddr> {
     let mut db = PFN_DB.lock();
     let hint = db.hint;
     let bm = db.bitmap.as_mut()?;

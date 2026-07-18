@@ -1190,6 +1190,63 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
                 );
             }
         }
+
+        // --- Mm: the pagefile — real paging-out and page-in ---------------
+        // A raw 12 MiB region past the FAT volume (sectors 8192..32768).
+        // The cycle, end to end: demand-commit a page, write a pattern,
+        // force an eviction (bytes to disk, PTE cleared, frame freed),
+        // check the on-disk bytes, then touch the VA again and let the #PF
+        // path page it back in — the content must survive the round trip.
+        mm::pageout::init(8192, 3072);
+        check!(
+            "Mm: pagefile online (3072 slots at sector 8192)",
+            mm::pageout::online()
+        );
+        {
+            let as_now = mm::virt::mm_current_address_space();
+            let va = mm::vad::vad_allocate(as_now, 2, true, false);
+            check!("Mm: pagefile test range committed", va.is_some());
+            if let Some(va) = va {
+                let pg = va + 0x1000;
+                // Fault the second page in and fill it with a pattern.
+                mm::virt::user_access_begin();
+                unsafe { core::ptr::write_bytes(pg as *mut u8, 0x51, mm::PAGE_SIZE) };
+                mm::virt::user_access_end();
+                let free0 = mm::phys::mm_free_page_count();
+                let evicted = mm::pageout::evict_for_test(as_now.0, pg);
+                let slot = mm::pageout::last_evicted_slot();
+                let gone = mm::virt::mm_get_physical_address(pg).is_none()
+                    && mm::phys::mm_free_page_count() == free0 + 1;
+                check!(
+                    "Mm: eviction writes the page out and frees its frame",
+                    evicted == 1 && slot.is_some() && gone
+                );
+                // The pagefile slot must hold the page's actual bytes.
+                let mut sec = [0u8; 512];
+                let on_disk = slot.is_some_and(|s| {
+                    io::virtblk::read_sector(8192 + s as u64 * 8, &mut sec)
+                        && sec[0] == 0x51
+                        && sec[511] == 0x51
+                });
+                check!(
+                    "Mm: pagefile slot holds the evicted page's bytes",
+                    on_disk
+                );
+                // Touch again: #PF → page-in from the slot, content intact.
+                mm::virt::user_access_begin();
+                let back0 = unsafe { (pg as *const u8).read() };
+                let back1 = unsafe { ((pg + 0xFFF) as *const u8).read() };
+                mm::virt::user_access_end();
+                check!(
+                    "Mm: page-in restores the evicted content",
+                    back0 == 0x51
+                        && back1 == 0x51
+                        && mm::virt::mm_get_physical_address(pg).is_some()
+                        && mm::pageout::paged_out_count() == 0
+                );
+                let _ = mm::vad::vad_free(as_now, va, 2 * mm::PAGE_SIZE as u64);
+            }
+        }
     } else {
         kd_println!("  [SKIP] Vblk: no virtio-blk device attached");
     }

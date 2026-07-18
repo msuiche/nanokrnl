@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-r"""Generate target/test-blk.img: a 16 MiB FAT32 superfloppy (no partition
-table) for the nanokrnl storage tests.
+r"""Generate target/test-blk.img: a 16 MiB disk holding a 4 MiB FAT32
+superfloppy (no partition table) plus a 12 MiB raw pagefile region, for
+the nanokrnl storage and paging tests.
 
 Layout:
-  sector 0:      BPB (OEM name "NANOBLK1", 0x55AA boot signature)
-  sectors 1-31:  reserved (sector 2 is the vblk write-test scratch area)
-  FAT1, FAT2:    256 sectors each (32768 clusters x 4 bytes)
-  data region:   HELLO.TXT, README.TXT in the root; SUB\NESTED.TXT nested
+  sector 0:        BPB (OEM name "NANOBLK1", 0x55AA boot signature)
+  sectors 1-31:    reserved (sector 2 is the vblk write-test scratch area)
+  FAT1, FAT2:      64 sectors each (8192 clusters x 4 bytes)
+  data region:     HELLO.TXT, README.TXT in the root; SUB\NESTED.TXT nested
+  sectors 0..8192: the FAT32 volume (BPB total = 8192)
+  sectors 8192+:   raw pagefile region (3072 page slots x 8 sectors) —
+                   deliberately outside the volume: paging must never
+                   recurse into the filesystem it might be paging out.
 
 One sector per cluster keeps the geometry trivially verifiable.
 """
@@ -17,7 +22,8 @@ SECTOR = 512
 SPC = 1                      # sectors per cluster
 RESERVED = 32                # reserved sectors (incl. BPB at 0)
 NUM_FATS = 2
-TOTAL_SECTORS = 16 * 1024 * 1024 // SECTOR  # 32768
+TOTAL_SECTORS = 4 * 1024 * 1024 // SECTOR   # 8192: the FAT32 volume size
+IMAGE_SECTORS = 16 * 1024 * 1024 // SECTOR  # 32768: the disk image size
 CLUSTERS = TOTAL_SECTORS - RESERVED        # data-region clusters (cluster 2 = first)
 FAT_SECTORS = (CLUSTERS * 4 + SECTOR - 1) // SECTOR
 DATA_START = RESERVED + NUM_FATS * FAT_SECTORS
@@ -101,9 +107,10 @@ def main():
     img += build_fats()
     img += data_region()
     assert len(img) == TOTAL_SECTORS * SECTOR, len(img)
+    img += b"\0" * ((IMAGE_SECTORS - TOTAL_SECTORS) * SECTOR)  # pagefile region
     with open("target/test-blk.img", "wb") as f:
         f.write(img)
-    print(f"wrote target/test-blk.img: {len(img)} bytes, FAT1/2 @ {RESERVED}, data @ {DATA_START}")
+    print(f"wrote target/test-blk.img: {len(img)} bytes, FAT1/2 @ {RESERVED}, data @ {DATA_START}, pagefile @ {TOTAL_SECTORS}")
 
 if __name__ == "__main__":
     main()
