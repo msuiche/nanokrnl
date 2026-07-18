@@ -50,6 +50,7 @@ const IST_STACK_SIZE: usize = 16 * 1024;
 
 /// 64-bit TSS layout (Intel SDM Vol. 3, Figure 8-11).
 #[repr(C, packed(4))]
+#[derive(Clone, Copy)]
 pub struct Tss64 {
     _reserved0: u32,
     /// RSP loaded on a ring-3 -> ring-0 transition (interrupt from user mode).
@@ -82,7 +83,21 @@ static mut BOOT_TSS: Tss64 = Tss64 {
 
 /// Emergency stacks for the IST entries (+ alignment via repr).
 #[repr(C, align(16))]
+#[derive(Clone, Copy)]
 struct IstStack([u8; IST_STACK_SIZE]);
+
+const EMPTY_TSS: Tss64 = Tss64 {
+    _reserved0: 0,
+    rsp0: 0,
+    rsp1: 0,
+    rsp2: 0,
+    _reserved1: 0,
+    ist: [0; 7],
+    _reserved2: 0,
+    _reserved3: 0,
+    iomap_base: size_of::<Tss64>() as u16, // no I/O bitmap
+};
+
 static mut IST1_STACK: IstStack = IstStack([0; IST_STACK_SIZE]);
 static mut IST2_STACK: IstStack = IstStack([0; IST_STACK_SIZE]);
 static mut IST3_STACK: IstStack = IstStack([0; IST_STACK_SIZE]);
@@ -90,6 +105,15 @@ static mut IST3_STACK: IstStack = IstStack([0; IST_STACK_SIZE]);
 /// The GDT itself: 10 quadwords — selectors through 0x40, with the TSS
 /// descriptor occupying two slots (indices 8 and 9). Index = selector >> 3.
 static mut BOOT_GDT: [u64; 10] = [0; 10];
+
+/// Per-CPU tables for application processors (slot `cpu - 1`): every CPU
+/// needs its own TSS (the busy bit is per-descriptor) and therefore its own
+/// GDT. Slot 0 is the BSP's BOOT_GDT/BOOT_TSS above.
+pub const MAX_CPUS: usize = 8;
+static mut AP_TSS: [Tss64; MAX_CPUS - 1] = [EMPTY_TSS; MAX_CPUS - 1];
+static mut AP_GDT: [[u64; 10]; MAX_CPUS - 1] = [[0; 10]; MAX_CPUS - 1];
+static mut AP_IST: [[IstStack; 3]; MAX_CPUS - 1] =
+    [[IstStack([0; IST_STACK_SIZE]); 3]; MAX_CPUS - 1];
 
 /// Base and limit of the loaded GDT — what `sgdt` would return. The crash dump
 /// records this in `KPROCESSOR_STATE.SpecialRegisters.Gdtr` so a debugger can
@@ -133,22 +157,50 @@ const fn segment_descriptor(typ: u8, dpl: u8, long: bool, default32: bool) -> u6
 pub fn init(boot_kernel_rsp: u64) {
     unsafe {
         // SAFETY: phase-0, single-threaded, one-time initialization.
-        let tss = &raw mut BOOT_TSS;
+        let ist = [
+            (&raw mut IST1_STACK as u64) + IST_STACK_SIZE as u64,
+            (&raw mut IST2_STACK as u64) + IST_STACK_SIZE as u64,
+            (&raw mut IST3_STACK as u64) + IST_STACK_SIZE as u64,
+        ];
+        build_tables(&raw mut BOOT_TSS, &raw mut BOOT_GDT, boot_kernel_rsp, ist);
+        load_tables(&raw const BOOT_GDT);
+    }
+}
 
-        // Wire up the emergency stacks (stacks grow down: store the top).
-        (*tss).rsp0 = boot_kernel_rsp;
-        (*tss).ist[(IST_DOUBLE_FAULT - 1) as usize] =
-            (&raw mut IST1_STACK as u64) + IST_STACK_SIZE as u64;
-        (*tss).ist[(IST_NMI - 1) as usize] = (&raw mut IST2_STACK as u64) + IST_STACK_SIZE as u64;
-        (*tss).ist[(IST_MCE - 1) as usize] = (&raw mut IST3_STACK as u64) + IST_STACK_SIZE as u64;
+/// Build and load a private GDT + TSS for application processor `cpu`
+/// (1-based). `rsp0` is the AP's kernel stack top; IST entries get per-CPU
+/// emergency stacks. Runs on the AP itself during `ke::smp` startup.
+pub fn init_ap(cpu: usize, rsp0: u64) {
+    debug_assert!(cpu >= 1 && cpu < MAX_CPUS);
+    let i = cpu - 1;
+    unsafe {
+        let ist = [
+            (&raw mut AP_IST[i][0] as u64) + IST_STACK_SIZE as u64,
+            (&raw mut AP_IST[i][1] as u64) + IST_STACK_SIZE as u64,
+            (&raw mut AP_IST[i][2] as u64) + IST_STACK_SIZE as u64,
+        ];
+        build_tables(&raw mut AP_TSS[i], &raw mut AP_GDT[i], rsp0, ist);
+        load_tables(&raw const AP_GDT[i]);
+    }
+}
 
-        let gdt = &raw mut BOOT_GDT;
+/// Fill `tss` with the standard stack wiring and write the NT-layout
+/// descriptor set (code/data + the TSS system descriptor) into `gdt`.
+unsafe fn build_tables(tss: *mut Tss64, gdt: *mut [u64; 10], rsp0: u64, ist: [u64; 3]) {
+    unsafe {
+        // Stacks grow down: store the top.
+        (*tss).rsp0 = rsp0;
+        (*tss).ist[(IST_DOUBLE_FAULT - 1) as usize] = ist[0];
+        (*tss).ist[(IST_NMI - 1) as usize] = ist[1];
+        (*tss).ist[(IST_MCE - 1) as usize] = ist[2];
+
+        let gdt = &mut *gdt;
         // type 0b11010 = S|code|readable ; 0b10010 = S|data|writable
-        (*gdt)[(KGDT64_R0_CODE >> 3) as usize] = segment_descriptor(0b1_1010, 0, true, false);
-        (*gdt)[(KGDT64_R0_DATA >> 3) as usize] = segment_descriptor(0b1_0010, 0, false, false);
-        (*gdt)[(KGDT64_R3_CMCODE >> 3) as usize] = segment_descriptor(0b1_1010, 3, false, true);
-        (*gdt)[(KGDT64_R3_DATA >> 3) as usize] = segment_descriptor(0b1_0010, 3, false, false);
-        (*gdt)[(KGDT64_R3_CODE >> 3) as usize] = segment_descriptor(0b1_1010, 3, true, false);
+        gdt[(KGDT64_R0_CODE >> 3) as usize] = segment_descriptor(0b1_1010, 0, true, false);
+        gdt[(KGDT64_R0_DATA >> 3) as usize] = segment_descriptor(0b1_0010, 0, false, false);
+        gdt[(KGDT64_R3_CMCODE >> 3) as usize] = segment_descriptor(0b1_1010, 3, false, true);
+        gdt[(KGDT64_R3_DATA >> 3) as usize] = segment_descriptor(0b1_0010, 3, false, false);
+        gdt[(KGDT64_R3_CODE >> 3) as usize] = segment_descriptor(0b1_1010, 3, true, false);
 
         // 16-byte TSS system descriptor (type 0b1001 = available 64-bit TSS).
         let base = tss as u64;
@@ -159,14 +211,19 @@ pub fn init(boot_kernel_rsp: u64) {
         lo |= 1 << 47; // present
         lo |= ((limit >> 16) & 0xF) << 48;
         lo |= ((base >> 24) & 0xFF) << 56;
-        (*gdt)[(KGDT64_SYS_TSS >> 3) as usize] = lo;
-        (*gdt)[(KGDT64_SYS_TSS >> 3) as usize + 1] = base >> 32;
+        gdt[(KGDT64_SYS_TSS >> 3) as usize] = lo;
+        gdt[(KGDT64_SYS_TSS >> 3) as usize + 1] = base >> 32;
+    }
+}
 
-        let gdtr = DescriptorTablePointer {
-            limit: (size_of::<[u64; 10]>() - 1) as u16,
-            base: gdt as u64,
-        };
-
+/// Load a GDT built by [`build_tables`], reload CS/SS/DS to the NT kernel
+/// selectors, and load the task register with that GDT's TSS.
+unsafe fn load_tables(gdt: *const [u64; 10]) {
+    let gdtr = DescriptorTablePointer {
+        limit: (size_of::<[u64; 10]>() - 1) as u16,
+        base: gdt as u64,
+    };
+    unsafe {
         // Load GDTR, then reload CS with a far return (you cannot `mov cs`),
         // refresh the data selectors, and finally load the task register.
         asm!(

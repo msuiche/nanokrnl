@@ -36,9 +36,11 @@ const IA32_APIC_BASE: u32 = 0x1B;
 const APIC_BASE_ENABLE: u64 = 1 << 11;
 
 // Register offsets (bytes) from the MMIO base.
+const REG_ID: usize = 0x020;
 const REG_EOI: usize = 0x0B0;
 const REG_SVR: usize = 0x0F0;
 const REG_ICR_LOW: usize = 0x300;
+const REG_ICR_HIGH: usize = 0x310;
 const REG_LVT_TIMER: usize = 0x320;
 const REG_TICR: usize = 0x380;
 const REG_TDCR: usize = 0x3E0;
@@ -94,6 +96,43 @@ pub fn eoi() {
     unsafe {
         if !APIC_MMIO_BASE.is_null() {
             write(REG_EOI, 0);
+        }
+    }
+}
+
+/// This processor's local APIC ID (the address IPIs target).
+pub fn lapic_id() -> u8 {
+    unsafe { (read(REG_ID) >> 24) as u8 }
+}
+
+/// Per-CPU APIC bring-up for an application processor: the register page is
+/// already located (the BSP ran [`init`]); each CPU must still set the
+/// enable bit in its own `IA32_APIC_BASE` MSR and software-enable its own
+/// APIC. The LVT timer stays off — the BSP's clock is the only one for now.
+pub fn init_ap() {
+    unsafe {
+        let base = rdmsr(IA32_APIC_BASE);
+        wrmsr(IA32_APIC_BASE, base | APIC_BASE_ENABLE);
+        write(REG_SVR, SVR_APIC_ENABLE | VECTOR_SPURIOUS as u32);
+    }
+}
+
+/// Send an inter-processor interrupt to `dest` (a local APIC ID).
+/// `delivery_mode` is the ICR delivery-mode field (0 = fixed, 5 = INIT,
+/// 6 = SIPI); `vector` is the interrupt vector for fixed delivery, the
+/// startup page frame number for SIPI, ignored for INIT. Waits for the
+/// APIC to accept the command (delivery-status bit).
+pub fn send_ipi(dest: u8, delivery_mode: u32, vector: u8) {
+    unsafe {
+        // Destination first, then the command word — the ICR is
+        // double-buffered and arms on the low-half write.
+        write(REG_ICR_HIGH, (dest as u32) << 24);
+        // Level-triggered + assert for INIT (the only mode that needs it);
+        // fixed/SIPI are edge-delivered.
+        let level = if delivery_mode == 5 { 0b11 << 14 } else { 0 };
+        write(REG_ICR_LOW, (delivery_mode << 8) | level | vector as u32);
+        while read(REG_ICR_LOW) & (1 << 12) != 0 {
+            core::hint::spin_loop();
         }
     }
 }

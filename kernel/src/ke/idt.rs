@@ -87,10 +87,17 @@ pub fn init() {
             };
             (*idt)[vector].set(stub_base + (vector as u64) * 16, ist);
         }
+        load();
+    }
+}
 
+/// Load IDTR with the shared table on an additional processor (AP startup).
+/// The IDT is one read-only table shared by every CPU — NT does the same.
+pub fn load() {
+    unsafe {
         let idtr = Idtr {
             limit: (size_of::<[IdtGate; 256]>() - 1) as u16,
-            base: idt as u64,
+            base: &raw const BOOT_IDT as u64,
         };
         asm!("lidt [{}]", in(reg) &idtr, options(nostack));
     }

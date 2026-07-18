@@ -79,8 +79,10 @@ fn main() {
         // from its phase-1 self tests (exit code = (value << 1) | 1).
         // Expose SMEP + SMAP so the kernel can enable Supervisor Mode
         // Execution/Access Prevention. The kernel brackets its few user-buffer
-        // accesses with stac/clac.
+        // accesses with stac/clac. Four vCPUs exercise the SMP AP-startup
+        // path (ke::smp); the APs park after bring-up.
         qemu.arg("-cpu").arg("qemu64,+smep,+smap");
+        qemu.arg("-smp").arg("4");
         qemu.arg("-serial").arg("stdio");
         qemu.arg("-device")
             .arg("isa-debug-exit,iobase=0xf4,iosize=0x04");

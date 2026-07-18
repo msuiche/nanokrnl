@@ -44,6 +44,8 @@ pub mod pcr;
 #[cfg(target_arch = "x86_64")]
 pub mod scheduler;
 #[cfg(target_arch = "x86_64")]
+pub mod smp;
+#[cfg(target_arch = "x86_64")]
 pub mod syscall;
 #[cfg(target_arch = "x86_64")]
 pub mod thread;

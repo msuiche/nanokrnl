@@ -38,6 +38,12 @@ static PFN_DB: SpinLock<PfnDatabase> = SpinLock::new(PfnDatabase {
     free_pages: 0,
 });
 
+/// Physical base of the SMP trampoline page (SIPI vector 0x08). Reserved
+/// here so the allocator never hands it to a pool/user allocation; the AP
+/// startup code copies its real-mode stub there. NT likewise carves its
+/// AP startup ("wakeup") block out of low memory.
+pub const TRAMPOLINE_PAGE: u64 = 0x8000;
+
 /// Bring the physical allocator online from the boot memory map.
 /// Phase 0, single-threaded.
 pub fn init(regions: &MemoryRegions, phys_offset: u64) {
@@ -85,10 +91,13 @@ pub fn init(regions: &MemoryRegions, phys_offset: u64) {
     let carve_pages = (carve_bytes >> PAGE_SHIFT as usize) as usize;
     bm.set_bits((home_start >> PAGE_SHIFT) as usize, carve_pages);
     // Never hand out frame 0: too many things treat PFN 0 / address 0 as
-    // a null sentinel (NT reserves low memory similarly).
-    if !bm.test_bit(0) {
-        bm.set_bits(0, 1);
-        total -= 1;
+    // a null sentinel (NT reserves low memory similarly). The trampoline
+    // page is likewise reserved for AP startup.
+    for pfn in [0u64, TRAMPOLINE_PAGE >> PAGE_SHIFT] {
+        if !bm.test_bit(pfn as usize) {
+            bm.set_bits(pfn as usize, 1);
+            total -= 1;
+        }
     }
 
     let free = total - carve_pages as u64;

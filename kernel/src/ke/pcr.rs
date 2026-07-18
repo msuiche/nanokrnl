@@ -20,6 +20,7 @@ use core::arch::asm;
 /// more (statistics, per-CPU lookaside lists, …) that can be added behind
 /// these without changing consumers.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct Kprcb {
     /// The thread currently running on this processor.
     pub current_thread: *mut crate::ke::thread::Kthread,
@@ -39,6 +40,7 @@ pub struct Kprcb {
 
 /// Per-processor control region — `KPCR`.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct Kpcr {
     /// Self-pointer: lets `gs`-relative code recover a linear pointer to
     /// its own KPCR (`mov rax, gs:[0]`).
@@ -63,9 +65,8 @@ pub struct Kpcr {
 pub const KPCR_SYSCALL_KERNEL_STACK: usize = core::mem::offset_of!(Kpcr, syscall_kernel_stack);
 pub const KPCR_SYSCALL_USER_STACK: usize = core::mem::offset_of!(Kpcr, syscall_user_stack);
 
-/// Boot processor's KPCR. Initialized once in phase 0 before interrupts
-/// are enabled; from then on only accessed via `GS` by its own CPU.
-static mut BOOT_PCR: Kpcr = Kpcr {
+/// A zeroed KPCR template — the initializer for every processor's region.
+const EMPTY_PCR: Kpcr = Kpcr {
     self_ptr: core::ptr::null_mut(),
     syscall_kernel_stack: 0,
     syscall_user_stack: 0,
@@ -80,6 +81,14 @@ static mut BOOT_PCR: Kpcr = Kpcr {
     },
 };
 
+/// Boot processor's KPCR. Initialized once in phase 0 before interrupts
+/// are enabled; from then on only accessed via `GS` by its own CPU.
+static mut BOOT_PCR: Kpcr = EMPTY_PCR;
+
+/// Application processors' KPCRs (slot `cpu - 1`); written once by each AP
+/// itself during `ke::smp` startup, then only read via `GS` by that CPU.
+static mut AP_PCR: [Kpcr; super::gdt::MAX_CPUS - 1] = [EMPTY_PCR; super::gdt::MAX_CPUS - 1];
+
 const IA32_GS_BASE: u32 = 0xC000_0101;
 
 /// Program the boot CPU's GS base to point at its KPCR. Phase 0 only.
@@ -87,6 +96,18 @@ pub fn init() {
     unsafe {
         let pcr = &raw mut BOOT_PCR;
         (*pcr).self_ptr = pcr;
+        wrmsr(IA32_GS_BASE, pcr as u64);
+    }
+}
+
+/// Program an application processor's GS base at its own KPCR and stamp the
+/// processor number. Runs on the AP during `ke::smp` startup.
+pub fn init_ap(cpu: usize) {
+    debug_assert!(cpu >= 1 && cpu < super::gdt::MAX_CPUS);
+    unsafe {
+        let pcr = &raw mut AP_PCR[cpu - 1];
+        (*pcr).self_ptr = pcr;
+        (*pcr).prcb.number = cpu as u32;
         wrmsr(IA32_GS_BASE, pcr as u64);
     }
 }

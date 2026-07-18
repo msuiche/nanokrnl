@@ -154,6 +154,11 @@ pub fn ki_system_startup(boot_info: &'static mut BootInfo) -> ! {
     hal::apic::init(phys_offset);
     kd_println!("HAL: PIC masked, APIC enabled, clock on vector 0xD1 (CLOCK_LEVEL)");
 
+    // Bring up the application processors (INIT-SIPI-SIPI). Each AP loads
+    // its own GDT/TSS/IDT/KPCR + LAPIC and parks; the scheduler and clock
+    // stay BSP-only for now. No-op without ACPI or on a uniprocessor.
+    ke::smp::init();
+
     // ---- Phase 1 -------------------------------------------------------
     kd_println!("KiSystemStartup: phase 1");
 
@@ -735,6 +740,54 @@ extern "C" fn user_thread_entry(ctx: *mut core::ffi::c_void) -> ! {
 /// The smoke-test thread: one end-to-end exercise per subsystem.
 extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
     kd_println!("KiSystemStartup: running self tests");
+
+    // --- Ke: SMP — application processors online --------------------------
+    // The MADT lists every logical processor; ke::smp started the APs at
+    // the end of phase 0. Every one must be online, carry a distinct APIC
+    // ID, and have read its own processor number back through its own GS
+    // (the per-CPU KPCR proof). Skips the multi-CPU assertions cleanly on
+    // uniprocessor machines (nanox).
+    {
+        let total = ke::smp::processor_count();
+        let online = ke::smp::online_count();
+        check!(
+            "Smp: MADT enumerates the machine's processors",
+            total >= 1
+        );
+        check!(
+            "Smp: every processor came online",
+            online == total
+        );
+        if total > 1 {
+            let mut ids = [0u64; ke::smp::MAX_CPUS];
+            let mut distinct = true;
+            let mut pcr_ok = true;
+            for n in 0..total {
+                match ke::smp::slot(n) {
+                    Some((id, on, pcr_seen)) => {
+                        if !on || pcr_seen != n as u64 + 1 {
+                            pcr_ok = false;
+                        }
+                        if ids[..n].contains(&id) {
+                            distinct = false;
+                        }
+                        ids[n] = id;
+                    }
+                    None => pcr_ok = false,
+                }
+            }
+            check!(
+                "Smp: distinct APIC IDs across processors",
+                distinct
+            );
+            check!(
+                "Smp: each processor read its own number through its own GS (KPCR)",
+                pcr_ok
+            );
+        } else {
+            kd_println!("  [SKIP] Smp: uniprocessor — multi-CPU checks skipped");
+        }
+    }
 
     // --- Cpu: SMEP hardening --------------------------------------------
     {

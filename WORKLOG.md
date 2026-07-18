@@ -1521,3 +1521,53 @@ was timing-dependent, so one green run was not accepted as proof; host
 18+2+7; emu 36/36. NT's memory-management story is now complete through
 the pagefile; the remaining frontier is SMP (AP startup, per-CPU KPCR,
 IPIs, TLB shootdown) and frame-based SEH (`.pdata` unwind).
+
+### 2026-07-18 - SMP I: the application processors come online
+
+The kernel is now multiprocessor-aware at the bring-up level: the BSP
+discovers the machine's CPUs from ACPI and starts every application
+processor, each landing in Rust with its own GDT/TSS/IDT/KPCR and local
+APIC before parking. The scheduler, clock, and user mode stay BSP-only;
+per-CPU scheduling and TLB shootdown IPIs build on this.
+
+- **`hal::acpi`** (new): RSDP scan (EBDA + F-segment), RSDT/XSDT walk,
+  MADT parse — signature- and checksum-validated everywhere, so nanox
+  (no ACPI) cleanly reports zero processors. Caught live: the RSDP
+  revision lives at offset **15**, not 9 — SeaBIOS is revision 0
+  (ACPI 1.0), so the wrong offset read the first OEMID byte, which is
+  always >= 2, silently forcing the XSDT path onto a machine that only
+  has an RSDT.
+- **The trampoline** (`ke::smp`, `global_asm!`): 16-bit real mode ->
+  32-bit protected -> 64-bit long mode, copied to physical 0x8000
+  (SIPI vector 0x08, reserved in the PFN bitmap) with all references
+  absolute literals and a `.org`-pinned layout. The BSP patches three
+  fields into the page: transition CR3, the AP's stack top, and
+  `ap_rust_entry`'s runtime VA (the kernel is PIE — no absolute
+  relocation against a Rust symbol exists, so the address travels as
+  data). A private transition PML4 (identity 2 MiB + a copy of the
+  kernel high half) carries the AP across the `mov cr3` boundary.
+- **Per-CPU everything**: `gdt::init_ap` / `pcr::init_ap` / `idt::load`
+  / `apic::init_ap` give each AP private GDT+TSS (the busy bit is
+  per-descriptor), a private KPCR behind its own GS base, the shared
+  IDT, and a software-enabled LAPIC (no timer — the BSP's clock stays
+  the only one). CR4 is adopted from the BSP so SMEP/SMAP match.
+- **INIT-SIPI-SIPI** via the LAPIC ICR, one AP at a time, with an
+  rdtsc-bounded online wait; a stubborn AP is skipped, not panicked.
+- **Two trampoline bugs the stage-letter trick caught** (outb to COM1
+  from each mode, since an AP fault before its IDT is a triple fault
+  and a machine reset): the GDTR base literal pointed 2 bytes past the
+  real GDT (a 6-byte GDTR is not 8-aligned — the `.align` lost in the
+  `.org` rewrite had been hiding that), and the GDTR limit said
+  `3*8-1` for a **4-entry** GDT, so the far jump to the 64-bit
+  segment (selector 0x18) was out of bounds. Both times the AP reset
+  the machine exactly one mode-transition earlier than it got.
+
+Boot suite (112 checks, now with `-smp 4`): MADT enumerates the
+processors, every processor comes online, APIC IDs are distinct, and
+each processor reads its own number back *through its own GS* — the
+per-CPU KPCR proof.
+
+Verified: QEMU suite 112/112 twice (exit 33); host 18+2+7; emu 36/36;
+nanox pipe session still boots (RSDP scan finds nothing, Smp checks
+skip cleanly). Next on the SMP road: per-CPU scheduling with IPI-based
+dispatch and TLB shootdowns, then SEH (`.pdata` unwind).
