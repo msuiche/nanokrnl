@@ -1432,3 +1432,39 @@ all through the same syscalls a Win32 app uses.
 Verified: QEMU suite 100/100 (exit 33); host 18+2+7; emu 36/36. Next
 storage rungs: FAT32 write support, then the pagefile — real paging-out,
 the reason this stack exists.
+
+### 2026-07-17 - storage III: FAT32 write support
+
+`D:\` is now writable end to end: create, append, close, and the data is
+real FAT — allocation, chains, and directory entries all update on disk.
+
+- **Write primitives**: `alloc_cluster` (scan-forward from a hint, mark
+  EOC, zero), `free_chain`, `set_fat_entry`, cluster writes, and
+  `dir_add` (replace-or-claim a slot). `create_file(path, data)` does a
+  whole-file write: free the old chain, allocate/fill a new one, update
+  the dirent.
+- **Write-back-on-close objects** (`FatWritable`): an open writable FAT
+  file is an in-memory buffer (`NtCreateFile` with CREATE_NEW/
+  CREATE_ALWAYS makes an empty one; OPEN_ALWAYS seeds it with the
+  existing content for append semantics); the object's delete procedure
+  flushes the buffer through `create_file` when the last handle closes.
+  `NtWriteFile`/`NtReadFile`/`GetFileSize` operate on the buffer in
+  between.
+- **The create-time reference must be dropped**, exactly like the pipe
+  ends: `NtCreateFile` (and the test) dereference the object right after
+  making the handle, or the flush never fires (refs bottom out at 1
+  forever). Second time that pattern has bitten; it now has a comment
+  everywhere it applies.
+- **One shared FAT sector window** for reads and writes: the flush
+  allocated clusters through `set_fat_entry` while `fat_entry` kept a
+  *separate* cache, so the read-back followed a stale "free" entry and
+  the chain came up empty. One window, invalidated on write, fixed it.
+
+Boot suite (103 checks): create + write + close flushes to the FAT
+(content byte-exact), the written file enumerates with its size, and
+recreating truncates to zero. Also fixed along the way: `read()` on an
+empty (cluster-0) file no longer underflows the cluster math.
+
+Verified: QEMU suite 103/103 (exit 33); host 18+2+7; emu 36/36. The
+filesystem story is complete for the demo surface; the remaining storage
+prize is the pagefile — real paging-out on top of this stack.

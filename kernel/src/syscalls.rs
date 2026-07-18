@@ -962,6 +962,15 @@ extern "C" fn nt_write_file(handle: u64, buffer: u64, length: u64, _a4: u64) -> 
                 crate::mm::virt::user_access_end();
                 return NtStatus::SUCCESS.0 as u64;
             }
+            // A writable FAT file (D:\): append to the buffer; it flushes to
+            // the FAT on last close.
+            if unsafe { io::fat::is_fat_writable(obj) } {
+                let file = obj as *mut io::fat::FatWritable;
+                crate::mm::virt::user_access_begin();
+                let _ = unsafe { io::fat::write(file, buffer as *const u8, length as usize) };
+                crate::mm::virt::user_access_end();
+                return NtStatus::SUCCESS.0 as u64;
+            }
             let device = obj as *mut DeviceObject;
             match unsafe {
                 io::io_synchronous_request(device, IRP_MJ_WRITE, buffer as *mut u8, length as usize)
@@ -1023,8 +1032,31 @@ extern "C" fn nt_create_file(name_ptr: u64, name_len: u64, _access: u64, disposi
         }
         // The FAT32 drive (D:\): read the file over virtio-blk and hand back a
         // read-only in-memory file object (the whole file is small; the
-        // block layer stays sector-level underneath).
+        // block layer stays sector-level underneath). Create dispositions
+        // make a writable (write-back) file instead.
         if let Some(rest) = strip_fat_drive(bare) {
+            if disposition == 1 || disposition == 2 {
+                // CREATE_NEW(1)/CREATE_ALWAYS(2): fresh (truncated) writable.
+                let Some(f) = io::fat::create_writable(rest) else { return 0 };
+                let h = handle::ob_create_handle(f as *mut u8, 0);
+                // The handle owns the reference now; drop the create-time one
+                // so the last close flushes (the pipe-end pattern).
+                unsafe { crate::ob::ob_dereference_object(f as *mut u8) };
+                return h;
+            }
+            if disposition == 4 {
+                // OPEN_ALWAYS(4): open for append if present, else create.
+                let f = match io::fat::open_writable(rest) {
+                    Some(f) => f,
+                    None => match io::fat::create_writable(rest) {
+                        Some(f) => f,
+                        None => return 0,
+                    },
+                };
+                let h = handle::ob_create_handle(f as *mut u8, 0);
+                unsafe { crate::ob::ob_dereference_object(f as *mut u8) };
+                return h;
+            }
             return match io::fat::read(rest) {
                 Some(bytes) => io::ramfs::open_bytes(bytes)
                     .map_or(0, |f| handle::ob_create_handle(f as *mut u8, 0)),
@@ -1206,6 +1238,14 @@ extern "C" fn nt_read_file(handle: u64, buffer: u64, length: u64, _a4: u64) -> u
                 crate::mm::virt::user_access_end();
                 return n as u64;
             }
+            // A writable FAT file (D:\): read the buffered content back.
+            if unsafe { io::fat::is_fat_writable(obj) } {
+                let file = obj as *mut io::fat::FatWritable;
+                crate::mm::virt::user_access_begin();
+                let n = unsafe { io::fat::read_writable(file, buffer as *mut u8, length as usize) };
+                crate::mm::virt::user_access_end();
+                return n as u64;
+            }
             // A pipe read end: drain the buffer, blocking (preemptibly) until data
             // arrives or the last writer closes (EOF). Between checks interrupts
             // are on, so the timer preempts us and the producer thread runs.
@@ -1345,6 +1385,9 @@ extern "C" fn nt_query_file_size(handle: u64, _a2: u64, _a3: u64, _a4: u64) -> u
         },
         Ok(obj) if unsafe { io::ramfs::is_writable_file(obj) } => unsafe {
             io::ramfs::writable_size(obj as *mut io::ramfs::WritableFile) as u64
+        },
+        Ok(obj) if unsafe { io::fat::is_fat_writable(obj) } => unsafe {
+            io::fat::writable_size(obj as *mut io::fat::FatWritable) as u64
         },
         _ => 0xFFFF_FFFF,
     }

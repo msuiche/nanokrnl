@@ -1153,6 +1153,42 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
                 "FAT: glob enumeration (*.TXT)",
                 (0..8).any(|i| io::fat::find("*.TXT", i).is_some_and(|(n, _, _)| n == "HELLO.TXT"))
             );
+
+            // --- FAT write: create, write, close (flush), read back ------
+            // The write-back model end to end: a fresh writable file is a
+            // buffer until the last handle closes, then it's real FAT data.
+            {
+                const CONTENT: &[u8] = b"written on the fat32 drive\n";
+                let f = io::fat::create_writable("WRITETST.TXT").expect("create_writable");
+                let n = unsafe { io::fat::write(f, CONTENT.as_ptr(), CONTENT.len()) };
+                let h = crate::ob::handle::ob_create_handle(f as *mut u8, 0);
+                // The handle owns the object reference now; drop the
+                // create-time one so the last close flushes to the FAT.
+                unsafe { crate::ob::ob_dereference_object(f as *mut u8) };
+                crate::ob::handle::ob_close_handle(h);
+                let back = io::fat::read("WRITETST.TXT");
+                check!(
+                    "FAT: create + write + close flushes to the FAT",
+                    n == CONTENT.len()
+                        && back.as_ref().is_some_and(|b| b.as_slice() == CONTENT)
+                );
+                check!(
+                    "FAT: written file enumerates with its size",
+                    (0..16).any(|i| {
+                        io::fat::find("*", i)
+                            .is_some_and(|(n, _, s)| n == "WRITETST.TXT" && s == CONTENT.len() as u64)
+                    })
+                );
+                // Truncate: recreating shrinks the file to zero.
+                let f2 = io::fat::create_writable("WRITETST.TXT").expect("recreate");
+                let h2 = crate::ob::handle::ob_create_handle(f2 as *mut u8, 0);
+                unsafe { crate::ob::ob_dereference_object(f2 as *mut u8) };
+                crate::ob::handle::ob_close_handle(h2);
+                check!(
+                    "FAT: recreate truncates to zero length",
+                    io::fat::read("WRITETST.TXT").is_some_and(|b| b.is_empty())
+                );
+            }
         }
     } else {
         kd_println!("  [SKIP] Vblk: no virtio-blk device attached");
