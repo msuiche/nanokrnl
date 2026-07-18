@@ -1268,6 +1268,33 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
             let rt2 = n2 == 22 && (0..10).all(|i| b3[i * 2] as u16 == b"hello hive"[i] as u16);
             check!("Cm: round-trip preserves values exactly", rt1 && rt2);
         }
+
+        // Runtime persistence: cm::init bumped HKLM\SYSTEM\PersistTest\
+        // BootCount and flushed the hive to H:\system.hive. Verify the
+        // counter exists, and — when a 9P server is live — that the flushed
+        // file on the host parses back to the same content.
+        let pk = cm::open_key(HKLM, crate::w!("SYSTEM\\PersistTest"));
+        let mut t3 = 0u32;
+        let mut b4 = [0u8; 4];
+        let bc = cm::query_value(pk, crate::w!("BootCount"), &mut t3, &mut b4);
+        check!(
+            "Cm: boot counter persisted (>= 1)",
+            pk != 0 && bc == 4 && u32::from_le_bytes(b4) >= 1
+        );
+        match crate::io::p9::read("system.hive") {
+            Some(host_bytes) if !host_bytes.is_empty() => {
+                let n = cm::hive::load(&host_bytes, crate::w!("SYSTEM3"));
+                let ht3 = cm::open_key(HKLM, crate::w!("SYSTEM3\\ControlSet001\\Control\\HiveTest"));
+                let mut t4 = 0u32;
+                let mut b5 = [0u8; 8];
+                let n3 = cm::query_value(ht3, crate::w!("Signature"), &mut t4, &mut b5);
+                check!(
+                    "Cm: host H:\\system.hive round-trips through 9P",
+                    n.is_ok() && n3 == 4 && u32::from_le_bytes([b5[0], b5[1], b5[2], b5[3]]) == 0xC0FFEE
+                );
+            }
+            _ => kd_println!("  [SKIP] Cm: no live 9P server for the host-hive round-trip"),
+        }
     }
 
     // --- Ps: CreateProcess primitive -------------------------------------

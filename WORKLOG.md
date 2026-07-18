@@ -1339,3 +1339,30 @@ persistence is now real: load any hive, change it, write it back. A
 `RegSaveFile`-style syscall (or a periodic flush of a system hive on the
 host 9P drive) is a small follow-up whenever persistence-at-runtime is
 wanted; the format machinery is done.
+
+### 2026-07-17 - registry persistence is real: hives survive reboots over 9P
+
+The loop is closed: `HKLM\SYSTEM` now lives on the host drive, and state
+written by one boot is read by the next.
+
+- **cm mounts host-first**: `cm::init` probes `H:\system.hive` (9P) before
+  falling back to the embedded seed hive. A live 9P server means the
+  registry has history; plain QEMU fails the probe fast (garbage port
+  reads) and stays RAM-only.
+- **BootCount + flush**: every boot bumps
+  `HKLM\SYSTEM\PersistTest\BootCount` and streams the serialized hive back
+  to the host (`cm::flush_to_host`, via the existing 9P create/write
+  path). A `CM: boot #N from the persisted hive` banner prints whenever
+  N > 1.
+- **Suite checks (90 now)**: the counter exists and is ≥ 1, and — when a
+  server is live — the flushed `H:\system.hive` parses back to the same
+  content through 9P (skips cleanly otherwise).
+- **The proof** (`emu/examples/p9_persist.rs`): three boots against one
+  in-process 9P server (extended with `Tlcreate`/`Twrite` and the
+  zero-name root-clone walk the kernel's `create()` needs). Boot 1 flushes
+  a `regf`-valid hive; boots 2 and 3 print `boot #2` / `boot #3` from the
+  persisted hive. PASS: BootCount 1 → 2 → 3 across reboots.
+
+Verified: QEMU suite 90/90 (exit 33); host 18+2+7; emu 36/36;
+`p9_persist` three-boot PASS. Registry work is done end to end: parse,
+serialize, persist, survive reboots.

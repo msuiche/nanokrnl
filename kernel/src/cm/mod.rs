@@ -208,17 +208,57 @@ pub fn init() {
     h.initialized = true;
     drop(h);
 
-    // Mount a real Windows registry hive file under HKLM\SYSTEM, if one is
-    // embedded (self-authored by `tools/gen_hive.py`; empty placeholder
-    // otherwise). This is the persistence path's read half: real `regf`
-    // bytes become live keys and values.
-    let image = crate::init::HIVE_IMAGE;
+    // Mount the system hive, preferring the host's copy: if H:\system.hive
+    // exists it holds state from previous boots (this is what makes the
+    // registry actually persistent); the embedded hive (tools/gen_hive.py)
+    // is the first-boot seed. Under transports with no 9P server the probe
+    // fails fast and we fall back.
+    let host_bytes = crate::io::p9::read("system.hive");
+    let image = match &host_bytes {
+        Some(b) => {
+            crate::kd_println!("CM: mounting host hive H:\\system.hive ({} bytes)", b.len());
+            b
+        }
+        None => crate::init::HIVE_IMAGE,
+    };
     if !image.is_empty() {
         match hive::load(image, crate::w!("SYSTEM")) {
             Ok(n) => crate::kd_println!("CM: hive loaded — {} keys under HKLM\\SYSTEM", n),
             Err(e) => crate::kd_println!("CM: hive load failed: {:?}", e),
         }
     }
+
+    // The cross-boot persistence proof: bump HKLM\SYSTEM\PersistTest\BootCount
+    // on every boot and flush the hive back to the host, so the next boot
+    // reads what this one wrote.
+    const HKLM: u64 = 0x8000_0002;
+    let key = create_key(HKLM, crate::w!("SYSTEM\\PersistTest"));
+    if key != 0 {
+        let mut t = 0u32;
+        let mut b = [0u8; 4];
+        let prev = if query_value(key, crate::w!("BootCount"), &mut t, &mut b) == 4 {
+            u32::from_le_bytes(b)
+        } else {
+            0
+        };
+        let cur = prev + 1;
+        set_value(key, crate::w!("BootCount"), REG_DWORD, &cur.to_le_bytes());
+        if cur > 1 {
+            crate::kd_println!("CM: boot #{} from the persisted hive", cur);
+        }
+        flush_to_host();
+    }
+}
+
+/// Serialize `HKLM\SYSTEM` and stream it to `H:\system.hive` on the host 9P
+/// drive, finalizing the persistence loop. Returns false when there is no
+/// hive to save or no live 9P server (plain QEMU: registry stays in RAM).
+pub fn flush_to_host() -> bool {
+    let Some(bytes) = save_hive(crate::w!("SYSTEM")) else { return false };
+    let Some(mut w) = crate::io::p9::create("system.hive") else { return false };
+    let ok = w.write(&bytes);
+    w.close();
+    ok
 }
 
 /// Resolve an `HKEY` to a key index. Handles predefined roots (sign-extended
