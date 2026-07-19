@@ -108,12 +108,16 @@ pub fn lapic_id() -> u8 {
 /// Per-CPU APIC bring-up for an application processor: the register page is
 /// already located (the BSP ran [`init`]); each CPU must still set the
 /// enable bit in its own `IA32_APIC_BASE` MSR and software-enable its own
-/// APIC. The LVT timer stays off — the BSP's clock is the only one for now.
+/// APIC. The LVT timer is armed like the BSP's — every CPU preempts its
+/// own current thread (only the BSP's tick advances `KeTickCount`).
 pub fn init_ap() {
     unsafe {
         let base = rdmsr(IA32_APIC_BASE);
         wrmsr(IA32_APIC_BASE, base | APIC_BASE_ENABLE);
         write(REG_SVR, SVR_APIC_ENABLE | VECTOR_SPURIOUS as u32);
+        write(REG_TDCR, 0b0011); // divide by 16
+        write(REG_LVT_TIMER, LVT_TIMER_PERIODIC | VECTOR_CLOCK as u32);
+        write(REG_TICR, 62_500);
     }
 }
 
@@ -131,6 +135,21 @@ pub fn send_ipi(dest: u8, delivery_mode: u32, vector: u8) {
         // fixed/SIPI are edge-delivered.
         let level = if delivery_mode == 5 { 0b11 << 14 } else { 0 };
         write(REG_ICR_LOW, (delivery_mode << 8) | level | vector as u32);
+        while read(REG_ICR_LOW) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Broadcast a fixed IPI to every processor except the caller (destination
+/// shorthand 0b11 — no destination field, no per-CPU loop). Used to nudge
+/// idle CPUs into the scheduler when new work appears.
+pub fn send_ipi_all_but_self(vector: u8) {
+    unsafe {
+        if APIC_MMIO_BASE.is_null() {
+            return;
+        }
+        write(REG_ICR_LOW, (0b11 << 18) | vector as u32);
         while read(REG_ICR_LOW) & (1 << 12) != 0 {
             core::hint::spin_loop();
         }

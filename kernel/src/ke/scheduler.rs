@@ -151,6 +151,43 @@ pub unsafe fn ki_initialize(boot_thread: *mut Kthread) {
     }
 }
 
+/// The AP half of [`ki_initialize`]: adopt the running context as this
+/// processor's idle thread. The global queues were initialized by the BSP;
+/// an AP touches only its own PRCB. Runs during `ke::smp` AP startup.
+///
+/// # Safety
+/// Call exactly once per application processor.
+pub unsafe fn ki_initialize_ap(idle_thread: *mut Kthread) {
+    unsafe {
+        (*idle_thread).state = ThreadState::Running;
+        let prcb = pcr::ke_get_prcb();
+        prcb.idle_thread = idle_thread;
+        prcb.current_thread = idle_thread;
+    }
+}
+
+/// The processor's halt loop: `sti; hlt` (atomic via sti's interrupt
+/// shadow) until an interrupt arrives — the clock or a dispatch IPI, whose
+/// handler does any rescheduling. Switching away from idle parks this
+/// context inside the ISR; switching back returns here to halt again. This
+/// is where idle CPUs live, BSP and APs alike.
+pub fn ap_idle_loop() -> ! {
+    loop {
+        unsafe { core::arch::asm!("sti", "hlt", options(nomem, nostack)) };
+    }
+}
+
+/// Nudge CPUs toward the scheduler after new work appeared: the local CPU
+/// gets the usual self-IPI, and with APs online a broadcast wakes every
+/// idle CPU so one of them steals the work off the global ready queues.
+/// The dispatch ISR is idempotent, so the extra wakeups are harmless.
+pub fn request_dispatch_ipi() {
+    crate::hal::apic::request_dispatch_interrupt();
+    if crate::ke::smp::online_count() > 1 {
+        crate::hal::apic::send_ipi_all_but_self(crate::ke::traps::VECTOR_DPC);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Ready queues
 // ---------------------------------------------------------------------------
@@ -167,25 +204,6 @@ unsafe fn ready_thread_locked(thread: *mut Kthread) {
     }
 }
 
-/// Pop the highest-priority ready thread, or null if none.
-/// Lock held by caller.
-unsafe fn select_next_locked() -> *mut Kthread {
-    unsafe {
-        let s = state();
-        if s.ready_summary == 0 {
-            return core::ptr::null_mut();
-        }
-        let pri = 31 - s.ready_summary.leading_zeros() as usize;
-        let entry = s.ready_queues[pri]
-            .remove_head()
-            .expect("ready_summary bit set but queue empty");
-        if s.ready_queues[pri].is_empty() {
-            s.ready_summary &= !(1 << pri);
-        }
-        container_of!(entry, Kthread, ready_list_entry)
-    }
-}
-
 /// `KeReadyThread` — make a thread runnable and let preemption sort it out.
 ///
 /// # Safety
@@ -195,8 +213,71 @@ pub unsafe fn ki_ready_thread(thread: *mut Kthread) {
     unsafe { ready_thread_locked(thread) };
     release(old);
     // The new thread may outrank the running one; the dispatch interrupt
-    // will run ki_check_preemption once IRQL allows.
-    crate::hal::apic::request_dispatch_interrupt();
+    // will run the preemption check once IRQL allows — on this CPU or,
+    // with APs online, on whichever idle CPU steals the thread first.
+    request_dispatch_ipi();
+}
+
+// ---------------------------------------------------------------------------
+// Processor affinity
+// ---------------------------------------------------------------------------
+
+/// May `thread` run on `cpu`? Isolated (per-process, `cr3 != 0`) threads are
+/// pinned to the BSP: their per-process DLL data lives in the shared shim
+/// pages, swapped on context switch — a model that is only correct when at
+/// most one isolated thread runs at a time. CPU 0 gives them exactly the UP
+/// semantics the swap was built for. Kernel threads and shared-AS user
+/// threads (`cr3 == 0`) run anywhere. (Real per-process pages — NT's COW —
+/// are the follow-up that lifts this.)
+fn allowed_on(cpu: usize, thread: *const Kthread) -> bool {
+    cpu == 0 || unsafe { (*thread).cr3 == 0 }
+}
+
+/// The highest priority holding at least one thread `cpu` may run.
+/// Lock held.
+unsafe fn best_allowed_priority_locked(cpu: usize) -> Option<usize> {
+    let s = unsafe { state() };
+    let mut summary = s.ready_summary;
+    while summary != 0 {
+        let pri = 31 - summary.leading_zeros() as usize;
+        let mut any = false;
+        s.ready_queues[pri].for_each(|e| {
+            if allowed_on(cpu, container_of!(e, Kthread, ready_list_entry)) {
+                any = true;
+            }
+        });
+        if any {
+            return Some(pri);
+        }
+        summary &= !(1 << pri);
+    }
+    None
+}
+
+/// Pop the highest-priority ready thread `cpu` may run, or null if none.
+/// Lock held.
+unsafe fn select_next_locked(cpu: usize) -> *mut Kthread {
+    let Some(pri) = (unsafe { best_allowed_priority_locked(cpu) }) else {
+        return core::ptr::null_mut();
+    };
+    let s = unsafe { state() };
+    let mut picked: *mut Kthread = core::ptr::null_mut();
+    s.ready_queues[pri].for_each(|e| {
+        if picked.is_null() {
+            let t = container_of!(e, Kthread, ready_list_entry);
+            if allowed_on(cpu, t) {
+                picked = t;
+            }
+        }
+    });
+    if picked.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe { ListEntry::remove(&raw mut (*picked).ready_list_entry) };
+    if s.ready_queues[pri].is_empty() {
+        s.ready_summary &= !(1 << pri);
+    }
+    picked
 }
 
 // ---------------------------------------------------------------------------
@@ -210,7 +291,7 @@ pub unsafe fn ki_ready_thread(thread: *mut Kthread) {
 unsafe fn switch_away_locked(cur: *mut Kthread) {
     unsafe {
         let prcb = pcr::ke_get_prcb();
-        let mut next = select_next_locked();
+        let mut next = select_next_locked(prcb.number as usize);
         if next.is_null() {
             next = prcb.idle_thread;
         }
@@ -250,6 +331,8 @@ unsafe fn switch_away_locked(cur: *mut Kthread) {
         };
         if target_cr3 != crate::mm::virt::mm_current_address_space().0 {
             crate::mm::virt::mm_switch_address_space(crate::mm::PhysAddr(target_cr3));
+            // Publish this CPU's address space for TLB shootdowns.
+            crate::ke::smp::set_active_cr3(target_cr3);
         }
         // Restore the resuming thread's user GS base (its TEB). Per-thread, so
         // when `next` next returns to ring 3 its `swapgs` lands on its own GS.
@@ -556,7 +639,7 @@ pub unsafe fn ki_signal_object(header: *mut DispatcherHeader) -> i32 {
         release(old);
     }
     if woke > 0 {
-        crate::hal::apic::request_dispatch_interrupt();
+        request_dispatch_ipi();
     }
     prev
 }
@@ -592,7 +675,7 @@ pub unsafe fn ki_release_semaphore(sem: *mut Ksemaphore, adjustment: i32) -> Res
         release(old);
     }
     if woke > 0 {
-        crate::hal::apic::request_dispatch_interrupt();
+        request_dispatch_ipi();
     }
     Ok(prev)
 }
@@ -627,7 +710,7 @@ pub unsafe fn ki_release_mutant(mutant: *mut Kmutant) -> Result<i32, NtStatus> {
         release(old);
     }
     if woke > 0 {
-        crate::hal::apic::request_dispatch_interrupt();
+        request_dispatch_ipi();
     }
     Ok(prev)
 }
@@ -753,9 +836,16 @@ pub unsafe fn ke_cancel_timer(timer: *mut Ktimer) -> bool {
 /// Clock ISR body (vector 0xD1, CLOCK_LEVEL). Keep it tiny; defer
 /// everything that needs the dispatcher lock. See module docs.
 pub fn ki_clock_tick(_frame: &mut KtrapFrame) {
-    let now = KE_TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-
     let prcb = pcr::ke_get_prcb();
+    // `KeTickCount` advances once per tick *system-wide*: every CPU's timer
+    // fires (each preempts its own current thread), but only the BSP bumps
+    // the global count or time would run N-processors-times fast.
+    let now = if prcb.number == 0 {
+        KE_TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        KE_TICK_COUNT.load(Ordering::Relaxed)
+    };
+
     let cur = prcb.current_thread;
     if !cur.is_null() && cur != prcb.idle_thread {
         // Quantum accounting: only this CPU touches its running thread's
@@ -788,8 +878,8 @@ pub fn ki_dispatch_interrupt() {
         let old = acquire();
         let cur = prcb.current_thread;
         let resched = if cur == prcb.idle_thread {
-            // Idle cedes to anything ready.
-            state().ready_summary != 0
+            // Idle cedes to anything ready *this CPU may run*.
+            best_allowed_priority_locked(prcb.number as usize).is_some()
         } else if quantum_end {
             // Round-robin within the priority: requeue at tail, then pick.
             (*cur).state = ThreadState::Ready;
@@ -797,9 +887,10 @@ pub fn ki_dispatch_interrupt() {
             ready_thread_locked(cur);
             true
         } else {
-            // Preemption check: someone readied a higher-priority thread.
-            let best = 31 - state().ready_summary.leading_zeros().min(31) as u8;
-            state().ready_summary != 0 && best > (*cur).priority
+            // Preemption check: someone readied a higher-priority thread
+            // this CPU may run.
+            best_allowed_priority_locked(prcb.number as usize)
+                .is_some_and(|best| best > (*cur).priority as usize)
         };
         if resched {
             if cur != prcb.idle_thread && (*cur).state == ThreadState::Running {

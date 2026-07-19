@@ -558,6 +558,8 @@ pub unsafe fn mm_unmap_user_page(va: u64) -> Option<PhysAddr> {
         let pa = PhysAddr(*pte & ADDR_MASK);
         *pte = 0;
         invlpg(va);
+        // Threads of this address space may be running on other CPUs.
+        crate::ke::smp::tlb_shootdown(current_pml4().0, va);
         Some(pa)
     }
 }
@@ -578,6 +580,7 @@ pub unsafe fn mm_protect_user_page(va: u64, writable: bool, executable: bool) {
             | if writable { ENTRY_RW } else { 0 }
             | if executable { 0 } else { ENTRY_NX };
         invlpg(va);
+        crate::ke::smp::tlb_shootdown(current_pml4().0, va);
     }
 }
 
@@ -617,8 +620,8 @@ pub fn mm_debug_pte_in(pml4: PhysAddr, va: u64) -> Option<u64> {
 
 /// Clear the 4 KiB leaf PTE of `va` in the address space `pml4`, returning
 /// the frame it mapped (`None` when it was never backed). Flushes the TLB
-/// entry only when `pml4` is the current address space (a CR3 reload on the
-/// next switch covers the rest).
+/// entry locally when `pml4` is the current address space, and on every
+/// other CPU currently running `pml4` via a shootdown IPI.
 ///
 /// # Safety
 /// `va` must be a user page owned by `pml4`.
@@ -646,6 +649,7 @@ pub unsafe fn mm_unmap_user_page_in(pml4: PhysAddr, va: u64) -> Option<PhysAddr>
         if pml4 == current_pml4() {
             invlpg(va);
         }
+        crate::ke::smp::tlb_shootdown(pml4.0, va);
         Some(pa)
     }
 }

@@ -24,6 +24,7 @@
 //! first Rust-order business.
 
 use super::{gdt, idt, pcr};
+use super::traps::VECTOR_TLB_SHOOTDOWN;
 use crate::hal::{acpi, apic};
 use crate::mm::phys::{mm_allocate_contiguous_pages, TRAMPOLINE_PAGE};
 use crate::mm::{phys_to_virt, PhysAddr, PAGE_SIZE};
@@ -71,6 +72,92 @@ static ONLINE_COUNT: AtomicUsize = AtomicUsize::new(1);
 /// The BSP's CR4, captured before AP startup so each AP can adopt the same
 /// feature set (SMEP/SMAP/PGE/…).
 static BSP_CR4: AtomicU64 = AtomicU64::new(0);
+
+// ---------------------------------------------------------------------------
+// TLB shootdown
+// ---------------------------------------------------------------------------
+//
+// With threads of one address space able to run on several CPUs, an unmap
+// or protection change must invalidate that page in *every* CPU's TLB, not
+// just the local one (`KiIpiSendPacket`/`KeFlushTbSingle` in NT). Each CPU
+// records the CR3 it is currently running; a shooter mails the VA to every
+// online CPU running that CR3 and IPIs it; the target's handler (vector
+// 0xE0, above the clock) does the `invlpg` and acks. The handler takes no
+// locks, so a CPU can always ack mid-spin — cross-shootdowns cannot
+// deadlock.
+
+/// The address space each CPU is currently running (0 = slot empty).
+static ACTIVE_CR3: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+/// Shootdown mailbox, per CPU: the VA to invalidate…
+static SHOOT_VA: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+/// …the request sequence number…
+static SHOOT_SEQ: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+/// …and the acknowledged sequence number.
+static SHOOT_ACK: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Record the CR3 this CPU is running (called from the context switch and
+/// at CPU bring-up).
+pub fn set_active_cr3(cr3: u64) {
+    let cpu = pcr::ke_get_prcb().number as usize;
+    if cpu < MAX_CPUS {
+        ACTIVE_CR3[cpu].store(cr3, Ordering::Release);
+    }
+}
+
+/// Serialize shooters: the per-CPU mailbox holds one VA, so two CPUs
+/// shooting the same target concurrently would clobber it. NT serializes
+/// its IPI packet similarly; the wait is short and targets never take
+/// this lock, so spinning here cannot deadlock.
+static SHOOT_LOCK: crate::ke::spinlock::SpinLock<()> = crate::ke::spinlock::SpinLock::new(());
+
+/// Invalidate `va` in the TLB of every *other* online CPU currently running
+/// address space `cr3`. The caller handles its own TLB. Returns how many
+/// remote CPUs acked (self-test/diagnostic surface).
+pub fn tlb_shootdown(cr3: u64, va: u64) -> usize {
+    let me = pcr::ke_get_prcb().number as usize;
+    let _serialize = SHOOT_LOCK.lock();
+    let mut acked = 0;
+    for cpu in 0..MAX_CPUS {
+        if cpu == me || !CPU_SLOTS[cpu].online.load(Ordering::Acquire) {
+            continue;
+        }
+        if ACTIVE_CR3[cpu].load(Ordering::Acquire) != cr3 {
+            continue;
+        }
+        SHOOT_VA[cpu].store(va, Ordering::Relaxed);
+        let seq = SHOOT_SEQ[cpu].fetch_add(1, Ordering::AcqRel) + 1;
+        apic::send_ipi(CPU_SLOTS[cpu].apic_id.load(Ordering::Acquire) as u8, 0, VECTOR_TLB_SHOOTDOWN);
+        // Bounded wait: a stuck CPU must not wedge the shooter (the page
+        // is freed regardless; a missed shootdown is a correctness bug we
+        // surface via the return count rather than a hang).
+        let start = rdtsc();
+        while SHOOT_ACK[cpu].load(Ordering::Acquire) < seq {
+            if rdtsc() - start > 2_000_000_000 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if SHOOT_ACK[cpu].load(Ordering::Acquire) >= seq {
+            acked += 1;
+        }
+    }
+    acked
+}
+
+/// The target half of the shootdown, in the IPI (above CLOCK_LEVEL, so it
+/// preempts any shooter spinning at DISPATCH or below). No locks, no
+/// allocation — invalidate, ack, done.
+pub fn on_tlb_shootdown() {
+    let cpu = pcr::ke_get_prcb().number as usize;
+    if cpu >= MAX_CPUS {
+        return;
+    }
+    let va = SHOOT_VA[cpu].load(Ordering::Relaxed);
+    unsafe {
+        core::arch::asm!("invlpg [{}]", in(reg) va, options(nostack));
+    }
+    SHOOT_ACK[cpu].store(SHOOT_SEQ[cpu].load(Ordering::Acquire), Ordering::Release);
+}
 
 extern "C" {
     static ap_tramp_start: u8;
@@ -234,6 +321,10 @@ pub fn init() {
     CPU_SLOTS[0].apic_id.store(bsp_id as u64, Ordering::Release);
     CPU_SLOTS[0].online.store(true, Ordering::Release);
     CPU_SLOTS[0].pcr_seen.store(1, Ordering::Release);
+    ACTIVE_CR3[0].store(
+        crate::mm::virt::mm_kernel_address_space().0,
+        Ordering::Release,
+    );
     if madt.count <= 1 {
         crate::kd_println!("SMP: uniprocessor (APIC id {})", bsp_id);
         return;
@@ -306,7 +397,8 @@ pub fn init() {
 }
 
 /// The AP's first Rust code, entered from the trampoline on the transition
-/// page tables. Brings up this CPU's own tables and parks.
+/// page tables. Brings up this CPU's own tables, adopts this context as its
+/// idle thread, and joins the scheduler.
 #[no_mangle]
 pub extern "C" fn ap_rust_entry() -> ! {
     // Switch to the real kernel page tables (the transition PML4 only
@@ -333,16 +425,31 @@ pub extern "C" fn ap_rust_entry() -> ! {
     idt::load();
     pcr::init_ap(cpu);
     apic::init_ap();
+    // STAR/LSTAR/FMASK/SCE are per-CPU MSRs — without this a `syscall` on
+    // this processor vectors to address 0.
+    super::syscall::init();
+    ACTIVE_CR3[cpu].store(
+        crate::mm::virt::mm_kernel_address_space().0,
+        Ordering::Release,
+    );
 
     // Prove the per-CPU KPCR works by reading our own number through GS.
     let seen = pcr::ke_get_prcb().number as u64 + 1;
     slot.pcr_seen.store(seen, Ordering::Release);
     crate::kd_println!("SMP: processor {} online (APIC id {})", cpu, id);
+
+    // Adopt this very context as the processor's idle thread — the same
+    // trick the BSP pulls in phase 1 (we are already running on the stack).
+    // The global dispatcher state is initialized by the BSP; only the
+    // per-CPU half is ours. From here on this CPU takes the clock,
+    // preempts, and picks up ready threads off the global queues.
+    let idle = crate::ex::ex_allocate_object(
+        crate::ke::thread::Kthread::new(cpu as u64, 0, 0, 0),
+        crate::mm::pool::pool_tag(b"Idle"),
+    )
+    .expect("AP idle thread allocation");
+    unsafe { crate::ke::scheduler::ki_initialize_ap(idle) };
     slot.online.store(true, Ordering::Release);
     ONLINE_COUNT.fetch_add(1, Ordering::AcqRel);
-
-    // Park: this CPU takes no interrupts and runs no threads yet.
-    loop {
-        unsafe { asm!("cli", "hlt", options(nomem, nostack)) };
-    }
+    crate::ke::scheduler::ap_idle_loop();
 }

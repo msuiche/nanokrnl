@@ -51,6 +51,21 @@ pub fn ps_create_system_thread(
     entry: extern "C" fn(*mut core::ffi::c_void) -> !,
     context: *mut core::ffi::c_void,
 ) -> Result<*mut Ethread, NtStatus> {
+    ps_create_system_thread_ex(entry, context, 0)
+}
+
+/// [`ps_create_system_thread`] with the thread's address space recorded
+/// **before** it becomes runnable. With APs online, a readied thread can be
+/// picked up by another CPU before the create call returns — writing `cr3`
+/// afterwards races the scheduler's first switch into it (it would boot on
+/// the kernel address space, with the shim-data swap and TLB tracking
+/// believing it belongs there). Callers running a user process thread must
+/// use this form.
+pub fn ps_create_system_thread_ex(
+    entry: extern "C" fn(*mut core::ffi::c_void) -> !,
+    context: *mut core::ffi::c_void,
+    cr3: u64,
+) -> Result<*mut Ethread, NtStatus> {
     // Stack first: a thread without a stack is nothing.
     let stack = crate::mm::pool::pool_alloc_checked(KERNEL_STACK_SIZE, TAG_STACK)?;
     let tid = NEXT_THREAD_ID.fetch_add(4, Ordering::Relaxed);
@@ -64,12 +79,53 @@ pub fn ps_create_system_thread(
     )?;
 
     // SAFETY: thread/stack freshly allocated and exclusively ours; the
-    // forged frame hands control to `entry` on first switch-in.
+    // forged frame hands control to `entry` on first switch-in. The CR3 is
+    // recorded *before* readying — see the doc above.
     unsafe {
         (*thread).tcb.initialize_stack(entry, context);
+        (*thread).tcb.cr3 = cr3;
         scheduler::ki_ready_thread(&raw mut (*thread).tcb);
     }
     Ok(thread)
+}
+
+/// [`ps_create_system_thread_ex`] without the final ready: the thread is
+/// fully forged but not yet scheduled. With APs online, a readied thread
+/// can start on another CPU before the create call returns, so callers
+/// that must finish initializing thread state (command line, std handles,
+/// MUI module) create suspended and then call [`ps_resume_thread`] —
+/// NT's `CREATE_SUSPENDED`/`ResumeThread` pattern.
+pub fn ps_create_system_thread_suspended(
+    entry: extern "C" fn(*mut core::ffi::c_void) -> !,
+    context: *mut core::ffi::c_void,
+    cr3: u64,
+) -> Result<*mut Ethread, NtStatus> {
+    let stack = crate::mm::pool::pool_alloc_checked(KERNEL_STACK_SIZE, TAG_STACK)?;
+    let tid = NEXT_THREAD_ID.fetch_add(4, Ordering::Relaxed);
+
+    let thread = ex::ex_allocate_object(
+        Ethread {
+            tcb: Kthread::new(tid, stack as u64, KERNEL_STACK_SIZE, DEFAULT_PRIORITY),
+            start_address: entry as usize as u64,
+        },
+        TAG_THREAD,
+    )?;
+
+    // SAFETY: as above; the thread stays off the ready queues until resumed.
+    unsafe {
+        (*thread).tcb.initialize_stack(entry, context);
+        (*thread).tcb.cr3 = cr3;
+    }
+    Ok(thread)
+}
+
+/// `NtResumeThread` for a freshly created thread: make it runnable.
+///
+/// # Safety
+/// `thread` came from [`ps_create_system_thread_suspended`] and has all its
+/// initial state written.
+pub unsafe fn ps_resume_thread(thread: *mut Ethread) {
+    unsafe { scheduler::ki_ready_thread(&raw mut (*thread).tcb) };
 }
 
 /// `PsTerminateSystemThread` — called by a system thread to end itself.

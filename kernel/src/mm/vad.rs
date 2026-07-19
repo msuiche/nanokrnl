@@ -146,6 +146,11 @@ pub fn vad_resolve(va: u64) -> bool {
     let Some(s) = space_mut(&mut spaces, pml4, false) else { return false };
     let Some(v) = s.vads.iter().find(|v| v.start <= page && page < v.end) else { return false };
     let (writable, executable) = (v.writable, v.executable);
+    // Two CPUs can fault on the same page concurrently; the loser of the
+    // VADS-lock race finds the page already mapped and is done.
+    if virt::mm_debug_pte(page).is_some() {
+        return true;
+    }
     // Paged out earlier? Read the content back instead of zero-filling.
     if super::pageout::page_in(pml4.0, page, writable, executable) {
         return true;

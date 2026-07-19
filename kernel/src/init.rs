@@ -365,22 +365,35 @@ fn spawn_process_thread(
     teb: u64,
 ) -> Result<*mut ps::Ethread, crate::rtl::NtStatus> {
     let start = ex::ex_allocate_object(UserStart { rip, rsp, cr3, teb }, pool_tag(b"UStr"))?;
-    let t = ps::ps_create_system_thread(user_thread_entry, start as *mut core::ffi::c_void)?;
-    // Record the address space at spawn, not at first run: the scheduler's
-    // very first switch into this thread must already see its CR3 — both to
-    // load it and to swap in the process's private shim CRT state. (Setting
-    // it in user_thread_entry left the first switch-in seeing cr3 == 0, so a
-    // process booted on the *stale shared* CRT arena and, with per-process
-    // demand-paged heaps, touched chunk VAs its own address space never
-    // backed.) The thread cannot run until we block, so this is race-free —
-    // same argument as the std_handles/cmdline writes at the call sites.
-    unsafe { (*t).tcb.cr3 = cr3 };
-    Ok(t)
+    // The address space must be recorded *before* the thread becomes
+    // runnable: with APs online a readied thread can be picked up by
+    // another CPU before the create call returns, so the post-creation
+    // `tcb.cr3 = cr3` write this used to do raced the scheduler's first
+    // switch into it (it booted on the kernel AS — with the shim swap and
+    // TLB tracking believing it belonged there — and crashed on its own
+    // stack or CRT state).
+    ps::ps_create_system_thread_ex(user_thread_entry, start as *mut core::ffi::c_void, cr3)
+}
+
+/// [`spawn_process_thread`] created suspended: the caller finishes writing
+/// thread state (command line, std handles, MUI module) and then calls
+/// [`ps::ps_resume_thread`]. Mandatory when any of that state must be in
+/// place before the thread first runs — under SMP it can start on another
+/// CPU the moment it is readied.
+fn spawn_process_thread_suspended(
+    rip: u64,
+    rsp: u64,
+    cr3: u64,
+    teb: u64,
+) -> Result<*mut ps::Ethread, crate::rtl::NtStatus> {
+    let start = ex::ex_allocate_object(UserStart { rip, rsp, cr3, teb }, pool_tag(b"UStr"))?;
+    ps::ps_create_system_thread_suspended(user_thread_entry, start as *mut core::ffi::c_void, cr3)
 }
 
 /// Record the command line a freshly-spawned thread's program will see
-/// (`GetCommandLine`/argv). Call before the thread first runs — on a single
-/// CPU it only runs once the spawning thread blocks, so this is race-free.
+/// (`GetCommandLine`/argv). Must be called before the thread is resumed:
+/// it reads these fields on its very first run, which under SMP can be on
+/// another CPU the moment it becomes runnable.
 fn set_cmdline(t: *mut ps::Ethread, cmdline: &'static str) {
     unsafe {
         (*t).tcb.cmdline_ptr = cmdline.as_ptr() as u64;
@@ -518,7 +531,10 @@ pub(crate) fn create_user_process(image: &[u8], cmdline: &[u8], std_handles: [u6
     // arguments. The per-thread cmdline (for the GetCommandLine syscall) is set
     // below; this covers the PEB-reading path.
     crate::ldr::pe::set_command_line(&proc, cmdline);
-    let t = match spawn_process_thread(proc.entry_va, proc.user_rsp, proc.cr3.0, proc.teb) {
+    // Suspended: the child's MUI module, standard handles, and command line
+    // are written below and must all be in place before its first run —
+    // under SMP a readied thread can start on another CPU immediately.
+    let t = match spawn_process_thread_suspended(proc.entry_va, proc.user_rsp, proc.cr3.0, proc.teb) {
         Ok(t) => t,
         Err(_) => return 0,
     };
@@ -571,12 +587,14 @@ pub(crate) fn create_user_process(image: &[u8], cmdline: &[u8], std_handles: [u6
     tbl[i].cmdline[..n].copy_from_slice(&cmdline[..n]);
     tbl[i].cmdline_len = n;
     // Point the child's command line at the table's stable storage (the static
-    // array address is fixed; safe to use after the lock is dropped). The child
-    // only runs once the creator blocks, so this is race-free.
+    // array address is fixed; safe to use after the lock is dropped).
     let cmd_ptr = (&raw const tbl[i].cmdline) as u64;
+    drop(tbl);
     unsafe {
         (*t).tcb.cmdline_ptr = cmd_ptr;
         (*t).tcb.cmdline_len = n as u32;
+        // Everything the thread needs is in place: let it run.
+        ps::ps_resume_thread(t);
     }
     PROC_HANDLE_BASE + i as u64
 }
@@ -783,6 +801,61 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
             check!(
                 "Smp: each processor read its own number through its own GS (KPCR)",
                 pcr_ok
+            );
+
+            // --- Smp II: the APs really schedule -------------------------
+            // Spawn six kernel threads; each records the processor it ran
+            // on and sleeps ~2 ms so creation overlaps execution. After
+            // joining all six, every slot must be filled and at least two
+            // distinct CPUs must appear — proof the global ready queue
+            // feeds the APs through the dispatch-IPI broadcast.
+            static RUN_CPUS: [core::sync::atomic::AtomicU64; 6] =
+                [const { core::sync::atomic::AtomicU64::new(0) }; 6];
+            extern "C" fn run_recorder(ctx: *mut core::ffi::c_void) -> ! {
+                let i = ctx as usize;
+                RUN_CPUS[i].store(
+                    ke::pcr::ke_get_prcb().number as u64 + 1,
+                    Ordering::Release,
+                );
+                ke::scheduler::ki_delay_thread(2);
+                ps::ps_terminate_system_thread();
+            }
+            for s in &RUN_CPUS {
+                s.store(0, Ordering::Release);
+            }
+            let mut threads = [core::ptr::null_mut(); 6];
+            for i in 0..6 {
+                threads[i] = ps::ps_create_system_thread(run_recorder, i as *mut core::ffi::c_void)
+                    .expect("smp worker");
+            }
+            for t in threads {
+                unsafe { ke::dispatcher::ke_wait_for_single_object(&raw mut (*t).tcb.header) };
+            }
+            let mut seen = [false; ke::smp::MAX_CPUS];
+            let mut ran = 0;
+            for s in &RUN_CPUS {
+                let v = s.load(Ordering::Acquire);
+                if v > 0 {
+                    ran += 1;
+                    seen[(v - 1) as usize] = true;
+                }
+            }
+            let cpus_used = seen.iter().filter(|&&x| x).count();
+            check!(
+                "Smp: kernel threads ran on more than one processor",
+                ran == 6 && cpus_used >= 2
+            );
+
+            // --- Smp II: TLB shootdown ------------------------------------
+            // The APs are back to idling in the kernel address space, so a
+            // shootdown for it must be acked by every online CPU but us.
+            let acked = ke::smp::tlb_shootdown(
+                mm::virt::mm_kernel_address_space().0,
+                &TESTS_FAILED as *const _ as u64,
+            );
+            check!(
+                "Smp: TLB shootdown acked by every online processor",
+                acked + 1 == online
             );
         } else {
             kd_println!("  [SKIP] Smp: uniprocessor — multi-CPU checks skipped");
@@ -1793,10 +1866,11 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
                 Ok(proc) => {
                     kd_println!("UM: process @ entry {:#X} (own address space)", proc.entry_va);
                     let before = io::console::bytes_written();
-                    let t = spawn_process_thread(proc.entry_va, proc.user_rsp, proc.cr3.0, proc.teb)
+                    let t = spawn_process_thread_suspended(proc.entry_va, proc.user_rsp, proc.cr3.0, proc.teb)
                         .expect("process thread");
                     set_cmdline(t, "userapp.exe alpha beta");
                     unsafe {
+                        ps::ps_resume_thread(t);
                         ke::dispatcher::ke_wait_for_single_object(&raw mut (*t).tcb.header);
                         // Return to the kernel address space for the rest of
                         // the tests.
@@ -2059,13 +2133,16 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
                     kd_println!("\n--- interactive cmd.exe: type commands, `exit` to quit ---\n");
                 }
                 let wr_before = io::console::bytes_written();
-                match spawn_process_thread(proc.entry_va, proc.user_rsp, proc.cr3.0, proc.teb) {
+                match spawn_process_thread_suspended(proc.entry_va, proc.user_rsp, proc.cr3.0, proc.teb) {
                     Ok(t) => {
                         set_cmdline(t, "cmd.exe");
                         // Give cmd its distinct stdin/stdout/stderr console handles
                         // (the GetStdHandle syscall path), so closing one stream's
                         // handle during a redirect does not invalidate another.
-                        unsafe { (*t).tcb.std_handles = proc.std_console };
+                        unsafe {
+                            (*t).tcb.std_handles = proc.std_console;
+                            ps::ps_resume_thread(t);
+                        }
                         #[cfg(not(feature = "interactive"))]
                         let st = unsafe {
                             scheduler::ki_wait_for_object(&raw mut (*t).tcb.header, Some(8000))

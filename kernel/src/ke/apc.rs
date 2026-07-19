@@ -141,8 +141,15 @@ pub unsafe fn ke_insert_queue_apc(apc: *mut Kapc, thread: *mut Kthread) -> bool 
 /// mid-delivery and re-entering through a nested dispatch) is cut by the
 /// per-CPU guard: the inner call simply leaves the queue for the outer one.
 pub fn ki_deliver_apcs() {
-    static DELIVERING: AtomicBool = AtomicBool::new(false);
-    if DELIVERING.swap(true, Ordering::AcqRel) {
+    // Re-entrancy guard, **per CPU**: delivery can nest on one processor
+    // (an APC routine that blocks re-enters delivery on its resume), while
+    // concurrent deliveries on different CPUs are legitimate and must not
+    // suppress each other — under SMP a global guard drops deliveries.
+    static DELIVERING: [AtomicBool; crate::ke::smp::MAX_CPUS] =
+        [const { AtomicBool::new(false) }; crate::ke::smp::MAX_CPUS];
+    let cpu = pcr::ke_get_prcb().number as usize;
+    let Some(slot) = DELIVERING.get(cpu) else { return };
+    if slot.swap(true, Ordering::AcqRel) {
         return;
     }
     // Move to APC_LEVEL from either side: the dispatch vector enters with
@@ -180,5 +187,5 @@ pub fn ki_deliver_apcs() {
     } else if entry > APC_LEVEL {
         irql::ke_raise_irql(entry);
     }
-    DELIVERING.store(false, Ordering::Release);
+    slot.store(false, Ordering::Release);
 }

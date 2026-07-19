@@ -86,6 +86,11 @@ pub const VECTOR_CLOCK: u8 = 0xD1;
 /// DPC/dispatch software interrupt — IRQL 2 ⇒ vector 0x2F's range; NT uses
 /// 0x2F... we self-IPI this vector to drain the DPC queue.
 pub const VECTOR_DPC: u8 = 0x2F;
+/// TLB shootdown IPI — priority 0xE sits above the clock (0xD), like NT's
+/// IPI_LEVEL above CLOCK_LEVEL: a CPU spinning in the shootdown-wait still
+/// answers inbound shootdowns, which is what makes cross-shootdowns
+/// deadlock-free.
+pub const VECTOR_TLB_SHOOTDOWN: u8 = 0xE0;
 /// APIC spurious vector (low 4 bits must be 0xF on old APICs): 0xFF.
 pub const VECTOR_SPURIOUS: u8 = 0xFF;
 
@@ -197,6 +202,12 @@ extern "C" fn ki_dispatch_trap(frame: &mut KtrapFrame) {
             // interrupts until we eventually iretq).
             crate::hal::apic::eoi();
             crate::ke::scheduler::ki_dispatch_interrupt();
+        }
+        VECTOR_TLB_SHOOTDOWN => {
+            // Takes no locks and never blocks — the sender is spinning on
+            // the ack while holding scheduler/mm locks.
+            crate::ke::smp::on_tlb_shootdown();
+            crate::hal::apic::eoi();
         }
         VECTOR_SPURIOUS => {
             // Spurious APIC interrupt: no EOI by definition.

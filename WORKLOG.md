@@ -1571,3 +1571,67 @@ Verified: QEMU suite 112/112 twice (exit 33); host 18+2+7; emu 36/36;
 nanox pipe session still boots (RSDP scan finds nothing, Smp checks
 skip cleanly). Next on the SMP road: per-CPU scheduling with IPI-based
 dispatch and TLB shootdowns, then SEH (`.pdata` unwind).
+
+### 2026-07-18 - SMP II: every processor schedules
+
+The parked APs from SMP I now run the full dispatcher: each has an idle
+thread, its own LAPIC clock, and pulls work off the global ready queues.
+Threads preempt and migrate across all four processors; user processes
+run wherever they're allowed to.
+
+- **APs join the scheduler**: `ki_initialize_ap` adopts the AP's startup
+  context as its idle thread (the BSP trick, per CPU), `apic::init_ap`
+  arms the per-CPU LVT timer, and `ap_idle_loop` parks in `sti; hlt`.
+  `KeTickCount` advances only on the BSP's tick (four 1 kHz timers
+  would quadruple time); every CPU does its own quantum accounting.
+  `syscall::init()` now runs on each AP too — STAR/LSTAR/FMASK are
+  per-CPU MSRs, and the first `syscall` on an AP was jumping to
+  address 0. (That was the SMP II double-fault: a user thread stole
+  onto an AP and vectored into nowhere.)
+- **Load balancing by broadcast**: readying or signaling a thread sends
+  the dispatch IPI to self *and* all-but-self; idle APs steal off the
+  global queues. The dispatch ISR is idempotent, so extra wakeups cost
+  nothing. Per-CPU `set_kernel_stack` (TSS.RSP0), per-CPU syscall
+  stack, per-CPU `KERNEL_GS_BASE` — all already keyed off the PRCB.
+- **TLB shootdowns**: every CPU publishes its current CR3; an unmap or
+  protection change (`mm_unmap_user_page`, `_in`, `mm_protect_user_page`)
+  now IPIs every other CPU running that address space (vector 0xE0,
+  above the clock so a spinning shooter still answers inbound
+  shootdowns — cross-shootdowns can't deadlock). Mailbox per CPU
+  (VA + seq/ack), shooters serialized on a global lock, bounded wait.
+  Plus the race SMP made real: two CPUs faulting the same VAD page at
+  once — the loser of the VADS-lock race now sees the page already
+  mapped and returns instead of double-backing it.
+- **The spawn-ready race**: every "create thread, then write its state"
+  path was built on the UP truth "it can't run until we block". With
+  APs, a readied thread can start on another CPU *before the create
+  call returns*: process threads booted on the kernel AS (the
+  `tcb.cr3 = cr3` write arriving late), missing their cmdline/std
+  handles/MUI. Now `cr3` is recorded before readying
+  (`ps_create_system_thread_ex`), and every path with post-create
+  writes creates suspended and resumes
+  (`ps_create_system_thread_suspended` + `ps_resume_thread`) — NT's
+  own `CREATE_SUSPENDED`/`ResumeThread` pattern.
+- **A global `DELIVERING` flag suppressed APC deliveries** whenever two
+  CPUs delivered concurrently (one always won, the other's APCs never
+  ran — the flaky kernel-APC test failures). It's per-CPU now: nesting
+  is a same-CPU concern.
+- **Isolated processes pin to CPU 0** (processor affinity): their
+  per-process DLL data lives in shared shim pages swapped on context
+  switch — correct only when at most one isolated thread runs at a
+  time. The scheduler's select/preemption checks skip threads the
+  current CPU may not run (`cr3 != 0` ⇒ CPU 0 only). Kernel threads
+  and shared-AS user threads run anywhere. The honest follow-up is
+  real per-process shim pages (NT's COW), which lifts the pin.
+
+Boot suite (114 checks, `-smp 4`): six kernel threads demonstrably run
+on more than one processor, and a TLB shootdown to the kernel address
+space is acked by every online CPU.
+
+Verified: QEMU suite 114/114 three consecutive times (the pre-fix
+failures were timing-dependent, so one green run wasn't accepted);
+host 18+2+7; emu 36/36; nanox pipe session (uniprocessor) still clean.
+Remaining SMP frontier: per-CPU ready queues (the global dispatcher
+lock is the classic first design, not the scalable one), shootdown
+batched by range, and unpinning isolated processes once shim data is
+truly per-process.

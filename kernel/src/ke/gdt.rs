@@ -252,15 +252,21 @@ unsafe fn load_tables(gdt: *const [u64; 10]) {
     }
 }
 
-/// Update RSP0 in the TSS — called by the context switch path so that an
-/// interrupt arriving in (future) user mode lands on the new thread's
-/// kernel stack. Mirrors `KiSetTssRsp0`.
+/// Update RSP0 in the *current processor's* TSS — called by the context
+/// switch path so that an interrupt arriving in (future) user mode lands on
+/// the new thread's kernel stack. Mirrors `KiSetTssRsp0`.
 pub fn set_kernel_stack(rsp0: u64) {
+    let cpu = crate::ke::pcr::ke_get_prcb().number as usize;
     unsafe {
         // SAFETY: rsp0 sits at offset 4 of the packed TSS, so it is only
         // 4-byte aligned — an unaligned write is required. The CPU reads
         // it from memory only on ring transitions, which cannot race a
         // same-CPU store.
-        (&raw mut BOOT_TSS.rsp0).write_unaligned(rsp0);
+        let tss = if cpu == 0 {
+            &raw mut BOOT_TSS
+        } else {
+            &raw mut AP_TSS[cpu - 1]
+        };
+        (&raw mut (*tss).rsp0).write_unaligned(rsp0);
     }
 }
