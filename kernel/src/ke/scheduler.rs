@@ -97,23 +97,37 @@ pub(crate) fn dispatcher_unlock(old_irql: Kirql) {
 /// All mutable dispatcher state, in one bag so the `unsafe` access pattern
 /// is uniform: touch only via [`state`], only with the lock held.
 struct KiDispatcher {
-    /// One FIFO ready queue per priority, like NT's `DispatcherReadyListHead[32]`.
-    ready_queues: [ListEntry; 32],
-    /// Bit *p* set ⇔ ready_queues[p] non-empty (`KiReadySummary`); makes
-    /// "highest ready priority" a single leading-zero count.
-    ready_summary: u32,
     /// Active (armed) `Ktimer`s, unsorted — fine at our timer counts;
     /// NT's timer wheel is the scalable version of exactly this list.
     timer_list: ListEntry,
     initialized: bool,
 }
 
+/// One processor's ready state: a FIFO queue per priority plus the summary
+/// bitmask (`KiReadySummary`), like NT's per-PRCB
+/// `DispatcherReadyListHead[32]`. Threads are queued on the bank of the CPU
+/// that readied them; a CPU with an empty bank steals from another's
+/// (NT's idle-CPU work stealing, minus the lock sharding — the global
+/// dispatcher lock still serializes every bank).
+struct ReadyBank {
+    queues: [ListEntry; 32],
+    summary: u32,
+    /// Threads currently queued here (diagnostics/self-test surface).
+    count: usize,
+}
+
 static mut KI_DISPATCHER: KiDispatcher = KiDispatcher {
-    ready_queues: [const { ListEntry::new() }; 32],
-    ready_summary: 0,
     timer_list: ListEntry::new(),
     initialized: false,
 };
+
+/// Per-CPU ready banks, indexed by processor number.
+static mut READY_BANKS: [ReadyBank; super::gdt::MAX_CPUS] =
+    [const { ReadyBank { queues: [const { ListEntry::new() }; 32], summary: 0, count: 0 } };
+        super::gdt::MAX_CPUS];
+
+/// Threads stolen off another CPU's bank so far (self-test surface).
+static STEALS: AtomicU64 = AtomicU64::new(0);
 
 /// Access the dispatcher state.
 ///
@@ -121,6 +135,15 @@ static mut KI_DISPATCHER: KiDispatcher = KiDispatcher {
 /// Caller must hold the dispatcher lock (or be in single-threaded phase-0).
 unsafe fn state() -> &'static mut KiDispatcher {
     unsafe { &mut *(&raw mut KI_DISPATCHER) }
+}
+
+/// Access one CPU's ready bank.
+///
+/// # Safety
+/// Caller must hold the dispatcher lock (banks of *other* CPUs are only
+/// ever touched under it, during a steal).
+unsafe fn bank(cpu: usize) -> &'static mut ReadyBank {
+    unsafe { &mut *(&raw mut READY_BANKS[cpu]) }
 }
 
 // ---------------------------------------------------------------------------
@@ -138,8 +161,10 @@ unsafe fn state() -> &'static mut KiDispatcher {
 pub unsafe fn ki_initialize(boot_thread: *mut Kthread) {
     unsafe {
         let s = state();
-        for q in &mut s.ready_queues {
-            q.init();
+        for bank in &mut *(&raw mut READY_BANKS) {
+            for q in &mut bank.queues {
+                q.init();
+            }
         }
         s.timer_list.init();
         s.initialized = true;
@@ -192,15 +217,17 @@ pub fn request_dispatch_ipi() {
 // Ready queues
 // ---------------------------------------------------------------------------
 
-/// Insert `thread` at the tail of its priority's ready queue.
-/// Lock held by caller.
+/// Insert `thread` at the tail of its priority's ready queue on the
+/// **current** CPU's bank. Lock held by caller.
 unsafe fn ready_thread_locked(thread: *mut Kthread) {
     unsafe {
-        let s = state();
+        let cpu = pcr::ke_get_prcb().number as usize;
         let pri = (*thread).priority as usize & 31;
         (*thread).state = ThreadState::Ready;
-        s.ready_queues[pri].insert_tail(&raw mut (*thread).ready_list_entry);
-        s.ready_summary |= 1 << pri;
+        let b = bank(cpu);
+        b.queues[pri].insert_tail(&raw mut (*thread).ready_list_entry);
+        b.summary |= 1 << pri;
+        b.count += 1;
     }
 }
 
@@ -219,24 +246,71 @@ pub unsafe fn ki_ready_thread(thread: *mut Kthread) {
 }
 
 // ---------------------------------------------------------------------------
-// Ready queues (cont.)
+// Selection
 // ---------------------------------------------------------------------------
 
-/// Pop the highest-priority ready thread, or null if none.
-/// Lock held by caller.
-unsafe fn select_next_locked() -> *mut Kthread {
-    let s = unsafe { state() };
-    if s.ready_summary == 0 {
-        return core::ptr::null_mut();
+/// The highest priority with a queued thread in bank `cpu`, or None.
+/// Lock held.
+unsafe fn best_priority_in(cpu: usize) -> Option<usize> {
+    let summary = unsafe { bank(cpu) }.summary;
+    if summary == 0 {
+        None
+    } else {
+        Some(31 - summary.leading_zeros() as usize)
     }
-    let pri = 31 - s.ready_summary.leading_zeros() as usize;
-    let entry = s.ready_queues[pri]
-        .remove_head()
-        .expect("ready_summary bit set but queue empty");
-    if s.ready_queues[pri].is_empty() {
-        s.ready_summary &= !(1 << pri);
+}
+
+/// Pop the highest-priority thread from bank `cpu`'s queue at `pri`.
+/// Lock held.
+unsafe fn pop_at(cpu: usize, pri: usize) -> *mut Kthread {
+    unsafe {
+        let b = bank(cpu);
+        let entry = b.queues[pri]
+            .remove_head()
+            .expect("ready summary bit set but queue empty");
+        b.count -= 1;
+        if b.queues[pri].is_empty() {
+            b.summary &= !(1 << pri);
+        }
+        container_of!(entry, Kthread, ready_list_entry)
     }
-    container_of!(entry, Kthread, ready_list_entry)
+}
+
+/// Pop the best thread for `cpu`: its own bank first; when it's empty, the
+/// globally best thread from any other bank (work stealing). Null when
+/// every bank is empty. Lock held.
+unsafe fn select_next_locked(cpu: usize) -> *mut Kthread {
+    if let Some(pri) = unsafe { best_priority_in(cpu) } {
+        return unsafe { pop_at(cpu, pri) };
+    }
+    // Steal: the globally best thread anywhere else.
+    let mut best: Option<(usize, usize)> = None; // (pri, cpu)
+    for other in 0..super::gdt::MAX_CPUS {
+        if other == cpu {
+            continue;
+        }
+        if let Some(pri) = unsafe { best_priority_in(other) } {
+            if best.is_none_or(|(bp, _)| pri > bp) {
+                best = Some((pri, other));
+            }
+        }
+    }
+    let Some((pri, owner)) = best else { return core::ptr::null_mut() };
+    STEALS.fetch_add(1, Ordering::Relaxed);
+    unsafe { pop_at(owner, pri) }
+}
+
+/// Threads queued on `cpu`'s bank — self-test/diagnostic surface.
+pub fn ready_count(cpu: usize) -> usize {
+    let _g = crate::ke::spinlock::SpinLock::lock(&READY_COUNT_LOCK);
+    unsafe { bank(cpu) }.count
+}
+
+static READY_COUNT_LOCK: crate::ke::spinlock::SpinLock<()> = crate::ke::spinlock::SpinLock::new(());
+
+/// Threads stolen off another CPU's bank so far — self-test surface.
+pub fn steal_count() -> u64 {
+    STEALS.load(Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------------------
@@ -250,7 +324,7 @@ unsafe fn select_next_locked() -> *mut Kthread {
 unsafe fn switch_away_locked(cur: *mut Kthread) {
     unsafe {
         let prcb = pcr::ke_get_prcb();
-        let mut next = select_next_locked();
+        let mut next = select_next_locked(prcb.number as usize);
         if next.is_null() {
             next = prcb.idle_thread;
         }
@@ -826,9 +900,15 @@ pub fn ki_dispatch_interrupt() {
     unsafe {
         let old = acquire();
         let cur = prcb.current_thread;
+        let me = prcb.number as usize;
+        // The best priority runnable *here*: my own bank, or a bank I could
+        // steal from (any other bank's best).
+        let best_here = (0..super::gdt::MAX_CPUS)
+            .filter_map(|c| unsafe { best_priority_in(c) })
+            .max();
         let resched = if cur == prcb.idle_thread {
-            // Idle cedes to anything ready.
-            state().ready_summary != 0
+            // Idle cedes to anything runnable.
+            best_here.is_some()
         } else if quantum_end {
             // Round-robin within the priority: requeue at tail, then pick.
             (*cur).state = ThreadState::Ready;
@@ -837,8 +917,7 @@ pub fn ki_dispatch_interrupt() {
             true
         } else {
             // Preemption check: someone readied a higher-priority thread.
-            let best = 31 - state().ready_summary.leading_zeros().min(31) as u8;
-            state().ready_summary != 0 && best > (*cur).priority
+            best_here.is_some_and(|best| best > (*cur).priority as usize)
         };
         if resched {
             if cur != prcb.idle_thread && (*cur).state == ThreadState::Running {

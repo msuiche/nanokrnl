@@ -1726,3 +1726,34 @@ was worse than documenting it as the follow-up. Roadmap is now fully
 clear through SMP and SEH; remaining candidates: per-CPU ready queues,
 `RtlUnwindEx`/global unwind for longjmp-style exits, kernel-mode SEH
 for driver crash paths.
+
+### 2026-07-20 - SMP III: per-CPU ready queues, and stealing that proves itself
+
+The dispatcher's last uniprocessor-shaped structure is gone: each CPU
+now owns its ready state (NT's per-PRCB `DispatcherReadyListHead[32]`
+plus its ready summary), and idle CPUs steal from other CPUs' banks.
+
+- **Per-CPU ready banks**: 32 FIFO queues + a summary bitmask per
+  processor. A readied thread lands on the bank of the CPU that
+  readied it (NT's `KiQueueReadyThread` behavior); selection pops the
+  local bank first, and when it's empty takes the globally best thread
+  from any other bank — work stealing with a counter. The global
+  dispatcher lock still serializes every bank (the classic design, not
+  the sharded one — noted in the docs, not pretended away).
+- **The checks got sharper as a result**: preemption and idle-cede now
+  look at "the best priority runnable *here*" — the local bank's best
+  or any bank's best that could be stolen — instead of the old global
+  summary word.
+- The new self-test is the interesting kind: with every thread readied
+  from one CPU, the *only* way one ran elsewhere is a steal, so the
+  suite asserts the steal counter advanced — causality, not
+  correlation. `ready_count(cpu)` introspection comes with it.
+
+Boot suite (119 checks): threads demonstrably migrate, and the
+migration is provably theft.
+
+Verified: QEMU suite 119/119 three consecutive times; host 18+2+7;
+emu 36/36; nanox pipe session clean. The scheduler is now honestly
+multiprocessor in structure as well as behavior. Remaining polish:
+idle-CPU-aware IPI targeting (skip the broadcast when an idle CPU is
+marked), priority boosting/aging, and the CRT scope-table walk for SEH.

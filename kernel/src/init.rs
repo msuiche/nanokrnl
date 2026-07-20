@@ -817,6 +817,7 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
             for s in &RUN_CPUS {
                 s.store(0, Ordering::Release);
             }
+            let steals_before = ke::scheduler::steal_count();
             let mut threads = [core::ptr::null_mut(); 6];
             for i in 0..6 {
                 threads[i] = ps::ps_create_system_thread(run_recorder, i as *mut core::ffi::c_void)
@@ -838,6 +839,14 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
             check!(
                 "Smp: kernel threads ran on more than one processor",
                 ran == 6 && cpus_used >= 2
+            );
+            // With per-CPU ready banks, every thread was readied onto THIS
+            // CPU's bank (the creating thread runs here) — the only way one
+            // ran on another CPU is that an idle CPU stole it. The steal
+            // counter is the direct proof.
+            check!(
+                "Smp: idle processors stole work from this CPU's ready bank",
+                ke::scheduler::steal_count() > steals_before
             );
 
             // --- Smp II: TLB shootdown ------------------------------------
