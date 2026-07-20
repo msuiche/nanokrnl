@@ -1635,3 +1635,48 @@ Remaining SMP frontier: per-CPU ready queues (the global dispatcher
 lock is the classic first design, not the scalable one), shootdown
 batched by range, and unpinning isolated processes once shim data is
 truly per-process.
+
+### 2026-07-18 - per-process shim pages: real COW DLL data, and the end of the CPU-0 pin
+
+SMP II pinned isolated processes to the BSP because their per-process
+DLL data lived in shared shim pages swapped on context switch. That pin
+is now gone for the right reason: every process gets *physically
+private* shim .data pages — NT's copy-on-write, done eagerly.
+
+- **`mm::virt::mm_privatize_pages`** (new): for each writable shim page
+  of a new process, the page-table chain out to it is *cloned* (the
+  window's PDPT copied per process, intermediate tables cloned,
+  large leaves split to 4 KiB) and the leaf PTE gets a fresh frame —
+  same VA, different physical page. `mm_free_privatized` reclaims the
+  frames and cloned tables at process exit. Everything outside the
+  shim regions keeps sharing tables and frames untouched.
+- **The seed must be the pristine snapshot, never the shared page** —
+  the bug this round's debugging chased. Seeding from the live shared
+  page copied the *kernel-AS apps'* runtime state (VEH registrations
+  pointing into their own images, heap arenas, fd tables) into every
+  new process: an isolated process's first exception dispatched into
+  *another image's* VEH handler and died returning through a foreign
+  stack frame. The give-away in the log: a user fault whose RIP sat in
+  a *different process's* image at a `pop rsi` epilogue, reading above
+  its own stack top. `register_shim_data` now snapshots page-aligned
+  spans at shim load (128 KiB budget so ulib fits); privatization
+  seeds from it.
+- **ulib joins the scheme**: `load_ulib` registers its writable
+  sections too, so the `reset_ulib_data` pre-spawn ritual (and its
+  "processes run serially" assumption) is deleted — every process's
+  CRT guards start pristine by construction.
+- **The context-switch swap and the affinity pin are deleted.**
+  `swap_shim_data`, the slot buffers, and the scheduler's per-switch
+  copy are gone; isolated (`cr3 != 0`) threads schedule on all four
+  CPUs like everything else.
+
+Boot suite (115 checks): the two-process test now proves *physical*
+privacy — same shim .data VA in both processes, different frames,
+neither the kernel AS's frame — while both CRTs run concurrently on
+whatever CPUs pick them.
+
+Verified: QEMU suite 115/115 three consecutive times; host 18+2+7;
+emu 36/36; nanox pipe session clean. SMP story now: AP startup,
+per-CPU scheduling, TLB shootdowns, and unrestricted migration. Next
+candidates: SEH (`.pdata` unwinding), per-CPU ready queues, or driver
+`.pdata`-based kernel SEH for crash paths.

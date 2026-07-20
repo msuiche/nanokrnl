@@ -219,65 +219,24 @@ pub unsafe fn ki_ready_thread(thread: *mut Kthread) {
 }
 
 // ---------------------------------------------------------------------------
-// Processor affinity
+// Ready queues (cont.)
 // ---------------------------------------------------------------------------
 
-/// May `thread` run on `cpu`? Isolated (per-process, `cr3 != 0`) threads are
-/// pinned to the BSP: their per-process DLL data lives in the shared shim
-/// pages, swapped on context switch — a model that is only correct when at
-/// most one isolated thread runs at a time. CPU 0 gives them exactly the UP
-/// semantics the swap was built for. Kernel threads and shared-AS user
-/// threads (`cr3 == 0`) run anywhere. (Real per-process pages — NT's COW —
-/// are the follow-up that lifts this.)
-fn allowed_on(cpu: usize, thread: *const Kthread) -> bool {
-    cpu == 0 || unsafe { (*thread).cr3 == 0 }
-}
-
-/// The highest priority holding at least one thread `cpu` may run.
-/// Lock held.
-unsafe fn best_allowed_priority_locked(cpu: usize) -> Option<usize> {
+/// Pop the highest-priority ready thread, or null if none.
+/// Lock held by caller.
+unsafe fn select_next_locked() -> *mut Kthread {
     let s = unsafe { state() };
-    let mut summary = s.ready_summary;
-    while summary != 0 {
-        let pri = 31 - summary.leading_zeros() as usize;
-        let mut any = false;
-        s.ready_queues[pri].for_each(|e| {
-            if allowed_on(cpu, container_of!(e, Kthread, ready_list_entry)) {
-                any = true;
-            }
-        });
-        if any {
-            return Some(pri);
-        }
-        summary &= !(1 << pri);
-    }
-    None
-}
-
-/// Pop the highest-priority ready thread `cpu` may run, or null if none.
-/// Lock held.
-unsafe fn select_next_locked(cpu: usize) -> *mut Kthread {
-    let Some(pri) = (unsafe { best_allowed_priority_locked(cpu) }) else {
-        return core::ptr::null_mut();
-    };
-    let s = unsafe { state() };
-    let mut picked: *mut Kthread = core::ptr::null_mut();
-    s.ready_queues[pri].for_each(|e| {
-        if picked.is_null() {
-            let t = container_of!(e, Kthread, ready_list_entry);
-            if allowed_on(cpu, t) {
-                picked = t;
-            }
-        }
-    });
-    if picked.is_null() {
+    if s.ready_summary == 0 {
         return core::ptr::null_mut();
     }
-    unsafe { ListEntry::remove(&raw mut (*picked).ready_list_entry) };
+    let pri = 31 - s.ready_summary.leading_zeros() as usize;
+    let entry = s.ready_queues[pri]
+        .remove_head()
+        .expect("ready_summary bit set but queue empty");
     if s.ready_queues[pri].is_empty() {
         s.ready_summary &= !(1 << pri);
     }
-    picked
+    container_of!(entry, Kthread, ready_list_entry)
 }
 
 // ---------------------------------------------------------------------------
@@ -291,7 +250,7 @@ unsafe fn select_next_locked(cpu: usize) -> *mut Kthread {
 unsafe fn switch_away_locked(cur: *mut Kthread) {
     unsafe {
         let prcb = pcr::ke_get_prcb();
-        let mut next = select_next_locked(prcb.number as usize);
+        let mut next = select_next_locked();
         if next.is_null() {
             next = prcb.idle_thread;
         }
@@ -311,19 +270,9 @@ unsafe fn switch_away_locked(cur: *mut Kthread) {
         // shared by every address space, so the kernel stacks of both `cur`
         // and `next` (and the code executing here) stay mapped across the
         // load. Only switch when the target AS actually differs, to avoid a
-        // needless TLB flush when staying within one address space.
-        // Emulated per-process DLL data: give the resuming process its private
-        // copy of the shim C-runtime state (fd table, cached std handles) by
-        // swapping it into the shared shim `.data` pages, saving the outgoing
-        // process's first. No-op unless an isolated process is involved. Done
-        // while `cur`'s address space is still active; the shim pages are in the
-        // shared high half (same physical frames in every space), so the copy
-        // sees the same bytes either side of the CR3 load.
-        let out_cr3 = (*cur).cr3;
-        let in_cr3 = (*next).cr3;
-        if out_cr3 != in_cr3 && (out_cr3 != 0 || in_cr3 != 0) {
-            crate::ldr::loaded::swap_shim_data(out_cr3, in_cr3);
-        }
+        // needless TLB flush when staying within one address space. (Per-process
+        // DLL data needs no switch-time work: every process's shim .data is
+        // privately mapped in its own address space.)
         let target_cr3 = if (*next).cr3 != 0 {
             (*next).cr3
         } else {
@@ -878,8 +827,8 @@ pub fn ki_dispatch_interrupt() {
         let old = acquire();
         let cur = prcb.current_thread;
         let resched = if cur == prcb.idle_thread {
-            // Idle cedes to anything ready *this CPU may run*.
-            best_allowed_priority_locked(prcb.number as usize).is_some()
+            // Idle cedes to anything ready.
+            state().ready_summary != 0
         } else if quantum_end {
             // Round-robin within the priority: requeue at tail, then pick.
             (*cur).state = ThreadState::Ready;
@@ -887,10 +836,9 @@ pub fn ki_dispatch_interrupt() {
             ready_thread_locked(cur);
             true
         } else {
-            // Preemption check: someone readied a higher-priority thread
-            // this CPU may run.
-            best_allowed_priority_locked(prcb.number as usize)
-                .is_some_and(|best| best > (*cur).priority as usize)
+            // Preemption check: someone readied a higher-priority thread.
+            let best = 31 - state().ready_summary.leading_zeros().min(31) as u8;
+            state().ready_summary != 0 && best > (*cur).priority
         };
         if resched {
             if cur != prcb.idle_thread && (*cur).state == ThreadState::Running {

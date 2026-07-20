@@ -514,12 +514,6 @@ fn mui_for_image(image: &[u8]) -> &'static [u8] {
 }
 
 pub(crate) fn create_user_process(image: &[u8], cmdline: &[u8], std_handles: [u64; 3]) -> u64 {
-    // ulib.dll lives once in the shared high half, so its C-runtime data is
-    // shared across processes. Reset it to its pristine post-load state so this
-    // process's ulib init runs fresh — otherwise a second ulib-based program
-    // (e.g. `more.com` run twice) sees stale "already initialized" CRT guards and
-    // aborts at startup. Safe: user processes run serially, none is executing now.
-    crate::ldr::loaded::reset_ulib_data();
     let proc = match crate::ldr::pe::load_user_process(image) {
         Ok(p) => p,
         Err(_) => return 0,
@@ -619,7 +613,7 @@ pub(crate) fn on_user_thread_exit(thread: u64) {
     let cr3 = unsafe { (*(thread as *const ps::Ethread)).tcb.cr3 };
     if cr3 != 0 {
         crate::ob::handle::ob_free_table(cr3);
-        crate::ldr::loaded::free_shim_data(cr3);
+        crate::ldr::loaded::free_shim_pages(cr3);
         // Reclaim the address space itself (image, stack, control block, and
         // every demand-faulted heap page). Switch to the kernel address space
         // first: freeing the live PML4 under our own translations would
@@ -1921,6 +1915,29 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
                         "Um: the two processes have distinct address spaces",
                         a.cr3.0 != b.cr3.0
                     );
+                    // Their shim .data must be *physically* private, not the
+                    // one shared high-half page: same VA in both processes,
+                    // different frames, neither the kernel AS's frame. This is
+                    // what lets two CRTs run concurrently on two CPUs.
+                    {
+                        let va = crate::ldr::loaded::first_shim_data_va();
+                        let pte_a = mm::virt::mm_debug_pte_in(a.cr3, va);
+                        let pte_b = mm::virt::mm_debug_pte_in(b.cr3, va);
+                        let pte_k = mm::virt::mm_debug_pte_in(
+                            mm::virt::mm_kernel_address_space(),
+                            va,
+                        );
+                        let frame = |p: Option<u64>| p.map(|e| e & 0x000F_FFFF_FFFF_F000);
+                        check!(
+                            "Um: shim .data pages are private per process",
+                            va != 0
+                                && frame(pte_a).is_some()
+                                && frame(pte_b).is_some()
+                                && frame(pte_a) != frame(pte_b)
+                                && frame(pte_a) != frame(pte_k)
+                                && frame(pte_b) != frame(pte_k)
+                        );
+                    }
                 }
                 _ => {
                     kd_println!("  [FAIL] Um: two-process load failed");

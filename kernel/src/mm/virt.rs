@@ -700,3 +700,196 @@ unsafe fn free_table_level(table: PhysAddr, level: u8) {
         mm_free_contiguous_pages(table, 1);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Per-process privatization of shared (phys-window) pages
+// ---------------------------------------------------------------------------
+
+/// Record of one process's privatized shared-range state: the cloned page
+/// tables and the fresh frames backing the private copies. Returned by
+/// [`mm_privatize_pages`], freed by [`mm_free_privatized`].
+///
+/// The clone works at whatever granularity the shared mapping uses: PDPT/PD
+/// entries pointing at shared tables are cloned (copied), large leaves are
+/// split into finer tables replicating the mapping — then the leaf PTE gets
+/// a new frame with the shared content. Everything else in the window keeps
+/// pointing at shared tables/frames, so non-shim window data is untouched.
+pub struct Privatized {
+    /// The process's private PDPT for the window's PML4 slot (0 = none yet).
+    pub pdpt: PhysAddr,
+    /// Cloned/split table frames (PDs, PTs) — freed as tables.
+    pub tables: [PhysAddr; MAX_PRIV_TABLES],
+    pub n_tables: usize,
+    /// Private data frames (leaf content copies) — freed as frames.
+    pub frames: [PhysAddr; MAX_PRIV_FRAMES],
+    pub n_frames: usize,
+}
+
+const MAX_PRIV_TABLES: usize = 16;
+const MAX_PRIV_FRAMES: usize = 256;
+
+impl Privatized {
+    pub const fn new() -> Self {
+        Privatized {
+            pdpt: PhysAddr(0),
+            tables: [PhysAddr(0); MAX_PRIV_TABLES],
+            n_tables: 0,
+            frames: [PhysAddr(0); MAX_PRIV_FRAMES],
+            n_frames: 0,
+        }
+    }
+
+    fn push_table(&mut self, t: PhysAddr) -> Option<()> {
+        if self.n_tables >= MAX_PRIV_TABLES {
+            return None;
+        }
+        self.tables[self.n_tables] = t;
+        self.n_tables += 1;
+        Some(())
+    }
+
+    fn push_frame(&mut self, f: PhysAddr) -> Option<()> {
+        if self.n_frames >= MAX_PRIV_FRAMES {
+            return None;
+        }
+        self.frames[self.n_frames] = f;
+        self.n_frames += 1;
+        Some(())
+    }
+
+    fn is_ours(&self, t: PhysAddr) -> bool {
+        self.tables[..self.n_tables].contains(&t)
+    }
+}
+
+/// Give address space `pml4` a private copy of every 4 KiB page of
+/// `[va, va+len)`: the range's page-table chain is cloned (so the process
+/// stops sharing the intermediate tables for it) and each leaf gets a fresh
+/// frame initialized from `seed` (the pristine bytes for the range,
+/// `seed.len() == len`; pass the shared content itself when no separate
+/// seed exists). The classic use is per-process DLL data — NT's
+/// copy-on-write, done eagerly at our scale.
+///
+/// Returns false (leaving shared mappings in place) if the range isn't
+/// mapped or the record caps are exceeded.
+pub fn mm_privatize_pages(pml4: PhysAddr, va: u64, len: usize, rec: &mut Privatized, seed: &[u8]) -> bool {
+    let win_idx = (((phys_to_virt(PhysAddr(0)) as u64) >> 39) & 0x1FF) as usize;
+    if seed.len() < len {
+        return false;
+    }
+    unsafe {
+        // Ensure the process's PML4 slot for the phys window holds a private
+        // PDPT clone rather than the shared one (copied at AS creation).
+        if rec.pdpt.0 == 0 {
+            let p4 = entry_ptr(pml4, win_idx);
+            let cur = *p4;
+            if cur & ENTRY_PRESENT == 0 {
+                return false;
+            }
+            let clone = new_table();
+            core::ptr::copy_nonoverlapping(
+                phys_to_virt(PhysAddr(cur & ADDR_MASK)) as *const u64,
+                phys_to_virt(clone) as *mut u64,
+                512,
+            );
+            if rec.push_table(clone).is_none() {
+                mm_free_contiguous_pages(clone, 1);
+                return false;
+            }
+            *p4 = clone.0 | (cur & !ADDR_MASK);
+            rec.pdpt = clone;
+        }
+        let base = va & !0xFFF;
+        let mut page = base;
+        let end = va + len as u64;
+        while page < end {
+            let s = (page - base) as usize;
+            if !privatize_leaf(rec, page, &seed[s..]) {
+                return false;
+            }
+            page += 0x1000;
+        }
+    }
+    true
+}
+
+/// Clone the chain from `rec.pdpt` down to `va`'s leaf and give the leaf a
+/// fresh frame initialized from `seed` (at least one page long). See
+/// [`mm_privatize_pages`].
+unsafe fn privatize_leaf(rec: &mut Privatized, va: u64, seed: &[u8]) -> bool {
+    let idx = |shift: u64| ((va >> shift) & 0x1FF) as usize;
+    unsafe {
+        let mut parent = rec.pdpt;
+        let mut shift = 30u64; // PDPT entry index bits
+        loop {
+            let e = entry_ptr(parent, idx(shift));
+            let cur = *e;
+            if cur & ENTRY_PRESENT == 0 {
+                return false; // range not mapped in the shared space
+            }
+            let child = PhysAddr(cur & ADDR_MASK);
+            if shift == 12 {
+                // Leaf: swap in a fresh frame seeded with the pristine bytes.
+                let Some(frame) = mm_allocate_page() else { return false };
+                core::ptr::copy_nonoverlapping(
+                    seed.as_ptr(),
+                    phys_to_virt(frame) as *mut u8,
+                    super::PAGE_SIZE,
+                );
+                if rec.push_frame(frame).is_none() {
+                    mm_free_contiguous_pages(frame, 1);
+                    return false;
+                }
+                *e = (cur & !ADDR_MASK) | frame.0;
+                return true;
+            }
+            if cur & ENTRY_LARGE != 0 {
+                // Large leaf: split into a finer table replicating the mapping
+                // (1 GiB → 512 × 2 MiB, or 2 MiB → 512 × 4 KiB).
+                let child_span = 1u64 << (shift - 9);
+                let base = cur & ADDR_MASK & !(child_span * 512 - 1);
+                let flags = cur & FLAG_MASK & !ENTRY_LARGE;
+                let table = new_table();
+                let t = phys_to_virt(table) as *mut u64;
+                for i in 0..512u64 {
+                    *t.add(i as usize) = (base + i * child_span) | flags;
+                }
+                if rec.push_table(table).is_none() {
+                    mm_free_contiguous_pages(table, 1);
+                    return false;
+                }
+                *e = table.0 | ENTRY_PRESENT | (cur & (ENTRY_RW | ENTRY_USER | ENTRY_NX));
+                parent = table;
+            } else if rec.is_ours(child) {
+                parent = child; // already cloned on an earlier page
+            } else {
+                // Shared intermediate table: clone it (entries and all).
+                let table = new_table();
+                core::ptr::copy_nonoverlapping(
+                    phys_to_virt(child) as *const u64,
+                    phys_to_virt(table) as *mut u64,
+                    512,
+                );
+                if rec.push_table(table).is_none() {
+                    mm_free_contiguous_pages(table, 1);
+                    return false;
+                }
+                *e = table.0 | (cur & !ADDR_MASK);
+                parent = table;
+            }
+            shift -= 9;
+        }
+    }
+}
+
+/// Free every frame and cloned table recorded in `rec` (process teardown).
+/// The process's PML4 is reclaimed separately by `mm_free_user_address_space`.
+pub fn mm_free_privatized(rec: &mut Privatized) {
+    for &f in &rec.frames[..rec.n_frames] {
+        mm_free_contiguous_pages(f, 1);
+    }
+    for &t in &rec.tables[..rec.n_tables] {
+        mm_free_contiguous_pages(t, 1);
+    }
+    *rec = Privatized::new();
+}
