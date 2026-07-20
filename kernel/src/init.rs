@@ -1969,6 +1969,28 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
         );
     }
 
+    // --- Seh: frame-based SEH (.pdata unwinding) ---------------------------
+    // sehtest.exe (clang, real __try/__except metadata) faults four times in
+    // marked regions; the shim's RtlLookupFunctionEntry + RtlVirtualUnwind +
+    // frame-handler dispatch must recover each (through NtContinue), the
+    // __finally-carrying frame must be visited, and a leaf-frame fault must
+    // reach the caller's handler. The process exits a bitmask: bits 0..3 =
+    // the four cases recovered.
+    if !SEHTEST_IMAGE.is_empty() {
+        let h = create_user_process(SEHTEST_IMAGE, b"sehtest.exe", [0, 0, 0]);
+        check!("Seh: sehtest.exe process created", h != 0);
+        let st = wait_user_process(h, 5000);
+        let code = user_process_exit_code(h);
+        unsafe {
+            mm::virt::mm_switch_address_space(mm::virt::mm_kernel_address_space());
+        }
+        check!("Seh: sehtest ran to exit", st == 0);
+        check!(
+            "Seh: all four frame-SEH cases recovered (try/finally/callee/nested)",
+            code == 0xF
+        );
+    }
+
     // --- Experimental: run a REAL Windows console binary (sort.exe) -----
     // Loads an unmodified Microsoft sort.exe and binds its kernel32/msvcrt/
     // ntdll imports to our shims. stdin is /dev/null here (no EOF), so sort
@@ -2229,6 +2251,10 @@ static CMD_MUI: &[u8] = include_bytes!(env!("NTOS_CMD_MUI_IMAGE"));
 /// at boot and exposed as `C:\system.hive` for inspection. Empty when not
 /// generated (loader test skips then).
 pub(crate) const HIVE_IMAGE: &[u8] = include_bytes!(env!("NTOS_HIVE_IMAGE"));
+/// `sehtest.exe` — a clang-built C binary with real frame-based SEH
+/// (`__try/__except/__finally`), the validation vehicle for the shim's
+/// `.pdata` unwinder (`scripts/build-sehtest.sh`). Empty when not built.
+static SEHTEST_IMAGE: &[u8] = include_bytes!(env!("NTOS_SEHTEST_IMAGE"));
 /// `more.com` — the console pager (a PE despite the `.com` name). Needs
 /// `ulib.dll` to actually run; embedded so it can be enumerated and launched
 /// once dependent-DLL loading exists.

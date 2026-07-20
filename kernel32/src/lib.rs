@@ -364,8 +364,10 @@ pub unsafe extern "C" fn WriteConsoleW(
 /// `ExitProcess(uExitCode)` — terminates the calling thread (single-thread
 /// process model for now).
 #[no_mangle]
-pub unsafe extern "C" fn ExitProcess(_exit_code: u32) -> ! {
-    syscall3(NT_TERMINATE_THREAD, 0, 0, 0);
+pub unsafe extern "C" fn ExitProcess(exit_code: u32) -> ! {
+    // The code lands in the thread's exit_code — what GetExitCodeProcess
+    // reads back.
+    syscall3(NT_TERMINATE_THREAD, exit_code as u64, 0, 0);
     loop {
         core::hint::spin_loop();
     }
@@ -4948,10 +4950,417 @@ pub unsafe extern "C" fn KiUserExceptionDispatcher(
             break;
         }
     }
+    // No vectored handler took it: frame-based SEH gets its turn — walk the
+    // call stack through .pdata, invoking frame handlers (`RtlDispatchException`
+    // semantics). A resumed thread never comes back here.
+    if seh_dispatch(record, context) {
+        core::hint::unreachable_unchecked();
+    }
     // Unhandled: terminate with the exception code as the exit status — the
     // same fate an unhandled user fault always had in this kernel.
     let code = (*record).code as u64;
     loop {
         syscall3(NT_TERMINATE_THREAD, code, 0, 0);
+    }
+}
+
+// --- Frame-based SEH: .pdata lookup and unwinding ---------------------------
+//
+// NT's order is: vectored handlers first, then frame-based SEH, then the
+// unhandled-exception fate. This is the frame half: walk the faulting
+// thread's call stack through each function's `RUNTIME_FUNCTION` (the
+// `.pdata` exception directory), invoke the frame's registered handler
+// (`__C_specific_handler` or a custom one — frame handlers are pluggable),
+// and either resume through `NtContinue` or virtual-unwind one frame and
+// keep searching. The unwinder implements the version-1 UNWIND_CODE set
+// (`RtlVirtualUnwind` semantics); leaf functions (no RUNTIME_FUNCTION) step
+// by the return address on the stack, per the documented leaf rule.
+//
+// Module coverage: the process image (found through the PEB's loader list).
+// A frame in any other module ends the walk unhandled — a documented
+// limitation, not a crash (the VEH/terminate path covers those).
+
+/// `RUNTIME_FUNCTION` (winnt.h, x64) — one `.pdata` entry.
+#[repr(C)]
+struct RuntimeFunction {
+    begin: u32,
+    end: u32,
+    unwind_info: u32,
+}
+
+const UNW_FLAG_EHANDLER: u8 = 1;
+const UNW_FLAG_UHANDLER: u8 = 2;
+const UNW_FLAG_CHAININFO: u8 = 4;
+
+// UNWIND_CODE opcodes (version 1).
+const UWOP_PUSH_NONVOL: u8 = 0;
+const UWOP_ALLOC_LARGE: u8 = 1;
+const UWOP_ALLOC_SMALL: u8 = 2;
+const UWOP_SET_FPREG: u8 = 3;
+const UWOP_SAVE_NONVOL: u8 = 4;
+const UWOP_SAVE_NONVOL_FAR: u8 = 5;
+const UWOP_SAVE_XMM128: u8 = 8;
+const UWOP_SAVE_XMM128_FAR: u8 = 9;
+const UWOP_PUSH_MACHFRAME: u8 = 10;
+
+/// `DISPATCHER_CONTEXT` (winnt.h, x64) — what a frame handler receives as
+/// its fourth argument.
+#[repr(C)]
+pub struct DispatcherContext {
+    pub control_pc: u64,
+    pub image_base: u64,
+    pub function_entry: u64,
+    pub establisher_frame: u64,
+    pub target_ip: u64,
+    pub context_record: u64,
+    pub language_handler: u64,
+    pub handler_data: u64,
+    pub history_table: u64,
+    pub scope_index: u32,
+    pub fill0: u32,
+}
+
+/// `EXCEPTION_DISPOSITION` values (the frame handler's return).
+pub const EXCEPTION_CONTINUE_EXECUTION_DISPO: i32 = 0;
+pub const EXCEPTION_CONTINUE_SEARCH_DISPO: i32 = 1;
+#[allow(dead_code)]
+pub const EXCEPTION_NESTED_EXCEPTION_DISPO: i32 = 2;
+pub const EXCEPTION_COLLIDED_UNWIND_DISPO: i32 = 3;
+
+/// `PEXCEPTION_ROUTINE` — a frame handler (`__C_specific_handler`'s shape).
+type FrameHandler = unsafe extern "C" fn(
+    record: *const ExceptionRecord,
+    establisher_frame: u64,
+    context: *mut Context,
+    dispatcher: *mut DispatcherContext,
+) -> i32;
+
+/// The process's own module (image base + size), found through the PEB's
+/// loader list (`RtlLookupFunctionEntry` uses the loader's inverted function
+/// table on real NT; the list is the same information at our scale).
+unsafe fn app_module() -> Option<(u64, u64)> {
+    unsafe {
+        let peb: u64;
+        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, nomem));
+        if peb == 0 {
+            return None;
+        }
+        let ldr = *((peb + 0x18) as *const u64); // PEB.Ldr
+        if ldr == 0 {
+            return None;
+        }
+        // InLoadOrderModuleList head at LDR+0x10; entries link at +0x00,
+        // DllBase at +0x30, SizeOfImage at +0x40.
+        let head = ldr + 0x10;
+        let mut cur = *(head as *const u64);
+        let mut spins = 0;
+        while cur != head && cur != 0 && spins < 16 {
+            let base = *((cur + 0x30) as *const u64);
+            let size = *((cur + 0x40) as *const u32) as u64;
+            if base != 0 && size != 0 {
+                return Some((base, size));
+            }
+            cur = *(cur as *const u64);
+            spins += 1;
+        }
+        None
+    }
+}
+
+/// The module's `.pdata` directory (RVA of the exception table + entry count).
+unsafe fn module_pdata(image_base: u64) -> Option<(u64, usize)> {
+    unsafe {
+        let hdr = image_base as *const u8;
+        let e_lfanew = *((hdr.add(0x3C)) as *const u32) as usize;
+        let opt = hdr.add(e_lfanew + 4 + 20);
+        let num_dirs = *((opt.add(108)) as *const u32) as usize;
+        if num_dirs <= 3 {
+            return None;
+        }
+        let rva = *((opt.add(112 + 3 * 8)) as *const u32) as u64;
+        let size = *((opt.add(112 + 3 * 8 + 4)) as *const u32) as usize;
+        if rva == 0 || size == 0 {
+            return None;
+        }
+        Some((image_base + rva, size / core::mem::size_of::<RuntimeFunction>()))
+    }
+}
+
+/// Binary-search the `.pdata` for the entry covering `rva`.
+unsafe fn lookup_function_entry(pdata: u64, count: usize, rva: u64) -> Option<u64> {
+    unsafe {
+        let mut lo = 0usize;
+        let mut hi = count;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let rf = pdata + (mid * 12) as u64;
+            let begin = *((rf) as *const u32);
+            let end = *((rf + 4) as *const u32);
+            if rva < begin as u64 {
+                hi = mid;
+            } else if rva >= end as u64 {
+                lo = mid + 1;
+            } else {
+                return Some(rf);
+            }
+        }
+        None
+    }
+}
+
+/// Register file access by UNWIND register index (0=RAX … 15=R15).
+fn ctx_reg(ctx: &mut Context, idx: u8) -> &mut u64 {
+    match idx {
+        0 => &mut ctx.rax,
+        1 => &mut ctx.rcx,
+        2 => &mut ctx.rdx,
+        3 => &mut ctx.rbx,
+        4 => &mut ctx.rsp,
+        5 => &mut ctx.rbp,
+        6 => &mut ctx.rsi,
+        7 => &mut ctx.rdi,
+        8 => &mut ctx.r8,
+        9 => &mut ctx.r9,
+        10 => &mut ctx.r10,
+        11 => &mut ctx.r11,
+        12 => &mut ctx.r12,
+        13 => &mut ctx.r13,
+        14 => &mut ctx.r14,
+        _ => &mut ctx.r15,
+    }
+}
+
+/// Read-side of [`ctx_reg`].
+fn ctx_reg_r(ctx: &Context, idx: u8) -> u64 {
+    match idx {
+        0 => ctx.rax,
+        1 => ctx.rcx,
+        2 => ctx.rdx,
+        3 => ctx.rbx,
+        4 => ctx.rsp,
+        5 => ctx.rbp,
+        6 => ctx.rsi,
+        7 => ctx.rdi,
+        8 => ctx.r8,
+        9 => ctx.r9,
+        10 => ctx.r10,
+        11 => ctx.r11,
+        12 => ctx.r12,
+        13 => ctx.r13,
+        14 => ctx.r14,
+        _ => ctx.r15,
+    }
+}
+
+/// Parsed UNWIND_INFO header.
+struct UnwindInfo {
+    flags: u8,
+    prolog: u8,
+    n_codes: usize,
+    frame_reg: u8,
+    frame_off: u8,
+    codes: u64, // VA of the code array
+    handler_va: u64,
+    handler_data: u64,
+}
+
+unsafe fn read_unwind_info(image_base: u64, rf: u64) -> UnwindInfo {
+    unsafe {
+        let rva = *((rf + 8) as *const u32) as u64;
+        let ui = image_base + rva;
+        let b0 = *(ui as *const u8);
+        let prolog = *((ui + 1) as *const u8);
+        let n_codes = *((ui + 2) as *const u8) as usize;
+        let b3 = *((ui + 3) as *const u8);
+        let codes = ui + 4;
+        let after = ui + 4 + ((n_codes * 2 + 3) & !3) as u64;
+        let (handler_va, handler_data) = if b0 >> 3 != 0 {
+            (*((after) as *const u32) as u64 + image_base, after + 4)
+        } else {
+            (0, 0)
+        };
+        UnwindInfo {
+            flags: b0 >> 3,
+            prolog,
+            n_codes,
+            frame_reg: b3 & 0xF,
+            frame_off: b3 >> 4,
+            codes,
+            handler_va,
+            handler_data,
+        }
+    }
+}
+
+/// This frame's establisher value (the frame base handlers reason about):
+/// `rbp - offset*16` for frame-pointer functions, the current RSP otherwise.
+fn establisher_of(ctx: &Context, ui: &UnwindInfo) -> u64 {
+    if ui.frame_reg != 0 {
+        ctx_reg_r(ctx, ui.frame_reg) - (ui.frame_off as u64) * 16
+    } else {
+        ctx.rsp
+    }
+}
+
+/// `RtlVirtualUnwind` (version 1): advance `ctx` from this frame to its
+/// caller's, per the UNWIND_CODEs. Returns false on malformed metadata.
+unsafe fn virtual_unwind(
+    image_base: u64,
+    rva: u64,
+    rf: u64,
+    ui: &UnwindInfo,
+    ctx: &mut Context,
+    establisher_frame: &mut u64,
+) -> bool {
+    unsafe {
+        let begin = *((rf) as *const u32);
+        let cur_off = (rva as u64).wrapping_sub(begin as u64);
+        let mut rsp = establisher_of(ctx, ui);
+        *establisher_frame = rsp;
+        let mut i = 0usize;
+        while i < ui.n_codes {
+            let cw = *((ui.codes + (i * 2) as u64) as *const u16);
+            let off = (cw & 0xFF) as u8;
+            let op = (cw >> 8) as u8 & 0xF;
+            let info = (cw >> 12) as u8;
+            i += 1;
+            // Mid-prolog: only undo ops already executed at the current IP.
+            if cur_off < ui.prolog as u64 && off as u64 > cur_off {
+                continue;
+            }
+            match op {
+                UWOP_PUSH_NONVOL => {
+                    let v = *((rsp) as *const u64);
+                    *ctx_reg(ctx, info) = v;
+                    rsp += 8;
+                }
+                UWOP_ALLOC_SMALL => {
+                    rsp += (info as u64) * 8 + 8;
+                }
+                UWOP_ALLOC_LARGE => {
+                    if info == 0 {
+                        let n = *((ui.codes + (i * 2) as u64) as *const u16);
+                        rsp += (n as u64) * 8;
+                        i += 1;
+                    } else {
+                        let n = *((ui.codes + (i * 2) as u64) as *const u32);
+                        rsp += n as u64;
+                        i += 2;
+                    }
+                }
+                UWOP_SET_FPREG => {
+                    rsp = *ctx_reg(ctx, info) - (ui.frame_off as u64) * 16;
+                    *establisher_frame = rsp;
+                }
+                UWOP_SAVE_NONVOL => {
+                    let n = *((ui.codes + (i * 2) as u64) as *const u16);
+                    i += 1;
+                    let v = *((rsp + (n as u64) * 8) as *const u64);
+                    *ctx_reg(ctx, info) = v;
+                }
+                UWOP_SAVE_NONVOL_FAR => {
+                    let n = *((ui.codes + (i * 2) as u64) as *const u32);
+                    i += 2;
+                    let v = *((rsp + n as u64) as *const u64);
+                    *ctx_reg(ctx, info) = v;
+                }
+                UWOP_SAVE_XMM128 => {
+                    i += 1; // 16-byte offset slot; XMM state not tracked here
+                }
+                UWOP_SAVE_XMM128_FAR => {
+                    i += 2;
+                }
+                UWOP_PUSH_MACHFRAME => {
+                    rsp += if info == 1 { 0x48 } else { 0x40 };
+                    ctx.rip = *((rsp) as *const u64);
+                    ctx.rsp = *((rsp + 0x18) as *const u64);
+                    return true;
+                }
+                _ => return false, // epilog/spare codes: unsupported metadata
+            }
+        }
+        ctx.rip = *((rsp) as *const u64);
+        ctx.rsp = rsp + 8;
+        true
+    }
+}
+
+/// The leaf rule: no RUNTIME_FUNCTION means a leaf function — its caller's
+/// return address sits at [RSP].
+unsafe fn leaf_step(ctx: &mut Context, establisher_frame: &mut u64) -> bool {
+    unsafe {
+        if ctx.rsp == 0 {
+            return false;
+        }
+        *establisher_frame = ctx.rsp;
+        ctx.rip = *(ctx.rsp as *const u64);
+        ctx.rsp += 8;
+        ctx.rip != 0
+    }
+}
+
+/// `RtlDispatchException`'s frame walk: from the faulting context outward,
+/// invoking each frame's handler until one resumes the thread (or the walk
+/// runs out of frames). Returns true when the thread was resumed through
+/// `NtContinue`; false to fall through to the unhandled path.
+unsafe fn seh_dispatch(record: *const ExceptionRecord, context: *mut Context) -> bool {
+    unsafe {
+        let Some((image_base, size)) = app_module() else { return false };
+        let Some((pdata, count)) = module_pdata(image_base) else { return false };
+        // Dispatch works on a copy: handlers may modify it, and NtContinue
+        // consumes it — the caller's context stays pristine on failure.
+        let mut ctx = core::ptr::read(context);
+        let mut establisher = 0u64;
+        for _ in 0..64 {
+            // Bounded walk: malformed metadata must not loop forever.
+            let rva = ctx.rip.wrapping_sub(image_base);
+            if rva >= size {
+                // Not in the covered module: try the leaf rule (the frame
+                // might still be a leaf in our module's caller chain) —
+                // outside it, the walk ends unhandled.
+                if !leaf_step(&mut ctx, &mut establisher) {
+                    return false;
+                }
+                continue;
+            }
+            let Some(rf) = lookup_function_entry(pdata, count, rva) else {
+                if !leaf_step(&mut ctx, &mut establisher) {
+                    return false;
+                }
+                continue;
+            };
+            let ui = read_unwind_info(image_base, rf);
+            if ui.flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER) != 0 && ui.handler_va != 0 {
+                let frame = establisher_of(&ctx, &ui);
+                let mut disp = DispatcherContext {
+                    control_pc: ctx.rip,
+                    image_base,
+                    function_entry: rf,
+                    establisher_frame: frame,
+                    target_ip: ctx.rip,
+                    context_record: &mut ctx as *mut Context as u64,
+                    language_handler: ui.handler_va,
+                    handler_data: ui.handler_data,
+                    history_table: 0,
+                    scope_index: 0,
+                    fill0: 0,
+                };
+                let handler: FrameHandler = core::mem::transmute(ui.handler_va);
+                let dispo = handler(record, frame, &mut ctx, &mut disp);
+                if dispo == EXCEPTION_CONTINUE_EXECUTION_DISPO
+                    || dispo == EXCEPTION_COLLIDED_UNWIND_DISPO
+                {
+                    // Resume at the (handler-adjusted) context; returns only
+                    // if the kernel rejects it, which is the unhandled path.
+                    syscall3(NT_CONTINUE, &mut ctx as *mut Context as u64, 0, 0);
+                    return false;
+                }
+                // ContinueSearch / NestedException: unwind and keep looking.
+            }
+            if !virtual_unwind(image_base, rva, rf, &ui, &mut ctx, &mut establisher) {
+                return false;
+            }
+        }
+        false
     }
 }

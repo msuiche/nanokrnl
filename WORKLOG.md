@@ -1680,3 +1680,49 @@ emu 36/36; nanox pipe session clean. SMP story now: AP startup,
 per-CPU scheduling, TLB shootdowns, and unrestricted migration. Next
 candidates: SEH (`.pdata` unwinding), per-CPU ready queues, or driver
 `.pdata`-based kernel SEH for crash paths.
+
+### 2026-07-20 - frame-based SEH: .pdata unwinding works
+
+The kernel's exception story is complete: vectored handlers first, then
+frame-based SEH, then the unhandled fate — NT's exact order. sehtest.exe,
+a clang-built C binary with real `__try/__except/__finally` metadata,
+faults four times and recovers four times.
+
+- **The shim's SEH engine** (kernel32, ~250 lines): `RtlLookupFunctionEntry`
+  (the process module from the PEB's loader list; `.pdata` from the PE
+  exception directory; binary search for the covering RUNTIME_FUNCTION),
+  `RtlVirtualUnwind` (the version-1 UNWIND_CODE set: nonvol pushes/saves,
+  small/large allocs, SET_FPREG frames, machine frames, mid-prolog
+  partial unwinds, XMM slots skipped-by-size), the **leaf rule** for
+  functions with no `.pdata` entry (caller = [RSP]), and the dispatch
+  loop itself — each frame's registered handler is invoked with a real
+  `DISPATCHER_CONTEXT`; `ExceptionContinueExecution` resumes through
+  `NtContinue`, `ContinueSearch` unwinds one frame and keeps looking,
+  walk exhausted = the old unhandled path.
+- **Frame handlers are pluggable** — the .xdata handler field just names
+  a function with the `__C_specific_handler` signature — and the test
+  exploits that: sehtest carries its *own* handler that dispatches on a
+  "which try is live" marker, so the OS machinery is proven without
+  betting on a toolchain's scope-table layout. The four cases: fault in
+  `__try` recovered; the `__finally`-carrying frame visited during the
+  walk; a fault in a leaf callee recovered by the caller's frame (the
+  leaf rule); nested try falling through to the outer frame.
+- **`ExitProcess` now forwards the exit code** in the kernel32 shim (it
+  used to drop it) — `GetExitCodeProcess` reads real values; sehtest
+  reports its case bitmask through it.
+- A nuance learned the hard way: clang constant-folds provable faults
+  (a null store always faults, so the except "always runs" and the SEH
+  metadata evaporates). Only non-provable fault sites keep real tables —
+  which is why all four test faults go through `0x1234`.
+
+Boot suite (118 checks): sehtest runs as a process and its exit bitmask
+must be 0xF — all four cases recovered through the unwinder.
+
+Verified: QEMU suite 118/118 three consecutive times; host 18+2+7;
+emu 36/36; nanox pipe session clean. Deliberately NOT in this commit:
+the CRT scope-table walk (`__C_specific_handler` proper in the msvcrt
+shim) — no in-tree binary needs it today, and shipping it unvalidated
+was worse than documenting it as the follow-up. Roadmap is now fully
+clear through SMP and SEH; remaining candidates: per-CPU ready queues,
+`RtlUnwindEx`/global unwind for longjmp-style exits, kernel-mode SEH
+for driver crash paths.

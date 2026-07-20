@@ -142,6 +142,14 @@ fn main() {
         "no_hive.bin",
         "NTOS_HIVE_IMAGE",
     );
+    // sehtest.exe — a clang-built C binary with real frame-based SEH
+    // (__try/__except, scripts/build-sehtest.sh) for the .pdata-unwind
+    // boot test. Empty (skipped) when not built.
+    resolve(
+        workspace.join("sehtest").join("sehtest.exe"),
+        "no_sehtest.bin",
+        "NTOS_SEHTEST_IMAGE",
+    );
 
     println!("cargo:rerun-if-changed=build.rs");
 }
