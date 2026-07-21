@@ -285,6 +285,55 @@ pub fn slot(n: usize) -> Option<(u64, bool, u64)> {
     Some((id, s.online.load(Ordering::Acquire), s.pcr_seen.load(Ordering::Acquire)))
 }
 
+// ---------------------------------------------------------------------------
+// Idle-aware IPI targeting
+// ---------------------------------------------------------------------------
+
+/// Per-CPU "running the idle thread" flag — the CPUs worth nudging when new
+/// work appears (a busy CPU finds it at its next dispatch point anyway).
+static HALTING: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+/// Idle-targeted dispatch IPIs sent so far (self-test surface).
+static IDLE_IPIS: AtomicU64 = AtomicU64::new(0);
+
+/// Record whether `cpu` is parked on its idle thread (called from the
+/// context switch with the chosen thread).
+pub fn set_halting(cpu: usize, halting: bool) {
+    if cpu < MAX_CPUS {
+        HALTING[cpu].store(halting, Ordering::Relaxed);
+    }
+}
+
+/// Send a fixed IPI to every *idle* processor except the caller — NT's
+/// idle-processor nudge instead of a broadcast storm. Returns how many were
+/// targeted.
+pub fn ipi_idle_cpus(vector: u8) -> usize {
+    let me = pcr::ke_get_prcb().number as usize;
+    let mut sent = 0;
+    for cpu in 0..MAX_CPUS {
+        if cpu == me || !HALTING[cpu].load(Ordering::Relaxed) {
+            continue;
+        }
+        if !CPU_SLOTS[cpu].online.load(Ordering::Acquire) {
+            continue;
+        }
+        apic::send_ipi(CPU_SLOTS[cpu].apic_id.load(Ordering::Acquire) as u8, 0, vector);
+        sent += 1;
+    }
+    IDLE_IPIS.fetch_add(sent as u64, Ordering::Relaxed);
+    sent
+}
+
+/// Idle-targeted dispatch IPIs sent so far (self-test surface).
+pub fn idle_ipis_sent() -> u64 {
+    IDLE_IPIS.load(Ordering::Relaxed)
+}
+
+/// Whether `cpu` is parked on its idle thread.
+pub fn is_halting(cpu: usize) -> bool {
+    cpu < MAX_CPUS && HALTING[cpu].load(Ordering::Relaxed)
+}
+
 /// Build the transition page table set (PML4 + PDPT + PD): identity map of
 /// the first 2 MiB plus a copy of the kernel high half. Returns the
 /// transition PML4's physical address.
@@ -321,6 +370,8 @@ pub fn init() {
     CPU_SLOTS[0].apic_id.store(bsp_id as u64, Ordering::Release);
     CPU_SLOTS[0].online.store(true, Ordering::Release);
     CPU_SLOTS[0].pcr_seen.store(1, Ordering::Release);
+    // The BSP's boot context doubles as its idle thread.
+    HALTING[0].store(true, Ordering::Release);
     ACTIVE_CR3[0].store(
         crate::mm::virt::mm_kernel_address_space().0,
         Ordering::Release,
@@ -428,6 +479,7 @@ pub extern "C" fn ap_rust_entry() -> ! {
     // STAR/LSTAR/FMASK/SCE are per-CPU MSRs — without this a `syscall` on
     // this processor vectors to address 0.
     super::syscall::init();
+    HALTING[cpu].store(true, Ordering::Release);
     ACTIVE_CR3[cpu].store(
         crate::mm::virt::mm_kernel_address_space().0,
         Ordering::Release,

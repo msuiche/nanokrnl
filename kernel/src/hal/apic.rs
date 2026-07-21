@@ -31,6 +31,7 @@
 
 use crate::ke::pcr::{rdmsr, wrmsr};
 use crate::ke::traps::{VECTOR_CLOCK, VECTOR_DPC, VECTOR_SPURIOUS};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 const IA32_APIC_BASE: u32 = 0x1B;
 const APIC_BASE_ENABLE: u64 = 1 << 11;
@@ -141,10 +142,14 @@ pub fn send_ipi(dest: u8, delivery_mode: u32, vector: u8) {
     }
 }
 
+/// Broadcast (all-but-self) fixed IPIs sent so far (self-test surface).
+static BROADCAST_IPIS: AtomicU64 = AtomicU64::new(0);
+
 /// Broadcast a fixed IPI to every processor except the caller (destination
 /// shorthand 0b11 — no destination field, no per-CPU loop). Used to nudge
 /// idle CPUs into the scheduler when new work appears.
 pub fn send_ipi_all_but_self(vector: u8) {
+    BROADCAST_IPIS.fetch_add(1, Ordering::Relaxed);
     unsafe {
         if APIC_MMIO_BASE.is_null() {
             return;
@@ -154,6 +159,11 @@ pub fn send_ipi_all_but_self(vector: u8) {
             core::hint::spin_loop();
         }
     }
+}
+
+/// Broadcast (all-but-self) fixed IPIs sent so far (self-test surface).
+pub fn broadcast_ipis_sent() -> u64 {
+    BROADCAST_IPIS.load(Ordering::Relaxed)
 }
 
 /// Request a DPC/dispatch interrupt on the current processor (self-IPI on

@@ -1826,3 +1826,29 @@ emu 36/36; nanox pipe session clean. The dispatcher is now fair as
 well as parallel. Remaining polish: `RtlUnwindEx`/global unwind,
 idle-CPU-aware IPI targeting (the broadcast still wakes every CPU for
 every ready), and quantum-end round-robin fairness across banks.
+
+### 2026-07-21 - idle-aware IPI targeting: the end of the broadcast storm
+
+Every thread ready/signal used to fire a dispatch IPI at *all but self*.
+Now the dispatcher nudges only the processors that are actually parked
+on their idle threads — NT's idle-processor selection, with the
+broadcast kept strictly as a fallback.
+
+- **The tracking**: each CPU publishes `halting` (its current thread is
+  its idle thread) from the context switch; `ipi_idle_cpus` sends the
+  dispatch vector only to those. `request_dispatch_ipi` = self-IPI +
+  idle nudges; the all-but-self broadcast fires only when *nothing* is
+  idle, so a freshly readied thread still never waits a whole tick.
+- **The accounting to prove it**: `idle_ipis_sent()` and
+  `broadcast_ipis_sent()` counters, and a test that readies a thread
+  with all APs idle — idle-targeted IPIs must advance, the broadcast
+  counter must not move.
+
+Boot suite (121 checks).
+
+Verified: QEMU suite 121/121 three consecutive times; host 18+2+7;
+emu 36/36; nanox pipe session clean. The SMP story is done from AP
+startup through scheduling, stealing, aging, shootdowns, and IPI
+economy. Remaining polish: `RtlUnwindEx`/global unwind, MSVC-layout
+scope tables for real MSVC binaries that need them, and the debugger's
+multi-CPU awareness (the gdb stub still thinks in one CPU).

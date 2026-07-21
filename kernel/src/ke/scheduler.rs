@@ -203,13 +203,18 @@ pub fn ap_idle_loop() -> ! {
 }
 
 /// Nudge CPUs toward the scheduler after new work appeared: the local CPU
-/// gets the usual self-IPI, and with APs online a broadcast wakes every
-/// idle CPU so one of them steals the work off the global ready queues.
-/// The dispatch ISR is idempotent, so the extra wakeups are harmless.
+/// gets the usual self-IPI; with APs online, *idle* processors get a
+/// targeted dispatch IPI (NT's idle-processor nudge — a busy CPU finds the
+/// work at its next dispatch point anyway). Only when nothing is idle does
+/// the broadcast fallback fire, so a freshly readied thread never waits a
+/// whole tick.
 pub fn request_dispatch_ipi() {
     crate::hal::apic::request_dispatch_interrupt();
     if crate::ke::smp::online_count() > 1 {
-        crate::hal::apic::send_ipi_all_but_self(crate::ke::traps::VECTOR_DPC);
+        let idled = crate::ke::smp::ipi_idle_cpus(crate::ke::traps::VECTOR_DPC);
+        if idled == 0 {
+            crate::hal::apic::send_ipi_all_but_self(crate::ke::traps::VECTOR_DPC);
+        }
     }
 }
 
@@ -401,6 +406,8 @@ unsafe fn switch_away_locked(cur: *mut Kthread) {
         (*next).state = ThreadState::Running;
         (*next).quantum = DEFAULT_QUANTUM;
         prcb.current_thread = next;
+        // Publish idle/busy for idle-aware IPI targeting.
+        crate::ke::smp::set_halting(prcb.number as usize, next == prcb.idle_thread);
         // Future user-mode entries from `next` must land on its stack: both
         // the TSS RSP0 (used by interrupts) and the per-CPU syscall stack.
         crate::ke::gdt::set_kernel_stack((*next).stack_top);

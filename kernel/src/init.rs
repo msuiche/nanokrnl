@@ -849,6 +849,26 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
                 ke::scheduler::steal_count() > steals_before
             );
 
+            // --- Smp III: idle-aware IPI targeting ---------------------------
+            // The APs are back to idling (halting), so readying one thread
+            // must nudge *idle* processors only — the broadcast fallback is
+            // for when nothing is idle.
+            {
+                let idle0 = ke::smp::idle_ipis_sent();
+                let bcast0 = crate::hal::apic::broadcast_ipis_sent();
+                extern "C" fn noop(ctx: *mut core::ffi::c_void) -> ! {
+                    let _ = ctx;
+                    ps::ps_terminate_system_thread();
+                }
+                let t = ps::ps_create_system_thread(noop, core::ptr::null_mut()).expect("ipi test");
+                unsafe { ke::dispatcher::ke_wait_for_single_object(&raw mut (*t).tcb.header) };
+                check!(
+                    "Smp: dispatch IPIs target idle processors (no broadcast storm)",
+                    ke::smp::idle_ipis_sent() > idle0
+                        && crate::hal::apic::broadcast_ipis_sent() == bcast0
+                );
+            }
+
             // --- Smp II: TLB shootdown ------------------------------------
             // The APs are back to idling in the kernel address space, so a
             // shootdown for it must be acked by every online CPU but us.
