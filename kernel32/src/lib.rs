@@ -4920,6 +4920,27 @@ pub unsafe extern "C" fn KiUserExceptionDispatcher(
     record: *const ExceptionRecord,
     context: *mut Context,
 ) -> ! {
+    // Vectored handlers first (NT's order), then frame-based SEH — a resumed
+    // thread never comes back here.
+    if veh_dispatch(record, context) {
+        core::hint::unreachable_unchecked();
+    }
+    if seh_dispatch(record, context) {
+        core::hint::unreachable_unchecked();
+    }
+    // Unhandled: terminate with the exception code as the exit status — the
+    // same fate an unhandled user fault always had in this kernel.
+    let code = (*record).code as u64;
+    loop {
+        syscall3(NT_TERMINATE_THREAD, code, 0, 0);
+    }
+}
+
+/// The vectored-handler walk, callable outside the trap path (software
+/// exceptions raised through `RaiseException` take the same route). True
+/// when a handler resumed the thread through `NtContinue` (in practice it
+/// never returns); false when nobody took it and the SEH walk is next.
+unsafe fn veh_dispatch(record: *const ExceptionRecord, context: *mut Context) -> bool {
     let ptrs = ExceptionPointers { record, context };
     // Snapshot under the lock (a handler may itself add/remove), then invoke
     // most-recent-first.
@@ -4950,18 +4971,7 @@ pub unsafe extern "C" fn KiUserExceptionDispatcher(
             break;
         }
     }
-    // No vectored handler took it: frame-based SEH gets its turn — walk the
-    // call stack through .pdata, invoking frame handlers (`RtlDispatchException`
-    // semantics). A resumed thread never comes back here.
-    if seh_dispatch(record, context) {
-        core::hint::unreachable_unchecked();
-    }
-    // Unhandled: terminate with the exception code as the exit status — the
-    // same fate an unhandled user fault always had in this kernel.
-    let code = (*record).code as u64;
-    loop {
-        syscall3(NT_TERMINATE_THREAD, code, 0, 0);
-    }
+    false
 }
 
 // --- Frame-based SEH: .pdata lookup and unwinding ---------------------------
@@ -5302,31 +5312,78 @@ unsafe fn leaf_step(ctx: &mut Context, establisher_frame: &mut u64) -> bool {
 }
 
 
+
+/// Find the module (any loaded PE: the process image or a shim DLL) that
+/// contains `rip`, by walking its loader-list entry or, for the shims,
+/// scanning down from `rip` for the MZ header — the poor man's inverted
+/// function table (NT keeps the real one; a page-granular scan is the same
+/// answer at our scale). Returns (image_base, size_of_image).
+unsafe fn module_from_rip(rip: u64) -> Option<(u64, u64)> {
+    unsafe {
+        if let Some((base, size)) = app_module() {
+            if rip >= base && rip < base + size {
+                return Some((base, size));
+            }
+        }
+        // Scan down in 16-byte steps for the MZ header of the owning image
+        // (pool-mapped images are 16-aligned, not page-aligned — a
+        // page-granular scan walks straight past them).
+        let mut addr = rip & !0xF;
+        for _ in 0..16384 {
+            let hdr = addr as *const u8;
+            if *hdr == b'M' && *hdr.add(1) == b'Z' {
+                let e_lfanew = *((hdr.add(0x3C)) as *const u32) as usize;
+                if e_lfanew < 0x1000 && *((hdr.add(e_lfanew)) as *const u32) == 0x0000_4550 {
+                    let opt = hdr.add(e_lfanew + 4 + 20);
+                    let size = *((opt.add(56)) as *const u32) as u64;
+                    if size != 0 {
+                        return Some((addr, size));
+                    }
+                }
+            }
+            addr = addr.checked_sub(0x10)?;
+        }
+        None
+    }
+}
+
 /// `RtlDispatchException`'s frame walk: from the faulting context outward,
 /// invoking each frame's handler until one resumes the thread (or the walk
 /// runs out of frames). Returns true when the thread was resumed through
 /// `NtContinue`; false to fall through to the unhandled path.
+
 unsafe fn seh_dispatch(record: *const ExceptionRecord, context: *mut Context) -> bool {
     unsafe {
-        let Some((image_base, size)) = app_module() else { return false };
-        let Some((pdata, count)) = module_pdata(image_base) else { return false };
         // Dispatch works on a copy: handlers may modify it, and NtContinue
         // consumes it — the caller's context stays pristine on failure.
         let mut ctx = core::ptr::read(context);
         let mut establisher = 0u64;
         for _ in 0..64 {
             // Bounded walk: malformed metadata must not loop forever.
-            let rva = ctx.rip.wrapping_sub(image_base);
+            let Some((image_base, size)) = module_from_rip(ctx.rip) else {
+                if !leaf_step(&mut ctx, &mut establisher) {
+                    return false;
+                }
+                continue;
+            };
+            for off in [0x6000u64, 0x7000, 0x7800, 0x8000, 0x8400, 0x8800, 0x9000] {
+            }
+            let Some((pdata, count)) = module_pdata(image_base) else {
+                if !leaf_step(&mut ctx, &mut establisher) {
+                    return false;
+                }
+                continue;
+            };
+            let rva = ctx.rip - image_base;
             if rva >= size {
-                // Not in the covered module: try the leaf rule (the frame
-                // might still be a leaf in our module's caller chain) —
-                // outside it, the walk ends unhandled.
                 if !leaf_step(&mut ctx, &mut establisher) {
                     return false;
                 }
                 continue;
             }
             let Some(rf) = lookup_function_entry(pdata, count, rva) else {
+                // No RUNTIME_FUNCTION covers it: a leaf frame — step to the
+                // caller by the return address on the stack.
                 if !leaf_step(&mut ctx, &mut establisher) {
                     return false;
                 }
@@ -5418,8 +5475,12 @@ pub unsafe extern "C" fn RtlUnwindEx(
         rec.flags |= EXCEPTION_UNWINDING;
         let record = &rec as *const ExceptionRecord;
 
-        let Some((image_base, size)) = app_module() else { return false };
-        let Some((pdata, count)) = module_pdata(image_base) else { return false };
+        let Some((image_base, size)) = app_module() else {
+            return false;
+        };
+        let Some((pdata, count)) = module_pdata(image_base) else {
+            return false;
+        };
 
         for _ in 0..64 {
             let rva = ctx.rip.wrapping_sub(image_base);
@@ -5476,5 +5537,111 @@ pub unsafe extern "C" fn RtlUnwindEx(
         ctx.rax = retval;
         syscall3(NT_CONTINUE, &mut ctx as *mut Context as u64, 0, 0);
         false
+    }
+}
+
+// --- Software exceptions: RaiseException -------------------------------------
+//
+// Hardware faults arrive at `KiUserExceptionDispatcher` via the kernel; a
+// *software* exception (`RaiseException`, C++ `throw`) is raised by user code
+// itself and takes the same dispatch path — the context is the raiser's
+// registers, captured here in the entry assembly before anything clobbers
+// them (the same trick as `longjmp`'s context build).
+
+/// `RaiseException(code, flags, nparams, params)` — the Win32 software
+/// exception raise. A continuable exception nobody handles returns to the
+/// caller; anything else (handled, or noncontinuable unhandled) never comes
+/// back here.
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "C" fn RaiseException(
+    _code: u32,
+    _flags: u32,
+    _nparams: u32,
+    _params: *const u64,
+) -> ! {
+    core::arch::naked_asm!(
+        // rcx = code, rdx = flags, r8 = nparams, r9 = params. Keep them in
+        // nonvolatiles, build the CONTEXT on the stack, call the worker.
+        "push rbx",
+        "push rdi",
+        "push rsi",
+        "mov rbx, rcx",        // code
+        "mov esi, edx",        // flags
+        "mov edi, r8d",        // nparams
+        "sub rsp, 0x4E0",      // CONTEXT (0x4D0) + params slot
+        "mov [rsp + 0x4D0], r9",
+        // Zero the context.
+        "mov rdi, rsp",
+        "xor eax, eax",
+        "mov ecx, 0x9A",
+        "rep stosq",
+        // ctx.rip = the raiser's return address (entry [rsp]; +3 pushes +0x4E0)
+        "mov rax, [rsp + 0x4F8]",
+        "mov [rsp + 0xF8], rax",
+        // ctx.rsp = raiser's rsp
+        "lea rax, [rsp + 0x4F8 + 8]",
+        "mov [rsp + 0x98], rax",
+        // Nonvolatiles as-is at entry (the raiser's values).
+        "mov [rsp + 0xA0], rbp",
+        "mov rax, [rsp + 0x4F0]", // saved rbx
+        "mov [rsp + 0x90], rax",
+        "mov rax, [rsp + 0x4E8]", // saved rdi
+        "mov [rsp + 0xB0], rax",
+        "mov rax, [rsp + 0x4E0]", // saved rsi
+        "mov [rsp + 0xA8], rax",
+        "mov [rsp + 0xD8], r12",
+        "mov [rsp + 0xE0], r13",
+        "mov [rsp + 0xE8], r14",
+        "mov [rsp + 0xF0], r15",
+        // worker(code, flags, nparams, params, ctx)
+        "mov rcx, rbx",
+        "mov edx, esi",
+        "mov r8d, edi",
+        "mov r9, [rsp + 0x4D0]",
+        "mov [rsp + 0x20], rsp", // arg5 = &ctx
+        "call {worker}",
+        // The worker returned: a continuable exception nobody handled. Head
+        // back to the raiser's caller.
+        "add rsp, 0x4E0",
+        "pop rsi",
+        "pop rdi",
+        "pop rbx",
+        "ret",
+        worker = sym raise_dispatch,
+    )
+}
+
+
+/// The `RaiseException` worker: build the record and run the dispatch.
+fn raise_dispatch(code: u32, flags: u32, nparams: u32, params: *const u64, ctx: &mut Context) {
+    let mut rec = ExceptionRecord {
+        code,
+        flags,
+        record: 0,
+        address: ctx.rip,
+        number_parameters: nparams,
+        _pad: 0,
+        information: [0; 15],
+    };
+    unsafe {
+        if !params.is_null() {
+            for i in 0..(nparams as usize).min(15) {
+                rec.information[i] = *params.add(i);
+            }
+        }
+        let record = &rec as *const ExceptionRecord;
+        if veh_dispatch(record, ctx) {
+            return;
+        }
+        if seh_dispatch(record, ctx) {
+            return;
+        }
+        if flags & 1 == 0 {
+            return; // continuable and unhandled: return to the raiser
+        }
+        loop {
+            syscall3(NT_TERMINATE_THREAD, code as u64, 0, 0);
+        }
     }
 }

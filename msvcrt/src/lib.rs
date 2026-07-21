@@ -22,6 +22,7 @@ use core::ffi::c_void;
 
 // System-service numbers (must match kernel `syscalls.rs`).
 const NT_TERMINATE_THREAD: u32 = 0;
+const NT_DEBUG_WRITE: u32 = 1;
 const NT_WRITE_FILE: u32 = 2;
 const NT_CREATE_FILE: u32 = 3;
 const NT_CLOSE: u32 = 4;
@@ -2129,3 +2130,343 @@ unsafe extern "C" {
         history: *mut c_void,
     ) -> bool;
 }
+
+// --- C++ EH: _CxxThrowException, __std_terminate, __CxxFrameHandler3 --------
+//
+// The MSVC C++ exception machinery: `throw` calls `_CxxThrowException`,
+// which raises a software exception through kernel32's `RaiseException`
+// (our first cross-DLL call); every function with a `try` carries
+// `__CxxFrameHandler3` in its `.xdata`, and the dispatch walk calls it per
+// frame. The handler walks the function's C++ metadata: the ip→state map
+// (where in the function are we), the unwind map (destructors to run
+// between states), and the try-block map with its catch arrays (whose
+// TypeDescriptors match the thrown type, via the compiler-generated
+// catchable-type array — hierarchy compatibility included).
+
+/// The MSVC C++ exception code ('msc' | 0xE0000000).
+const CXX_EXCEPTION: u32 = 0xE06D7363;
+/// `EXCEPTION_NONCONTINUABLE` — C++ exceptions must be handled.
+const EH_NONCONTINUABLE: u32 = 1;
+/// The throw-info magic (params[0] of a C++ exception record).
+const CXX_MAGIC: u64 = 0x19930520;
+/// `__CxxFrameHandler3`'s FuncInfo magic (0x19930520..22 accepted).
+fn funcinfo_magic_ok(m: u32) -> bool {
+    (0x19930520..=0x19930522).contains(&m)
+}
+
+unsafe extern "C" {
+    /// kernel32's software-raise (see the RtlUnwindEx import above).
+    fn RaiseException(code: u32, flags: u32, nparams: u32, params: *const u64) -> !;
+}
+
+/// `_CxxThrowException(pExceptionObject, pThrowInfo)` — what `throw`
+/// compiles to. Raises the C++ exception; only returns if a continuable
+/// raise comes back unhandled (never for C++ EH).
+#[no_mangle]
+pub unsafe extern "C" fn _CxxThrowException(obj: *mut c_void, throw_info: *mut c_void) -> ! {
+    let params = [CXX_MAGIC, obj as u64, throw_info as u64, 0];
+    RaiseException(CXX_EXCEPTION, EH_NONCONTINUABLE, 4, params.as_ptr());
+}
+
+/// `__std_terminate()` — no handler anywhere (e.g. a throw out of a
+/// noexcept function): the process dies. NT calls the unhandled-exception
+/// machinery; our fate is the same terminate path.
+#[no_mangle]
+pub unsafe extern "C" fn __std_terminate() -> ! {
+    loop {
+        syscall3(NT_TERMINATE_THREAD, 0xE06D7363u64 & !0xffff_ffff, 0, 0);
+        syscall3(NT_TERMINATE_THREAD, 0xE06D7363u64, 0, 0);
+    }
+}
+
+/// `ip→state` map entry: from this code RVA, the function is in `state`.
+#[repr(C)]
+struct IpToState {
+    ip: u32,
+    state: i32,
+}
+/// Unwind map entry: run `action` (a destructor thunk, code RVA or 0), go
+/// to `to_state`.
+#[repr(C)]
+struct UnwindMapEntry {
+    to_state: i32,
+    action: u32,
+}
+/// Try-block map entry: while in states `try_low+1 ..= try_high`, a match
+/// may land in one of this block's catches; `catch_high` is the state after
+/// the catch completes.
+#[repr(C)]
+struct TryBlock {
+    try_low: i32,
+    try_high: i32,
+    catch_high: i32,
+    n_catches: i32,
+    catch_array: u32, // RVA
+}
+/// One catch: its TypeDescriptor RVA, the frame slot for the caught object,
+/// and the catch-block code RVA.
+#[repr(C)]
+struct CatchInfo {
+    adjectives: u32,
+    type_rva: u32,
+    catch_obj_offset: i32,
+    handler_rva: u32,
+    frame_rva: u32,
+}
+/// The thrown object's catchable-type array (hierarchy included).
+#[repr(C)]
+struct CatchableTypeArray {
+    n: i32,
+    rva: [u32; 1],
+}
+/// One catchable type: its TypeDescriptor RVA and its byte size.
+#[repr(C)]
+struct CatchableType {
+    properties: u32,
+    type_rva: u32,
+    disp0: i32,
+    disp1: i32,
+    disp2: i32,
+    size: i32,
+    copy_fn: u32,
+}
+/// The throw info (`_ThrowInfo`): attributes, the exception object's
+/// destructor RVA, a forward-compat hook, then the catchable-type array RVA.
+#[repr(C)]
+struct ThrowInfo {
+    attributes: u32,
+    pmfn: u32,
+    forward_compat: u32,
+    catch_compat: u32, // RVA to CatchableTypeArray
+}
+
+/// The dispatch side's context (must match kernel32's DispatcherContext).
+#[repr(C)]
+struct CxxDispatcherContext {
+    control_pc: u64,
+    image_base: u64,
+    function_entry: u64,
+    establisher_frame: u64,
+    target_ip: u64,
+    context_record: u64,
+    language_handler: u64,
+    handler_data: u64, // FuncInfo RVA
+}
+
+/// The record head (code/flags/info) the C++ handler reads.
+#[repr(C)]
+struct CxxRecord {
+    code: u32,
+    flags: u32,
+    _record: u64,
+    _address: u64,
+    number_parameters: u32,
+    _pad: u32,
+    information: [u64; 15],
+}
+
+/// `__CxxFrameHandler3(record, frame, context, dispatcher)` — the frame
+/// handler named in a C++ module's `.xdata`.
+#[no_mangle]
+pub unsafe extern "C" fn __CxxFrameHandler3(
+    record: *const CxxRecord,
+    frame: u64,
+    _context: *mut c_void,
+    disp: *const CxxDispatcherContext,
+) -> i32 {
+    let d = &*disp;
+    // HandlerData addresses the field after the handler RVA — for C++ EH
+    // that field holds the FuncInfo's RVA (for C SEH it *is* the scope
+    // table; the layouts differ in exactly this indirection).
+    let fi = (d.image_base + *(d.handler_data as *const u32) as u64) as *const u32;
+    if !funcinfo_magic_ok(*fi) {
+        return 1; // ContinueSearch
+    }
+    let max_state = *fi.add(1) as i32;
+    let unwind_map = (d.image_base + *fi.add(2) as u64) as *const UnwindMapEntry;
+    let n_try = *fi.add(3) as i32;
+    let try_map = (d.image_base + *fi.add(4) as u64) as *const TryBlock;
+    let n_ip = *fi.add(5) as i32;
+    let ip_map = (d.image_base + *fi.add(6) as u64) as *const IpToState;
+    let rva = (d.control_pc - d.image_base) as u32;
+
+    // Current state: the greatest ip <= rva; state = its entry, -1 if none.
+    let mut state = -1i32;
+    for i in 0..n_ip as usize {
+        let e = &*ip_map.add(i);
+        if e.ip <= rva {
+            state = e.state;
+        } else {
+            break;
+        }
+    }
+    let unwinding = (*record).flags & 0x2 != 0;
+
+    if unwinding || (*record).code != CXX_EXCEPTION {
+        // Unwind path (or a foreign exception): run destructors downward.
+        let mut us = state;
+        while us >= 0 && us < max_state {
+            let e = &*unwind_map.add(us as usize);
+            if e.action != 0 {
+                let dtor: FinallyFn = core::mem::transmute(d.image_base + e.action as u64);
+                let ep = [record as u64, d.context_record];
+                dtor(ep.as_ptr(), frame);
+            }
+            let next = e.to_state;
+            if next >= us {
+                break; // corrupt map: don't spin
+            }
+            us = next;
+        }
+        return 1; // ContinueSearch
+    }
+
+    // A C++ throw: find the try block covering this state. The try-body
+    // states are `try_low ..= try_high` inclusive — `try_low == try_high`
+    // is a try with no enclosing state (the common outermost case).
+    let params = &(*record).information;
+    let obj = params[1];
+    let throw_info = params[2] as *const ThrowInfo;
+    for t in 0..n_try as usize {
+        let tb = &*try_map.add(t);
+        if state >= tb.try_low && state <= tb.try_high {
+            // Check each catch against the thrown type's catchable array.
+            let catches = (d.image_base + tb.catch_array as u64) as *const CatchInfo;
+            let cta = (d.image_base + (*throw_info).catch_compat as u64) as *const CatchableTypeArray;
+            let n_ct = (*cta).n as usize;
+            for c in 0..tb.n_catches as usize {
+                let ci = &*catches.add(c);
+                if ci.type_rva == 0 {
+                    // catch(...) — no type check, no object.
+                    unwind_to_state(unwind_map, state, tb.try_low - 1, record, frame, d);
+                    return take_catch(d, ci, obj, frame, None, record);
+                }
+                for k in 0..n_ct {
+                    let ct = &*((d.image_base + (*cta).rva[k] as u64) as *const CatchableType);
+                    if ct.type_rva == ci.type_rva {
+                        // The MS order: run this frame's try-body
+                        // destructors (__FrameUnwindToState), build the
+                        // catch object, then call the catch funclet.
+                        unwind_to_state(unwind_map, state, tb.try_low - 1, record, frame, d);
+                        return take_catch(d, ci, obj, frame, Some(ct), record);
+                    }
+                }
+            }
+        }
+    }
+    1 // ContinueSearch
+}
+
+/// `__FrameUnwindToState`: run the unwind map's destructors from `state`
+/// down to `target` — the pre-catch cleanup of the try body's locals.
+unsafe fn unwind_to_state(
+    unwind_map: *const UnwindMapEntry,
+    mut state: i32,
+    target: i32,
+    record: *const CxxRecord,
+    frame: u64,
+    d: &CxxDispatcherContext,
+) {
+    while state > target && state >= 0 {
+        let e = &*unwind_map.add(state as usize);
+        if e.action != 0 {
+            let dtor: FinallyFn = core::mem::transmute(d.image_base + e.action as u64);
+            let ep = [record as u64, d.context_record];
+            dtor(ep.as_ptr(), frame);
+        }
+        let next = e.to_state;
+        if next >= state {
+            break; // corrupt map: don't spin
+        }
+        state = next;
+    }
+}
+
+/// Land a catch: build the caught object in the frame slot (by-value
+/// catches copy the object's bytes from the matching CatchableType's
+/// size, references take the pointer, and an offset of 0 means the catch
+/// names no variable), then call the catch *funclet* — the handler RVA
+/// is not resumed directly: it is CALLED with rdx = the establisher
+/// frame, runs the catch body, and returns the continuation address
+/// (normal flow after the try/catch) in rax. Resume there.
+fn take_catch(
+    d: &CxxDispatcherContext,
+    ci: &CatchInfo,
+    obj: u64,
+    frame: u64,
+    ct: Option<&CatchableType>,
+    record: *const CxxRecord,
+) -> i32 {
+    unsafe {
+        let ctx = d.context_record as *mut u8;
+        if ci.catch_obj_offset != 0 {
+            let slot = frame.wrapping_add(ci.catch_obj_offset as u64);
+            if ci.adjectives & 0x8 != 0 {
+                *(slot as *mut u64) = obj; // caught by reference
+            } else if let Some(c) = ct {
+                if c.copy_fn != 0 {
+                    // A copy-constructor thunk: fn(dest, src).
+                    let cf: extern "C" fn(*mut u8, u64) =
+                        core::mem::transmute(d.image_base + c.copy_fn as u64);
+                    cf(slot as *mut u8, obj);
+                } else {
+                    core::ptr::copy_nonoverlapping(
+                        obj as *const u8,
+                        slot as *mut u8,
+                        c.size as usize,
+                    );
+                }
+            }
+        }
+        let funclet: extern "C" fn(*const CxxRecord, u64) -> u64 =
+            core::mem::transmute(d.image_base + ci.handler_rva as u64);
+        let cont = funclet(record, frame);
+        *((ctx.add(0xF8)) as *mut u64) = cont; // CONTEXT::Rip
+        0 // ExceptionContinueExecution
+    }
+}
+
+// --- C++ RTTI: const type_info::vftable --------------------------------------
+//
+// Every RTTI TypeDescriptor references the CRT's `type_info` vtable
+// (`??_7type_info@@6B@`). MSVC's type_info has a virtual destructor and a
+// non-virtual `operator==` (name comparison); the EH machinery compares
+// TypeDescriptor *pointers* for catch matching (we do the same in
+// `__CxxFrameHandler3`), so the vtable exists for linkage completeness,
+// with real semantics behind the entries anyway.
+
+/// `type_info::~type_info` (trivial).
+unsafe extern "C" fn type_info_dtor(_this: *mut c_void) {}
+
+/// `type_info::operator==` — compare the decorated names (at this+16:
+/// vptr(8) + spare(8) precede the name bytes).
+unsafe extern "C" fn type_info_operator_eq(this: *const u8, other: *const u8) -> i32 {
+    unsafe {
+        let a = this.add(16);
+        let b = other.add(16);
+        let mut i = 0;
+        loop {
+            let (x, y) = (*a.add(i), *b.add(i));
+            if x != y {
+                return 0;
+            }
+            if x == 0 {
+                return 1;
+            }
+            i += 1;
+        }
+    }
+}
+
+/// `const type_info::vftable` — the decorated export name every RTTI
+/// TypeDescriptor points at.
+#[export_name = "??_7type_info@@6B@"]
+pub static TYPE_INFO_VTABLE: SyncVtable = SyncVtable([
+    type_info_dtor as *const (),
+    type_info_operator_eq as *const (),
+]);
+
+/// A vtable is read-only after linking; the raw pointers are fine to share.
+#[repr(C)]
+pub struct SyncVtable(pub [*const (); 2]);
+unsafe impl Sync for SyncVtable {}

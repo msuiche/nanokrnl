@@ -168,15 +168,18 @@ pub fn register_shim_data(image: &[u8], base: u64) {
     // SMAP, so bracket the snapshot copy.
     crate::mm::virt::user_access_begin();
     for &(rva, vsize) in secs.iter().take(n) {
-        // Page-align the span (privatization works per 4 KiB page).
-        let lo = rva as u64 & !0xFFF;
-        let hi = (rva as u64 + vsize as u64 + 0xFFF) & !0xFFF;
-        let len = (hi - lo) as usize;
+        // Align the span to the page grid *of the mapped image* (bases are
+        // 16-aligned, not page-aligned): the seed must cover every page the
+        // privatizer walks, or the region's boundary page gets a zeroed
+        // private copy (this zeroed msvcrt's .pdata, whose first page
+        // shares a page with .data's tail).
+        let va = (base + rva as u64) & !0xFFF;
+        let len = ((base + rva as u64 + vsize as u64 + 0xFFF) & !0xFFF) - va;
+        let len = len as usize;
         if sd.n >= MAX_SHIM_REGIONS || sd.total + len > SHIM_DATA_MAX {
             break;
         }
         let off = sd.total;
-        let va = base + lo;
         unsafe {
             core::ptr::copy_nonoverlapping(va as *const u8, sd.snapshot[off..].as_mut_ptr(), len);
         }

@@ -150,6 +150,13 @@ fn main() {
         "no_sehtest.bin",
         "NTOS_SEHTEST_IMAGE",
     );
+    // cpptest.exe — a clang++-built C++ binary (throw/catch/dtor unwind,
+    // scripts/build-cpptest.sh) for the C++ EH boot test.
+    resolve(
+        workspace.join("cpptest").join("cpptest.exe"),
+        "no_cpptest.bin",
+        "NTOS_CPPTEST_IMAGE",
+    );
 
     println!("cargo:rerun-if-changed=build.rs");
 }

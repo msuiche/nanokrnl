@@ -1898,3 +1898,70 @@ model is complete for the clang/MSVC v1 metadata surface. Remaining
 polish: C++ EH (`__CxxFrameHandler3` + `_CxxThrowException`) for
 C++-compiled tools, and the MSVC-layout scope-table variant if a real
 MSVC binary ever needs recovery.
+
+### 2026-07-21 - C++ EH: throw, catch, and destructor unwinding
+
+The last exception-machinery gap closes: a clang++ binary can now
+`throw` and `catch` through the real MSVC v1 metadata surface, with
+destructors running on the way out. cpptest.exe (clang++ -O1
+-fexceptions, `scripts/build-cpptest.sh`) exercises four cases in the
+boot suite — exact-type catch, destructor unwinding, a nested wrong
+handler skipped, and catch(...) — and the kernel asserts the exit
+bitmask 0xF.
+
+- **kernel32: `RaiseException`** (exported, naked + worker): captures
+  the caller's context and runs the dispatch walk for *software*
+  exceptions — the same per-frame `.pdata` walk the fault path uses,
+  with the VEH chain first, then the frame handlers. The walk's
+  module resolution now happens **per frame** (`module_from_rip`:
+  the PEB loader list, else an MZ scan in 16-byte steps — pool-mapped
+  images are 16-aligned, not page-aligned; a page-granular scan walked
+  past them into supervisor pages). This is also msvcrt's first
+  **cross-DLL import into kernel32's RaiseException** — exactly like
+  real msvcrt raising through kernel32/ntdll.
+- **msvcrt: `_CxxThrowException`** — synthesizes the MS record
+  (code 0xE06D7363, NONCONTINUABLE, params
+  `[0x19930520, obj, throw_info, 0]`) and raises it. Plus
+  `__std_terminate` and the `const type_info::vftable` data export
+  (`??_7type_info@@6B@`) every RTTI TypeDescriptor points at — a real
+  DATA export, which dlltool's .def route can't express, so the build
+  now runs lld's `/IMPLIB` for the import library.
+- **msvcrt: `__CxxFrameHandler3`** — the frame handler named in a C++
+  module's `.xdata`. Parses the FuncInfo (magic 0x19930522), maps the
+  control IP to a state via the ip2state table, and on a C++ throw
+  searches the try-block map for a state-covering block, then matches
+  the thrown type's CatchableTypeArray against each catch's
+  TypeDescriptor (identity). On a match it follows the MS order:
+  `__FrameUnwindToState` runs the try body's destructors, the catch
+  object is built in the frame slot (by-value copies the object's
+  bytes via the CatchableType's size/copy-thunk; references take the
+  pointer; offset 0 means the catch names no variable), and the catch
+  **funclet** is CALLED with rdx = the establisher frame — it runs
+  the catch body and returns the continuation address in rax, which
+  becomes the resumed Rip. The unwinding path (EXCEPTION_UNWINDING)
+  walks the unwind map downward running dtors.
+- **Three metadata lessons the hardware taught**: (1) `_ThrowInfo` has
+  FOUR fields — `pForwardCompat` sits between the destructor RVA and
+  the CatchableTypeArray RVA; a three-field struct read the array RVA
+  as 0 and parsed the MZ header as catchable types. (2) clang's
+  outermost try blocks are `try_low == try_high` with the throw state
+  equal to `try_low` — the try-body match is inclusive at both ends.
+  (3) The catch handler RVA is a funclet that must be called, not a
+  resume target — resuming at it directly sent its final `ret` to
+  garbage. Also fixed along the way: `UWOP_SET_FPREG`'s register comes
+  from the UNWIND_INFO header (not the opinfo), and the privatization
+  seed must align regions to the mapped image's own page grid.
+- **The funclet protocol, from the disassembly**: the catch funclet
+  homes rdx, rebuilds rbp = rdx + 0x50, reads the catch object at
+  [rbp + 4] (= establisher + dispCatchObj), runs the body, loads the
+  post-try/catch continuation into rax, and rets — the runtime calls
+  it and resumes at the returned address. Destructor thunks use the
+  same rdx = establisher convention as __finally funclets.
+
+Boot suite: the three new Seh checks (cpptest created / ran to exit /
+bitmask 0xF) sit next to the five C-SEH case checks. Verified: QEMU
+suite three consecutive PASSes; host 18+2+7; emu 36/36; nanox pipe
+session clean. Remaining EH polish: second-pass unwinding of
+*intermediate* frames between the throw and the catch (a no-op for
+the tests — no intermediate dtors), catch objects that need real copy
+constructors with side effects, and the MSVC-layout scope tables.

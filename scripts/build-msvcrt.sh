@@ -32,6 +32,9 @@ done
 for name in $DATA; do
     EXPORT_ARGS="$EXPORT_ARGS -Clink-arg=/EXPORT:$name,DATA"
 done
+# The RTTI vtable is a data export under its decorated name (referenced by
+# every TypeDescriptor in C++-compiled consumers).
+EXPORT_ARGS="$EXPORT_ARGS -Clink-arg=/EXPORT:??_7type_info@@6B@,DATA"
 echo "msvcrt exports: $FUNCS $EXPNAMES (data: $DATA)"
 
 # The kernel32 import library, so msvcrt can call kernel32's RtlUnwindEx —
@@ -47,7 +50,7 @@ K32DEF=msvcrt/kernel32.def
 "$DLLTOOL" -m i386:x86-64 -d "$K32DEF" -l msvcrt/kernel32.lib -D kernel32.dll
 
 cd msvcrt
-RUSTFLAGS="-Clink-arg=/dll -Clink-arg=/entry:DllMain -Clink-arg=/nodefaultlib -Clink-arg=$WS/msvcrt/kernel32.lib $EXPORT_ARGS" \
+RUSTFLAGS="-Clink-arg=/dll -Clink-arg=/entry:DllMain -Clink-arg=/nodefaultlib -Clink-arg=$WS/msvcrt/kernel32.lib -Clink-arg=/implib:$WS/msvcrt/msvcrt.lib $EXPORT_ARGS" \
     "$CARGO" +nightly build --release
 
 cp target/x86_64-pc-windows-msvc/release/msvcrt.dll ./msvcrt.dll

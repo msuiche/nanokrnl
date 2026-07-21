@@ -2075,6 +2075,27 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
         );
     }
 
+    // --- Seh: C++ exceptions (throw/catch/destructor unwind) --------------
+    // cpptest.exe (clang++, real MS C++ EH): throw -> _CxxThrowException ->
+    // RaiseException -> the dispatch walk -> __CxxFrameHandler3 -> the catch
+    // block, with the destructor running on the way out. Exit bitmask: bit 0
+    // = exact-type catch, bit 1 = destructor ran, bit 2 = wrong handler
+    // skipped, bit 3 = catch(...).
+    if !CPPTEST_IMAGE.is_empty() {
+        let h = create_user_process(CPPTEST_IMAGE, b"cpptest.exe", [0, 0, 0]);
+        check!("Seh: cpptest.exe process created", h != 0);
+        let st = wait_user_process(h, 5000);
+        let code = user_process_exit_code(h);
+        unsafe {
+            mm::virt::mm_switch_address_space(mm::virt::mm_kernel_address_space());
+        }
+        check!("Seh: cpptest ran to exit", st == 0);
+        check!(
+            "Seh: C++ throw/catch/unwind all behaved (exact type, dtor, nesting, catch-all)",
+            code == 0xF
+        );
+    }
+
     // --- Experimental: run a REAL Windows console binary (sort.exe) -----
     // Loads an unmodified Microsoft sort.exe and binds its kernel32/msvcrt/
     // ntdll imports to our shims. stdin is /dev/null here (no EOF), so sort
@@ -2339,6 +2360,10 @@ pub(crate) const HIVE_IMAGE: &[u8] = include_bytes!(env!("NTOS_HIVE_IMAGE"));
 /// (`__try/__except/__finally`), the validation vehicle for the shim's
 /// `.pdata` unwinder (`scripts/build-sehtest.sh`). Empty when not built.
 static SEHTEST_IMAGE: &[u8] = include_bytes!(env!("NTOS_SEHTEST_IMAGE"));
+/// `cpptest.exe` — a clang++-built C++ binary with real C++ exceptions
+/// (`throw`/`catch`/destructor unwind), the validation vehicle for
+/// `_CxxThrowException` + `__CxxFrameHandler3` (`scripts/build-cpptest.sh`).
+static CPPTEST_IMAGE: &[u8] = include_bytes!(env!("NTOS_CPPTEST_IMAGE"));
 /// `more.com` — the console pager (a PE despite the `.com` name). Needs
 /// `ulib.dll` to actually run; embedded so it can be enumerated and launched
 /// once dependent-DLL loading exists.
