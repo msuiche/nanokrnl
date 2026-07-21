@@ -3,6 +3,10 @@
 # SEH (__try/__except/__finally), compiled with clang (MSVC ABI) and linked
 # against the shim import libraries. Produces sehtest/sehtest.exe, which the
 # kernel's build.rs embeds for the SEH boot self-test.
+#
+# -fasync-exceptions is required: without it clang treats hardware faults
+# (the AVs this test raises) as outside the SEH model and emits no handler
+# metadata at all (/EHsc vs /EHa on MSVC).
 set -eu
 cd "$(dirname "$0")/.."
 WS="$PWD"
@@ -22,9 +26,10 @@ gen_implib() {
     "$DLLTOOL" -m i386:x86-64 -d "$def" -l "$lib" -D "$dll"
 }
 gen_implib kernel32/src/lib.rs kernel32.dll kernel32
+gen_implib msvcrt/src/lib.rs   msvcrt.dll   msvcrt
 
-"$CLANG" --target=x86_64-pc-windows-msvc -O1 -fno-stack-protector \
+"$CLANG" --target=x86_64-pc-windows-msvc -O1 -fasync-exceptions -fno-stack-protector \
     -c sehtest/sehtest.c -o target/sehtest.obj
 "$LLD_LINK" /subsystem:console /entry:mainCRTStartup /nodefaultlib \
-    /out:sehtest/sehtest.exe target/sehtest.obj "$WS/sehtest/kernel32.lib"
+    /out:sehtest/sehtest.exe target/sehtest.obj "$WS/sehtest/kernel32.lib" "$WS/sehtest/msvcrt.lib"
 ls -l sehtest/sehtest.exe

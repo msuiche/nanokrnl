@@ -1,60 +1,49 @@
-// sehtest.c — frame-based SEH end-to-end test.
+// sehtest.c — frame-based SEH end-to-end test, through the real CRT handler.
 //
-// Proves the whole OS-side SEH path on real clang-emitted .pdata metadata:
-// exception delivery -> RtlLookupFunctionEntry -> RtlVirtualUnwind (incl.
-// the leaf rule) -> frame-handler invocation per frame -> NtContinue.
+// Exercises the full chain: kernel exception delivery -> the kernel32 shim's
+// RtlLookupFunctionEntry + RtlVirtualUnwind + frame-handler dispatch -> the
+// msvcrt shim's `__C_specific_handler` (the scope-table walk) -> __except
+// blocks and a __finally funclet emitted by clang's WinEH.
 //
-// The twist: this binary carries its OWN frame handler (`__C_specific_handler`
-// below — frame handlers are pluggable, the .xdata handler field just names
-// a function). It dispatches on a global "which try am I in" marker instead
-// of walking a scope table, so the test validates the OS machinery without
-// depending on any toolchain's scope-table layout. The __try/__except
-// constructs exist to make clang emit real UNWIND_INFO (EHANDLER/UHANDLER
-// flags, handler RVA) for the marked functions; the recovery actions live
-// in the handler + flags, and the continuations check the flags.
+// Every filter is a real function (opaque to the folder) and every flag is
+// set inside the block it proves ran — so a green line means the machinery
+// truly dispatched into that block, not just that the code exists.
 //
-// Built with clang (MSVC ABI) — see scripts/build-sehtest.sh.
+// Built with clang -fasync-exceptions (required: without it clang treats
+// hardware faults as outside the SEH model and emits no handler metadata).
+// See scripts/build-sehtest.sh.
 
 typedef unsigned long long u64;
 typedef unsigned int u32;
 typedef int i32;
 
-#define NULL ((void*)0)
-// EXCEPTION_DISPOSITION
-#define ExceptionContinueExecution 0
-#define ExceptionContinueSearch 1
+#define EXCEPTION_EXECUTE_HANDLER 1
+#define EXCEPTION_CONTINUE_SEARCH 0
+
+// msvcrt shim import: the frame handler named in our .xdata.
+__declspec(dllimport) int __C_specific_handler(void*, u64, void*, void*);
 
 // kernel32 shim imports
 __declspec(dllimport) u64 __stdcall GetStdHandle(u32);
 __declspec(dllimport) i32 __stdcall WriteConsoleA(u64, const void*, u32, u32*, u64);
 __declspec(dllimport) void __stdcall ExitProcess(u32);
 
-// CONTEXT, trimmed to the one field the handler rewrites (rip @ 0xF8).
-typedef struct { char pad[0xF8]; u64 rip; } ContextRip;
+// The SEH filter-context intrinsic (excpt.h, declared manually: freestanding).
+unsigned long _exception_code(void);
 
-static volatile int g_active_case;  // which __try region is live (1..4)
-static volatile int g_finally_ran;  // handler ran for the __finally frame
-static volatile int g_rec[5];       // handler recovered case i
-static volatile int g_dummy;        // keeps the funclets un-eliminable
-static u64 g_cont[5];               // continuation label addresses
+static volatile u32 g_seen_code;
+static volatile int g_finally_ran;
+static volatile int g_inner_ran;
+static volatile int g_rec[5];
 
-// The custom frame handler: called once per handler-carrying frame during
-// the dispatch walk (that per-frame invocation is exactly what __finally and
-// __except mechanics reduce to). `frame` is the establisher frame; `ctx` is
-// the dispatch context the kernel resumes from on ContinueExecution.
-int __C_specific_handler(void* record, u64 frame, void* context, void* disp) {
-    (void)record; (void)frame; (void)disp;
-    ContextRip* ctx = (ContextRip*)context;
-    int c = g_active_case;
-    if (c == 2) {
-        g_finally_ran = 1; // the frame carrying the __finally was reached
-    }
-    if (c >= 1 && c <= 4) {
-        g_rec[c] = 1;
-        ctx->rip = g_cont[c];       // resume at the case's continuation
-        return ExceptionContinueExecution;
-    }
-    return ExceptionContinueSearch;
+// Real, non-foldable filters: one executes, one passes.
+static int filt_exec(u32 code) {
+    g_seen_code = code;
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+static int filt_pass(u32 code) {
+    g_seen_code = code;
+    return EXCEPTION_CONTINUE_SEARCH;
 }
 
 static void print(const char* s) {
@@ -71,73 +60,69 @@ static __declspec(noinline) void fault_in_callee(void) {
 }
 
 void mainCRTStartup(void) {
-    g_cont[1] = (u64)&&c1_cont;
-    g_cont[2] = (u64)&&c2_cont;
-    g_cont[3] = (u64)&&c3_cont;
-    g_cont[4] = (u64)&&c4_cont;
-
-    // Case 1: fault in a __try, recovered by the frame's handler.
-    g_active_case = 1;
+    // Case 1: fault in __try, except block runs.
     __try {
         *(volatile int*)0x1234 = 42;
-    } __except (1 /* EXECUTE_HANDLER */) {
-        g_dummy++; // the custom handler bypasses this block
+        g_rec[1] = -1; // unreached
+    } __except (filt_exec(_exception_code())) {
+        g_rec[1] = 1;
     }
-    // if the dispatch worked, the handler set g_rec[1] and jumped us here:
-c1_cont:
-    if (g_rec[1]) print("SEH: frame handler recovered a fault in __try\n");
-    else print("SEH: FAIL case1 (handler not invoked)\n");
+    if (g_rec[1] == 1 && g_seen_code == 0xC0000005)
+        print("SEH: __except block ran, filter saw the AV code\n");
+    else
+        print("SEH: FAIL case1\n");
 
-    // Case 2: a frame carrying a __finally must have its handler invoked
-    // while the walk passes through it.
-    g_active_case = 2;
+    // Case 2: the __finally funclet must run as the unwind passes its frame.
+    g_finally_ran = 0;
     __try {
         __try {
             *(volatile int*)0x1234 = 42;
         } __finally {
-            g_dummy++; // runs only under a real scope-table walk
+            g_finally_ran = 1;
         }
-    } __except (1) {
-        g_dummy++;
+    } __except (filt_exec(_exception_code())) {
+        g_rec[2] = 1;
     }
-c2_cont:
-    if (g_finally_ran) print("SEH: unwind reached the frame carrying __finally\n");
-    else print("SEH: FAIL case2 (finally frame skipped)\n");
+    if (g_rec[2] == 1 && g_finally_ran)
+        print("SEH: __finally ran during the unwind\n");
+    else
+        print("SEH: FAIL case2\n");
 
-    // Case 3: fault one leaf frame down; the walk must apply the leaf rule
-    // to reach this frame's handler.
-    g_active_case = 3;
+    // Case 3: fault one leaf frame down, recovered by the caller's except.
+    g_rec[3] = 0;
     __try {
         fault_in_callee();
-    } __except (1) {
-        g_dummy++;
+    } __except (filt_exec(_exception_code())) {
+        g_rec[3] = 1;
     }
-c3_cont:
-    if (g_rec[3]) print("SEH: leaf-rule unwind reached the caller's handler\n");
-    else print("SEH: FAIL case3 (callee fault not recovered)\n");
+    if (g_rec[3] == 1)
+        print("SEH: caller's __except caught the callee fault (virtual unwind)\n");
+    else
+        print("SEH: FAIL case3\n");
 
-    // Case 4: an inner handler passing means the walk continues outward.
-    g_active_case = 4;
+    // Case 4: an inner filter passing must let the outer handler fire.
+    g_rec[4] = 0;
+    g_inner_ran = 0;
     __try {
         __try {
             *(volatile int*)0x1234 = 42;
-        } __except (0 /* CONTINUE_SEARCH */) {
-            g_dummy++; // inner passes; must NOT recover here
+        } __except (filt_pass(_exception_code())) {
+            g_inner_ran = 1; // must NOT run
         }
-    } __except (1) {
-        g_dummy++;
+    } __except (filt_exec(_exception_code())) {
+        g_rec[4] = 1;
     }
-c4_cont:
-    if (g_rec[4]) print("SEH: nested dispatch fell through to the outer frame\n");
-    else print("SEH: FAIL case4 (nested dispatch wrong)\n");
+    if (g_rec[4] == 1 && !g_inner_ran)
+        print("SEH: nested filter passed, outer __except caught it\n");
+    else
+        print("SEH: FAIL case4\n");
 
-    g_active_case = 0;
     print("SEH: reached the end (survived all faults)\n");
-    // Exit-code bitmask for the boot self-test: bit i = case i+1 recovered.
+    // Exit-code bitmask for the boot self-test: bit i = case i+1 behaved.
     u32 mask = 0;
-    if (g_rec[1]) mask |= 1;
-    if (g_rec[2] && g_finally_ran) mask |= 2;
-    if (g_rec[3]) mask |= 4;
-    if (g_rec[4]) mask |= 8;
+    if (g_rec[1] == 1) mask |= 1;
+    if (g_rec[2] == 1 && g_finally_ran) mask |= 2;
+    if (g_rec[3] == 1) mask |= 4;
+    if (g_rec[4] == 1 && !g_inner_ran) mask |= 8;
     ExitProcess(mask);
 }

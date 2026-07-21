@@ -1757,3 +1757,44 @@ emu 36/36; nanox pipe session clean. The scheduler is now honestly
 multiprocessor in structure as well as behavior. Remaining polish:
 idle-CPU-aware IPI targeting (skip the broadcast when an idle CPU is
 marked), priority boosting/aging, and the CRT scope-table walk for SEH.
+
+### 2026-07-21 - SEH, complete: the CRT scope-table walk (__C_specific_handler)
+
+The follow-up I deliberately didn't ship unvalidated last round, now
+validated: the msvcrt shim's `__C_specific_handler` is the real thing —
+the scope-table walk that makes compiler-emitted `__try/__except/__finally`
+work end to end, and sehtest.exe drives it with zero custom machinery.
+
+- **The format, pinned empirically** (by building minimal binaries and
+  matching table bytes to disassembly): clang's WinEH scopetable is a
+  u32 count followed by **16-byte entries** `{ try_begin, try_end,
+  filter, handler }` (RVAs); `handler == 0` marks a `__finally`, and
+  nesting is by range containment, not an explicit level. And the flag
+  without which none of this exists: **`-fasync-exceptions`** — clang's
+  default treats hardware faults as outside the SEH model and emits no
+  handler metadata at all (its /EHsc), which is why the early minimal
+  tests kept coming back `flags 0`.
+- **The algorithm**: innermost containing range first; `__finally`
+  funclets run as the unwind passes them; `__except` filters evaluate
+  innermost-out; EXECUTE_HANDLER resumes the thread at the except block
+  through `NtContinue`; CONTINUE_SEARCH keeps walking. First version
+  had the nesting order inverted (shallowest first) — the `__finally`
+  got skipped until the order flipped to smallest-range-first.
+- **The funclet ABI, also pinned empirically**: rcx =
+  `&EXCEPTION_POINTERS` (the filter reads the record pointer from
+  `[rcx]`), rdx = the establisher frame (the finally funclet builds its
+  rbp from it). Passing the frame in rcx like the SDK's prose suggests
+  made every filter read garbage and pass.
+- **sehtest.exe, final form**: real filter functions, flags set inside
+  the actual `__except`/`__finally` blocks — a green line now means the
+  dispatch truly entered that block through the CRT handler.
+
+Boot suite (119 checks, unchanged count — the same four Seh checks, now
+backed by the CRT walk instead of a custom handler).
+
+Verified: QEMU suite 119/119 three consecutive times; host 18+2+7;
+emu 36/36; nanox pipe session clean. SEH is done end to end: delivery,
+VEH, .pdata unwinding, CRT scope-table dispatch. Remaining unwind
+polish: `RtlUnwindEx`/global unwind (longjmp, C++ EH), collided-unwind
+chaining, and MSVC-layout scope tables for real MSVC binaries that
+need SEH recovery (none in-tree today).

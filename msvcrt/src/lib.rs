@@ -1040,16 +1040,6 @@ pub extern "C" fn _XcptFilter(_xcpt_num: u32, _xcpt_info: *mut c_void) -> i32 {
     0 // EXCEPTION_CONTINUE_SEARCH
 }
 
-#[no_mangle]
-pub extern "C" fn __C_specific_handler(
-    _record: *mut c_void,
-    _frame: *mut c_void,
-    _context: *mut c_void,
-    _dispatch: *mut c_void,
-) -> i32 {
-    1 // ExceptionContinueSearch
-}
-
 // ---------------------------------------------------------------------------
 // Wider CRT surface for classic console tools (e.g. choice.exe): wide-string
 // parsing, a couple of stdio shims, and a wide `vsnprintf`.
@@ -1951,3 +1941,124 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 /// MSVC floating-point CRT marker (referenced by core under `/nodefaultlib`).
 #[no_mangle]
 pub static _fltused: i32 = 0;
+
+// --- Frame-based SEH: __C_specific_handler ---------------------------------
+//
+// The CRT's frame handler: given a faulting frame's `DISPATCHER_CONTEXT`
+// (from the kernel32 shim's dispatch walk), walk the function's scope table
+// and decide the disposition — call `__finally` blocks as the unwind passes
+// them, evaluate `__except` filters innermost-first, and on EXECUTE_HANDLER
+// resume the thread at the except block. This is the piece that makes real
+// `__try/__except/__finally` (as clang's WinEH emits it) work end to end.
+//
+// The scope-table layout here is clang's: a u32 count followed by
+// 16-byte entries `{ try_begin, try_end, filter, handler }` (RVAs). A
+// `handler == 0` entry is a `__finally`; nesting is by range containment
+// (an inner `__try`'s range sits inside its outer's). MSVC's CRT uses a
+// different field order (level/filter/handler) — supporting it is a
+// follow-up keyed on a binary that needs it.
+
+/// `EXCEPTION_DISPOSITION` values (must match kernel32's dispatch).
+const DISPO_CONTINUE_EXECUTION: i32 = 0;
+const DISPO_CONTINUE_SEARCH: i32 = 1;
+
+/// `EXCEPTION_RECORD` head (only the fields the walk reads).
+#[repr(C)]
+struct SehRecord {
+    code: u32,
+    flags: u32,
+}
+
+/// The dispatch side's context, trimmed to what the walk rewrites.
+#[repr(C)]
+struct SehDispatcherContext {
+    control_pc: u64,
+    image_base: u64,
+    function_entry: u64,
+    establisher_frame: u64,
+    target_ip: u64,
+    context_record: u64, // -> full CONTEXT; only `rip` (at 0xF8) is touched
+    language_handler: u64,
+    handler_data: u64, // the scope table VA
+}
+
+/// One clang-format scope-table entry (RVAs).
+#[repr(C)]
+struct ScopeEntry {
+    try_begin: u32,
+    try_end: u32,
+    filter: u32,
+    handler: u32,
+}
+
+/// A filter funclet: rcx = &EXCEPTION_POINTERS, rdx = the establisher
+/// frame; returns EXECUTE_HANDLER (1) / CONTINUE_SEARCH (0) /
+/// CONTINUE_EXECUTION (-1).
+type FilterFn = unsafe extern "C" fn(ep: *const u64, frame: u64) -> i32;
+/// A finally funclet: rcx = &EXCEPTION_POINTERS, rdx = the establisher frame.
+type FinallyFn = unsafe extern "C" fn(ep: *const u64, frame: u64);
+
+/// `__C_specific_handler(record, frame, context, dispatcher)` — the frame
+/// handler named in a module's `.xdata`; the kernel32 dispatch walk calls it
+/// once per handler-carrying frame.
+#[no_mangle]
+pub unsafe extern "C" fn __C_specific_handler(
+    _record: *const SehRecord,
+    frame: u64,
+    context: *mut c_void,
+    disp: *const SehDispatcherContext,
+) -> i32 {
+    let d = &*disp;
+    let count = *(d.handler_data as *const u32) as usize;
+    let entries = (d.handler_data + 4) as *const ScopeEntry;
+    // Innermost range first, outward: `__finally` blocks run as the unwind
+    // passes them, and a `__except` filter is only evaluated after every
+    // nested scope inside it had its say. (That's what "enclosing level"
+    // reduces to — smallest containing range = innermost.)
+    let mut done = [false; 32];
+    loop {
+        let mut pick = usize::MAX;
+        let mut pick_span = u32::MAX;
+        for i in 0..count.min(32) {
+            if done[i] {
+                continue;
+            }
+            let e = &*entries.add(i);
+            let (b, en) = (e.try_begin, e.try_end);
+            let covered = d.control_pc >= d.image_base + b as u64
+                && d.control_pc < d.image_base + en as u64;
+            if covered && (en - b) < pick_span {
+                pick = i;
+                pick_span = en - b;
+            }
+        }
+        if pick == usize::MAX {
+            break;
+        }
+        done[pick] = true;
+        let e = &*entries.add(pick);
+        // The funclet ABI: rcx = &EXCEPTION_POINTERS, rdx = the frame.
+        let ep = [_record as u64, d.context_record];
+        if e.handler == 0 {
+            // `__finally`: runs as the unwind passes, outward-bound.
+            let fin: FinallyFn = core::mem::transmute(d.image_base + e.filter as u64);
+            fin(ep.as_ptr(), frame);
+            continue;
+        }
+        // `__except`: evaluate the filter in the frame's context.
+        let filter: FilterFn = core::mem::transmute(d.image_base + e.filter as u64);
+        let verdict = filter(ep.as_ptr(), frame);
+        if verdict == 1 {
+            // EXCEPTION_EXECUTE_HANDLER: resume at the except block.
+            let ctx = d.context_record as *mut u8;
+            *((ctx.add(0xF8)) as *mut u64) = d.image_base + e.handler as u64;
+            return DISPO_CONTINUE_EXECUTION;
+        }
+        if verdict == -1 {
+            // EXCEPTION_CONTINUE_EXECUTION: the filter fixed the fault.
+            return DISPO_CONTINUE_EXECUTION;
+        }
+        // CONTINUE_SEARCH: fall through to the enclosing try.
+    }
+    DISPO_CONTINUE_SEARCH
+}
