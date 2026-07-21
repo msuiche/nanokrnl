@@ -1965,3 +1965,54 @@ session clean. Remaining EH polish: second-pass unwinding of
 *intermediate* frames between the throw and the catch (a no-op for
 the tests — no intermediate dtors), catch objects that need real copy
 constructors with side effects, and the MSVC-layout scope tables.
+
+### 2026-07-21 - the second pass: intermediate frames unwind before the handler runs
+
+The exception model's last semantic gap closes. NT's dispatch is two
+passes: a *search* pass walks the frames looking for a handler, and
+when one takes the exception, an *unwind* pass revisits every frame
+between the exception point and the catching frame so its `__finally`
+blocks and C++ destructors run before the handler body executes. We
+had the search pass; the frames in between were silently skipped —
+fine until a destructor lived in one.
+
+- **kernel32's `seh_dispatch` gained the unwind pass**: when a frame
+  handler returns ExceptionContinueExecution, `unwind_to_frame` walks
+  a pristine copy of the exception-time context from the exception
+  point up to the catching frame (exclusive), calling each intervening
+  handler with the record plus `EXCEPTION_UNWINDING` — the same
+  per-frame module resolution, leaf rule, and 64-step bound as the
+  search pass. Only then does `NtContinue` resume the handler's
+  context. Faults and software raises share the path, so C SEH and
+  C++ EH both got the pass. (The pass needs no second CONTEXT copy on
+  the stack — `seh_dispatch` never writes the caller's context, and a
+  second 0x4D0-byte copy pushed the frame past 4 KiB and dragged in a
+  `__chkstk` the shim doesn't provide. LLVM keeps you honest.)
+- **`__C_specific_handler` learned the real timing**: it ran
+  `__finally` funclets on *any* visit — the search pass included —
+  which the tests couldn't see (flag writes are idempotent). Now
+  finallys run only under `EXCEPTION_UNWINDING`, and on
+  EXCEPTION_EXECUTE_HANDLER the handler runs the *local* unwind
+  itself — the finallys of the scopes inner to the matching except,
+  innermost first, exactly MS's `_local_unwind` — before resuming at
+  the except block. The dispatcher's unwind pass covers the *other*
+  frames; the frame's own inner scopes are the handler's business.
+- **cpptest case 5 proves it**: `throw_through()` holds a `MidBomb`
+  between the throw and main's `catch(int)`; its destructor must run
+  as the unwind pass travels through. It does. The boot bitmask grows
+  to 0x1F. sehtest's five cases stay green through the
+  `__C_specific_handler` rewrite — the finally in case 2 now runs at
+  the correct time (same-frame local unwind at execute), case 5's via
+  the new pass, once.
+- The one deliberate deviation from MS's order: the catch *funclet*
+  runs inside the search pass (MS runs it after the nested unwind,
+  inside CatchIt), so an intermediate dtor technically executes after
+  the catch body here. Value catches can't observe it — the catch
+  object is built before the funclet call — and the exception object
+  itself is never unwind-destroyed (the runtime owns it). Getting
+  MS's exact order means an in-handler `RtlUnwind` that returns to the
+  caller; documented, not shipped.
+
+Boot suite: same three cpptest checks (created / ran to exit / 0x1F)
+plus the five C-SEH case checks. Verified: QEMU suite three
+consecutive PASSes; host 18+2+7; emu 36/36; nanox pipe session clean.

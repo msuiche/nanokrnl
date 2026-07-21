@@ -2078,9 +2078,11 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
     // --- Seh: C++ exceptions (throw/catch/destructor unwind) --------------
     // cpptest.exe (clang++, real MS C++ EH): throw -> _CxxThrowException ->
     // RaiseException -> the dispatch walk -> __CxxFrameHandler3 -> the catch
-    // block, with the destructor running on the way out. Exit bitmask: bit 0
-    // = exact-type catch, bit 1 = destructor ran, bit 2 = wrong handler
-    // skipped, bit 3 = catch(...).
+    // block, with destructors running on the way out — in the throwing frame
+    // and in the intermediate frames (the second, unwind, pass). Exit
+    // bitmask: bit 0 = exact-type catch, bit 1 = destructor ran, bit 2 =
+    // wrong handler skipped, bit 3 = catch(...), bit 4 = the intermediate
+    // frame's destructor ran.
     if !CPPTEST_IMAGE.is_empty() {
         let h = create_user_process(CPPTEST_IMAGE, b"cpptest.exe", [0, 0, 0]);
         check!("Seh: cpptest.exe process created", h != 0);
@@ -2091,8 +2093,8 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
         }
         check!("Seh: cpptest ran to exit", st == 0);
         check!(
-            "Seh: C++ throw/catch/unwind all behaved (exact type, dtor, nesting, catch-all)",
-            code == 0xF
+            "Seh: C++ throw/catch/unwind all behaved (type, dtors, nesting, catch-all)",
+            code == 0x1F
         );
     }
 

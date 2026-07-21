@@ -2065,6 +2065,8 @@ pub unsafe extern "C" fn __C_specific_handler(
     // nested scope inside it had its say. (That's what "enclosing level"
     // reduces to — smallest containing range = innermost.)
     let mut done = [false; 32];
+    let mut picked = [0usize; 32]; // pick order = innermost first
+    let mut n_picked = 0usize;
     loop {
         let mut pick = usize::MAX;
         let mut pick_span = u32::MAX;
@@ -2085,13 +2087,21 @@ pub unsafe extern "C" fn __C_specific_handler(
             break;
         }
         done[pick] = true;
+        if n_picked < 32 {
+            picked[n_picked] = pick;
+            n_picked += 1;
+        }
         let e = &*entries.add(pick);
         // The funclet ABI: rcx = &EXCEPTION_POINTERS, rdx = the frame.
         let ep = [_record as u64, d.context_record];
         if e.handler == 0 {
-            // `__finally`: runs as the unwind passes, outward-bound.
-            let fin: FinallyFn = core::mem::transmute(d.image_base + e.filter as u64);
-            fin(ep.as_ptr(), frame);
+            // `__finally`: runs on the unwind pass only — a search-pass
+            // visit decides nothing about this frame yet (the matching
+            // handler may still pass, or live in an outer frame).
+            if unwinding {
+                let fin: FinallyFn = core::mem::transmute(d.image_base + e.filter as u64);
+                fin(ep.as_ptr(), frame);
+            }
             continue;
         }
         if unwinding {
@@ -2101,7 +2111,18 @@ pub unsafe extern "C" fn __C_specific_handler(
         let filter: FilterFn = core::mem::transmute(d.image_base + e.filter as u64);
         let verdict = filter(ep.as_ptr(), frame);
         if verdict == 1 {
-            // EXCEPTION_EXECUTE_HANDLER: resume at the except block.
+            // EXCEPTION_EXECUTE_HANDLER: the local unwind — the finallys
+            // of the scopes inner to this except (exactly the finally
+            // entries picked before it, innermost first) run before the
+            // except body — then resume at the except block.
+            for &p in picked.iter().take(n_picked) {
+                let pe = &*entries.add(p);
+                if pe.handler == 0 {
+                    let fin: FinallyFn =
+                        core::mem::transmute(d.image_base + pe.filter as u64);
+                    fin(ep.as_ptr(), frame);
+                }
+            }
             let ctx = d.context_record as *mut u8;
             *((ctx.add(0xF8)) as *mut u64) = d.image_base + e.handler as u64;
             return DISPO_CONTINUE_EXECUTION;

@@ -5357,6 +5357,9 @@ unsafe fn seh_dispatch(record: *const ExceptionRecord, context: *mut Context) ->
         // Dispatch works on a copy: handlers may modify it, and NtContinue
         // consumes it — the caller's context stays pristine on failure.
         let mut ctx = core::ptr::read(context);
+        // Note: `*context` itself is never written — it stays the pristine
+        // exception-time context, ready for the unwind pass if a handler
+        // takes the exception below.
         let mut establisher = 0u64;
         for _ in 0..64 {
             // Bounded walk: malformed metadata must not loop forever.
@@ -5410,6 +5413,11 @@ unsafe fn seh_dispatch(record: *const ExceptionRecord, context: *mut Context) ->
                 if dispo == EXCEPTION_CONTINUE_EXECUTION_DISPO
                     || dispo == EXCEPTION_COLLIDED_UNWIND_DISPO
                 {
+                    // Second pass: run the intermediate frames' handlers
+                    // with the unwind record — finally blocks and C++
+                    // destructors between the exception point and the
+                    // catching frame execute before the handler does.
+                    unwind_to_frame(record, &*context, frame);
                     // Resume at the (handler-adjusted) context; returns only
                     // if the kernel rejects it, which is the unhandled path.
                     syscall3(NT_CONTINUE, &mut ctx as *mut Context as u64, 0, 0);
@@ -5432,6 +5440,79 @@ unsafe fn seh_dispatch(record: *const ExceptionRecord, context: *mut Context) ->
 // blocks run on a longjmp or a C++ exception's unwind pass) and resuming at
 // the target IP with the return value in rax. The walk reuses the dispatch
 // machinery: same `.pdata` lookup, same virtual unwind, same leaf rule.
+
+/// The unwind pass after a handler takes an exception: walk a pristine
+/// copy of the exception-time context from the exception point up to the
+/// catching frame (exclusive), calling every intervening frame's handler
+/// with the unwind record so its `__finally` blocks and C++ destructors
+/// run before control resumes in the handler. Best-effort: a frame that
+/// cannot be walked ends the pass, never the resume — real NT bugchecks
+/// on a broken unwind chain, a degraded resume is more useful here.
+unsafe fn unwind_to_frame(record: *const ExceptionRecord, orig: &Context, target: u64) {
+    unsafe {
+        let mut ctx = core::ptr::read(orig);
+        let mut rec = core::ptr::read(record);
+        rec.flags |= EXCEPTION_UNWINDING;
+        let record = &rec as *const ExceptionRecord;
+        let mut establisher = 0u64;
+        for _ in 0..64 {
+            // Bounded walk: malformed metadata must not loop forever.
+            let Some((image_base, size)) = module_from_rip(ctx.rip) else {
+                if ctx.rsp == target || !leaf_step(&mut ctx, &mut establisher) {
+                    return;
+                }
+                continue;
+            };
+            let Some((pdata, count)) = module_pdata(image_base) else {
+                if ctx.rsp == target || !leaf_step(&mut ctx, &mut establisher) {
+                    return;
+                }
+                continue;
+            };
+            let rva = ctx.rip - image_base;
+            if rva >= size {
+                if ctx.rsp == target || !leaf_step(&mut ctx, &mut establisher) {
+                    return;
+                }
+                continue;
+            }
+            let Some(rf) = lookup_function_entry(pdata, count, rva) else {
+                if ctx.rsp == target || !leaf_step(&mut ctx, &mut establisher) {
+                    return;
+                }
+                continue;
+            };
+            let ui = read_unwind_info(image_base, rf);
+            let frame = establisher_of(&ctx, &ui);
+            if frame == target {
+                return; // the catching frame is the handler's own business
+            }
+            if ui.flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER) != 0 && ui.handler_va != 0 {
+                let mut disp = DispatcherContext {
+                    control_pc: ctx.rip,
+                    image_base,
+                    function_entry: rf,
+                    establisher_frame: frame,
+                    target_ip: 0,
+                    context_record: &mut ctx as *mut Context as u64,
+                    language_handler: ui.handler_va,
+                    handler_data: ui.handler_data,
+                    history_table: 0,
+                    scope_index: 0,
+                    fill0: 0,
+                };
+                let handler: FrameHandler = core::mem::transmute(ui.handler_va);
+                // During an unwind the handler's job is the finally/dtor
+                // path; any other answer is a contract violation we treat
+                // as continue-search (NT bugchecks on COLLIDED_UNWIND).
+                let _ = handler(record, frame, &mut ctx, &mut disp);
+            }
+            if !virtual_unwind(image_base, rva, rf, &ui, &mut ctx, &mut establisher) {
+                return;
+            }
+        }
+    }
+}
 
 /// `EXCEPTION_UNWINDING` (exception flags word): this dispatch is an unwind,
 /// not a fault — handlers run their `__finally`/terminate paths only.

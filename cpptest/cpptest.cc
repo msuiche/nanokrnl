@@ -7,10 +7,12 @@
 //  2. an object's destructor must run while the throw unwinds its frame;
 //  3. a nested try whose inner catch(double) does NOT match int — the outer
 //     catch(int) must take it (the state walk skips the wrong handler);
-//  4. catch(...) takes whatever's left.
+//  4. catch(...) takes whatever's left;
+//  5. an object in the *intermediate* frame between throw and catch is
+//     destroyed as the unwind pass travels through (the second pass).
 //
 // Exit code = bitmask of the cases that behaved; the kernel boot test
-// asserts 0xF. Built with clang++ -fexceptions (scripts/build-cpptest.sh).
+// asserts 0x1F. Built with clang++ -fexceptions (scripts/build-cpptest.sh).
 
 typedef unsigned long long u64;
 typedef unsigned int u32;
@@ -46,6 +48,19 @@ __declspec(noinline) static void throw_int_nested() {
         // must NOT match an int throw
         g_outer = -1;
     }
+}
+
+// Case 5's witness: an object living in the intermediate frame between
+// the throw and the catch — the unwind pass must destroy it on the way.
+static volatile int g_mid_dtor;
+struct MidBomb {
+    int id;
+    explicit MidBomb(int i) : id(i) {}
+    ~MidBomb() { g_mid_dtor = id; }
+};
+__declspec(noinline) static void throw_through() {
+    MidBomb m(9);
+    throw 42;
 }
 
 int mainCRTStartup() {
@@ -106,6 +121,21 @@ int mainCRTStartup() {
         mask |= 8;
     } else {
         print("CPP: FAIL case4\n");
+    }
+
+    // Case 5: the intermediate frame's destructor runs as the throw
+    // unwinds through it to the outer catch (the second, unwind, pass).
+    g_mid_dtor = 0;
+    try {
+        throw_through();
+    } catch (int) {
+        // caught
+    }
+    if (g_mid_dtor == 9) {
+        print("CPP: intermediate-frame destructor ran on the way out\n");
+        mask |= 0x10;
+    } else {
+        print("CPP: FAIL case5\n");
     }
 
     print("CPP: reached the end\n");
