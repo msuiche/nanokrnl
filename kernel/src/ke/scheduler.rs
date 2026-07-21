@@ -224,10 +224,74 @@ unsafe fn ready_thread_locked(thread: *mut Kthread) {
         let cpu = pcr::ke_get_prcb().number as usize;
         let pri = (*thread).priority as usize & 31;
         (*thread).state = ThreadState::Ready;
+        (*thread).ready_since = KE_TICK_COUNT.load(Ordering::Relaxed);
         let b = bank(cpu);
         b.queues[pri].insert_tail(&raw mut (*thread).ready_list_entry);
         b.summary |= 1 << pri;
         b.count += 1;
+    }
+}
+
+/// Ticks a ready thread may wait before starvation relief lifts it
+/// (~NT's starvation threshold, scaled to our 1 kHz tick and test windows).
+pub const STARVE_TICKS: u64 = 300;
+/// The priority starved threads are boosted to (top of the dynamic band).
+pub const BOOST_PRIORITY: u8 = 15;
+/// Ticks between starvation scans (rate limit for the queue walk).
+const STARVE_SCAN_INTERVAL: u64 = 64;
+static STARVE_LAST_SCAN: AtomicU64 = AtomicU64::new(0);
+
+/// Starvation relief: every ready thread waiting longer than
+/// [`STARVE_TICKS`] is lifted to [`BOOST_PRIORITY`] (NT's starvation boost;
+/// decay happens when the thread next runs). Lock held.
+unsafe fn boost_starved_locked(now: u64) {
+    unsafe {
+        for cpu in 0..super::gdt::MAX_CPUS {
+            for pri in 1..BOOST_PRIORITY as usize {
+                // Collect first: boosting requeues at the head of a higher
+                // queue, mutating the lists being walked.
+                let mut starved: [*mut Kthread; 16] = [core::ptr::null_mut(); 16];
+                let mut n = 0;
+                bank(cpu).queues[pri].for_each(|e| {
+                    if n < starved.len() {
+                        let t = container_of!(e, Kthread, ready_list_entry);
+                        if now.saturating_sub((*t).ready_since) > STARVE_TICKS {
+                            starved[n] = t;
+                            n += 1;
+                        }
+                    }
+                });
+                for t in &starved[..n] {
+                    let t = *t;
+                    ListEntry::remove(&raw mut (*t).ready_list_entry);
+                    if bank(cpu).queues[pri].is_empty() {
+                        bank(cpu).summary &= !(1 << pri);
+                    }
+                    bank(cpu).count -= 1;
+                    (*t).boosted = true;
+                    (*t).priority = BOOST_PRIORITY;
+                    // Not `ready_thread_locked` (that would re-stamp the
+                    // thread onto *this* CPU and reset its wait clock):
+                    // requeue on the same bank, keeping the original tick.
+                    let b = bank(cpu);
+                    b.queues[BOOST_PRIORITY as usize]
+                        .insert_tail(&raw mut (*t).ready_list_entry);
+                    b.summary |= 1 << BOOST_PRIORITY;
+                    b.count += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Decay: a boosted thread that just got selected runs once at the boost,
+/// then drops back to its base priority. Lock held.
+unsafe fn decay_boost_locked(thread: *mut Kthread) {
+    unsafe {
+        if (*thread).boosted {
+            (*thread).boosted = false;
+            (*thread).priority = (*thread).base_priority;
+        }
     }
 }
 
@@ -333,6 +397,7 @@ unsafe fn switch_away_locked(cur: *mut Kthread) {
             (*cur).state = ThreadState::Running;
             return;
         }
+        decay_boost_locked(next);
         (*next).state = ThreadState::Running;
         (*next).quantum = DEFAULT_QUANTUM;
         prcb.current_thread = next;
@@ -899,6 +964,12 @@ pub fn ki_dispatch_interrupt() {
     let quantum_end = core::mem::replace(&mut prcb.quantum_end, false);
     unsafe {
         let old = acquire();
+        // Starvation relief scan (rate-limited; the queue walk isn't free).
+        let now = KE_TICK_COUNT.load(Ordering::Relaxed);
+        if now.saturating_sub(STARVE_LAST_SCAN.load(Ordering::Relaxed)) >= STARVE_SCAN_INTERVAL {
+            STARVE_LAST_SCAN.store(now, Ordering::Relaxed);
+            boost_starved_locked(now);
+        }
         let cur = prcb.current_thread;
         let me = prcb.number as usize;
         // The best priority runnable *here*: my own bank, or a bank I could

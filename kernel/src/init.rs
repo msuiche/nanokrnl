@@ -1076,6 +1076,61 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
         check!("Ke: sync event wakes one waiter per set", PONGS.load(Ordering::Acquire) == waiters);
     }
 
+    // --- Ke: starvation relief (priority aging) ---------------------------
+    // Four priority-8 hogs busy-loop and never block, one per CPU; two
+    // priority-4 starvelings can then only run when the starvation-relief
+    // scan lifts them past the hogs (BOOST_PRIORITY). Without aging they
+    // would starve forever; with it, both run within the window.
+    if ke::smp::online_count() > 1 {
+        static HOG_STOP: AtomicBool = AtomicBool::new(false);
+        static STARVED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+        extern "C" fn hog(_: *mut core::ffi::c_void) -> ! {
+            while !HOG_STOP.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+            }
+            ps::ps_terminate_system_thread();
+        }
+        extern "C" fn starveling(ctx: *mut core::ffi::c_void) -> ! {
+            STARVED[ctx as usize].fetch_add(1, Ordering::AcqRel);
+            ps::ps_terminate_system_thread();
+        }
+        HOG_STOP.store(false, Ordering::Release);
+        for s in &STARVED {
+            s.store(0, Ordering::Release);
+        }
+        let mut hogs = [core::ptr::null_mut(); 4];
+        for h in &mut hogs {
+            *h = ps::ps_create_system_thread(hog, core::ptr::null_mut()).expect("hog");
+        }
+        // Give the hogs a moment to occupy every CPU (the delay frees this
+        // CPU for the fourth hog), then release the starvelings into a
+        // machine with no free processor.
+        ke_delay_execution_thread(100);
+        let mut sv = [core::ptr::null_mut(); 2];
+        for i in 0..2 {
+            sv[i] = ps::ps_create_system_thread_suspended(starveling, i as *mut core::ffi::c_void, 0)
+                .expect("starveling");
+            unsafe {
+                (*sv[i]).tcb.priority = 4;
+                (*sv[i]).tcb.base_priority = 4;
+                ps::ps_resume_thread(sv[i]);
+            }
+        }
+        // 300 ticks to starve + 64-tick scan interval + scheduling slack.
+        ke_delay_execution_thread(1200);
+        HOG_STOP.store(true, Ordering::Release);
+        for h in hogs {
+            unsafe { ke::dispatcher::ke_wait_for_single_object(&raw mut (*h).tcb.header) };
+        }
+        for t in sv {
+            unsafe { ke::dispatcher::ke_wait_for_single_object(&raw mut (*t).tcb.header) };
+        }
+        check!(
+            "Ke: starved threads run via starvation relief (priority aging)",
+            STARVED[0].load(Ordering::Acquire) == 1 && STARVED[1].load(Ordering::Acquire) == 1
+        );
+    }
+
     // --- Ke: wait timeout -----------------------------------------------
     {
         // Wait on a never-signaled notification event with a 5-tick

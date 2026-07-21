@@ -1798,3 +1798,31 @@ VEH, .pdata unwinding, CRT scope-table dispatch. Remaining unwind
 polish: `RtlUnwindEx`/global unwind (longjmp, C++ EH), collided-unwind
 chaining, and MSVC-layout scope tables for real MSVC binaries that
 need SEH recovery (none in-tree today).
+
+### 2026-07-21 - starvation relief: priority aging in the dispatcher
+
+A hog thread at your priority used to own its CPU forever — the
+dispatcher had no answer to starvation. Now ready threads that wait
+long enough get lifted, run, and decay: NT's starvation-relief boost.
+
+- **The mechanics**: every ready thread carries `ready_since` (the tick
+  it became ready). A rate-limited scan (every 64 ticks) walks the
+  per-CPU ready banks and lifts any thread starved past `STARVE_TICKS`
+  (300) to `BOOST_PRIORITY` (15, the top of the dynamic band). The
+  boost is one quantum wide: `switch_away_locked` decays it back to
+  `base_priority` the moment the thread is selected. The thread's
+  effective priority (`priority`, the queue index) and its base
+  priority are now distinct fields on `KTHREAD`.
+- **The test is adversarial by construction**: four priority-8 hogs
+  busy-loop and never block — one per CPU, so *no* processor is free —
+  then two priority-4 starvelings are released. They can only run if
+  the aging scan lifts them past the hogs. Both run inside the window;
+  without relief they would starve forever.
+
+Boot suite (120 checks).
+
+Verified: QEMU suite 120/120 three consecutive times; host 18+2+7;
+emu 36/36; nanox pipe session clean. The dispatcher is now fair as
+well as parallel. Remaining polish: `RtlUnwindEx`/global unwind,
+idle-CPU-aware IPI targeting (the broadcast still wakes every CPU for
+every ready), and quantum-end round-robin fairness across banks.

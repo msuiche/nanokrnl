@@ -111,8 +111,15 @@ pub struct Kthread {
     /// Top (initial RSP) of the kernel stack; also loaded into TSS.RSP0.
     pub stack_top: u64,
     pub state: ThreadState,
-    /// 0–31; ready-queue index. 0 is reserved for the idle thread.
+    /// 0–31; ready-queue index, *effective* priority (boost included).
     pub priority: u8,
+    /// The priority the thread was created with — what `boost` decays back to.
+    pub base_priority: u8,
+    /// Set when starvation relief has lifted this thread to [`BOOST_PRIORITY`];
+    /// cleared (and `priority` restored to `base_priority`) once it has run.
+    pub boosted: bool,
+    /// Tick the thread last became ready (starvation accounting).
+    pub ready_since: u64,
     /// Remaining clock ticks before preemption.
     pub quantum: i32,
     /// Ready-queue linkage (when Ready).
@@ -206,6 +213,9 @@ impl Kthread {
             stack_top: stack_base + stack_size as u64,
             state: ThreadState::Initialized,
             priority,
+            base_priority: priority,
+            boosted: false,
+            ready_since: 0,
             quantum: DEFAULT_QUANTUM,
             ready_list_entry: ListEntry::new(),
             wait_blocks: [const { KwaitBlock::new() }; MAX_WAIT_BLOCKS],
