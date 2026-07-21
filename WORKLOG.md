@@ -1852,3 +1852,49 @@ startup through scheduling, stealing, aging, shootdowns, and IPI
 economy. Remaining polish: `RtlUnwindEx`/global unwind, MSVC-layout
 scope tables for real MSVC binaries that need them, and the debugger's
 multi-CPU awareness (the gdb stub still thinks in one CPU).
+
+### 2026-07-21 - global unwind: RtlUnwindEx and a longjmp that runs finally blocks
+
+The unwind machinery now goes both directions: faults dispatch *down*
+into handlers, and `longjmp` unwinds *back out* through the frames,
+running every `__finally` on the way — NT's two-sided unwind story.
+
+- **`RtlUnwindEx` (kernel32 shim, exported)**: the controlled global
+  unwind — walk from the caller's context to a target frame, calling
+  each frame's handler with a synthesized `STATUS_UNWIND` +
+  `EXCEPTION_UNWINDING` record (the CRT's cue to run only the
+  finally/terminate paths), then resume at the target IP with the
+  return value in rax, through `NtContinue`. On success it never
+  returns; on an unreachable target it returns false so the caller can
+  degrade instead of dying.
+- **msvcrt's `longjmp` upgraded in place**: it now builds the unwind
+  context and calls `RtlUnwindEx` — the NT behavior — falling back to
+  the old plain register-restore only when the walk can't reach the
+  target (missing metadata). Same buffer layout, so cmd.exe's command
+  loop is untouched. And it's our first **cross-DLL import**: msvcrt
+  links kernel32's `RtlUnwindEx` exactly like real msvcrt calling
+  ntdll (the build now generates a kernel32 import library for it).
+- **msvcrt's `__C_specific_handler` honors `EXCEPTION_UNWINDING`**:
+  filters are skipped, finally funclets run — the distinction between
+  a fault dispatch and an unwind dispatch.
+- **The bug the trace hunt found**: `UWOP_SET_FPREG`'s register comes
+  from the UNWIND_INFO *header*, not the code's opinfo field. I used
+  the opinfo (0 → RAX), so the first real frame-pointer unwind set
+  RSP = RAX = 0 and the thread vanished into a nested-fault loop that
+  terminates silently. Only case 5 hit it — every earlier case stopped
+  at its handler without unwinding *through* a frame. (This is why
+  hardware validation beats reading the docs twice: the disassembly
+  said `04 03`, and `03` looked like a register until it wasn't.)
+- **sehtest case 5**: a fault's except block longjmps back to setjmp;
+  the intervening `__finally` must run and control must return with
+  the value. It does.
+
+Boot suite (121 checks): the Seh checks now cover try / finally /
+callee / nested / longjmp end to end.
+
+Verified: QEMU suite 121/121 three consecutive times; host 18+2+7;
+emu 36/36; nanox pipe session clean. The NT exception and unwind
+model is complete for the clang/MSVC v1 metadata surface. Remaining
+polish: C++ EH (`__CxxFrameHandler3` + `_CxxThrowException`) for
+C++-compiled tools, and the MSVC-layout scope-table variant if a real
+MSVC binary ever needs recovery.

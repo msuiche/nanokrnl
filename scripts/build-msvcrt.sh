@@ -34,8 +34,20 @@ for name in $DATA; do
 done
 echo "msvcrt exports: $FUNCS $EXPNAMES (data: $DATA)"
 
+# The kernel32 import library, so msvcrt can call kernel32's RtlUnwindEx —
+# a real cross-DLL dependency, exactly like msvcrt importing from ntdll.
+DLLTOOL="${DLLTOOL:-/opt/homebrew/opt/llvm/bin/llvm-dlltool}"
+K32DEF=msvcrt/kernel32.def
+{
+    echo "LIBRARY kernel32.dll"
+    echo "EXPORTS"
+    grep -oE 'pub (unsafe )?extern "C" fn [A-Za-z0-9_]+' kernel32/src/lib.rs \
+        | awk '{print $NF}' | grep -v '^DllMain$'
+} > "$K32DEF"
+"$DLLTOOL" -m i386:x86-64 -d "$K32DEF" -l msvcrt/kernel32.lib -D kernel32.dll
+
 cd msvcrt
-RUSTFLAGS="-Clink-arg=/dll -Clink-arg=/entry:DllMain -Clink-arg=/nodefaultlib $EXPORT_ARGS" \
+RUSTFLAGS="-Clink-arg=/dll -Clink-arg=/entry:DllMain -Clink-arg=/nodefaultlib -Clink-arg=$WS/msvcrt/kernel32.lib $EXPORT_ARGS" \
     "$CARGO" +nightly build --release
 
 cp target/x86_64-pc-windows-msvc/release/msvcrt.dll ./msvcrt.dll

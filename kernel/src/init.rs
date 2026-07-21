@@ -2070,8 +2070,8 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
         }
         check!("Seh: sehtest ran to exit", st == 0);
         check!(
-            "Seh: all four frame-SEH cases recovered (try/finally/callee/nested)",
-            code == 0xF
+            "Seh: all five frame-SEH cases recovered (try/finally/callee/nested/longjmp)",
+            code == 0x1F
         );
     }
 

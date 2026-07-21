@@ -149,29 +149,74 @@ pub unsafe extern "C" fn _local_unwind() {
     );
 }
 
-/// `longjmp(jmpbuf, val)` — restore context saved by `__intrinsic_setjmp` and
-/// resume there, with the setjmp call appearing to return `val` (or 1 if 0).
+/// `longjmp(jmpbuf, val)` — unwind to the frame `_setjmp` captured and make
+/// it "return" `val` (or 1 if 0). First class: `RtlUnwindEx` walks the
+/// frames and runs `__finally` blocks on the way (the NT behavior); when the
+/// walk can't reach the target (missing metadata), it falls back to the old
+/// plain register-restore — a degraded control transfer beats a dead thread.
 #[unsafe(naked)]
 #[no_mangle]
 pub unsafe extern "C" fn longjmp() {
     core::arch::naked_asm!(
-        "mov rbx, [rcx + 0]",
-        "mov rbp, [rcx + 8]",
-        "mov rsi, [rcx + 16]",
-        "mov rdi, [rcx + 24]",
-        "mov r12, [rcx + 32]",
-        "mov r13, [rcx + 40]",
-        "mov r14, [rcx + 48]",
-        "mov r15, [rcx + 56]",
-        "mov rax, rdx", // return value
+        // rcx = jb (rbx,rbp,rsi,rdi,r12..r15,rsp,rip), edx = value.
+        // jb goes in rbx, value in edi (both nonvolatile across the call).
+        "mov rbx, rcx",
+        "mov edi, edx",
+        // Build the CONTEXT RtlUnwindEx walks from (0x4D0 bytes).
+        "sub rsp, 0x4D8",
+        "mov rdi, rsp",
+        "xor eax, eax",
+        "mov ecx, 0x9A",
+        "rep stosq",
+        "mov rax, [rbx + 72]",      // saved return address -> ctx.rip
+        "mov [rsp + 0xF8], rax",
+        "mov rax, [rbx + 64]",      // saved rsp -> ctx.rsp
+        "mov [rsp + 0x98], rax",
+        "mov rax, [rbx + 0]",
+        "mov [rsp + 0x90], rax",    // ctx.rbx
+        "mov rax, [rbx + 8]",
+        "mov [rsp + 0xA0], rax",    // ctx.rbp
+        "mov rax, [rbx + 16]",
+        "mov [rsp + 0xA8], rax",    // ctx.rsi
+        "mov rax, [rbx + 24]",
+        "mov [rsp + 0xB0], rax",    // ctx.rdi
+        "mov rax, [rbx + 32]",
+        "mov [rsp + 0xD8], rax",    // ctx.r12
+        "mov rax, [rbx + 40]",
+        "mov [rsp + 0xE0], rax",    // ctx.r13
+        "mov rax, [rbx + 48]",
+        "mov [rsp + 0xE8], rax",    // ctx.r14
+        "mov rax, [rbx + 56]",
+        "mov [rsp + 0xF0], rax",    // ctx.r15
+        // RtlUnwindEx(frame = jb->rsp, ip = jb->rip, NULL, value, ctx, NULL)
+        "mov rcx, [rbx + 64]",
+        "mov rdx, [rbx + 72]",
+        "xor r8d, r8d",
+        "mov r9d, edi",
+        "mov [rsp + 0x20], rsp",
+        "mov qword ptr [rsp + 0x28], 0",
+        "call {unwind}",
+        // On success it never returns; false means fall back to the plain
+        // register-restore (reading every field before rbx is reloaded).
+        "add rsp, 0x4D8",
+        "mov rbp, [rbx + 8]",
+        "mov rsi, [rbx + 16]",
+        "mov rdi, [rbx + 24]",
+        "mov r12, [rbx + 32]",
+        "mov r13, [rbx + 40]",
+        "mov r14, [rbx + 48]",
+        "mov r15, [rbx + 56]",
+        "mov eax, edi",
         "test rax, rax",
         "jnz 2f",
         "mov eax, 1", // longjmp(buf, 0) makes setjmp return 1
         "2:",
-        "mov rsp, [rcx + 64]", // restore stack
-        "mov rdx, [rcx + 72]", // saved return address
+        "mov rsp, [rbx + 64]",
+        "mov rdx, [rbx + 72]",
+        "mov rbx, [rbx + 0]",
         "jmp rdx",
-    );
+        unwind = sym RtlUnwindEx,
+    )
 }
 
 #[no_mangle]
@@ -2005,12 +2050,15 @@ type FinallyFn = unsafe extern "C" fn(ep: *const u64, frame: u64);
 pub unsafe extern "C" fn __C_specific_handler(
     _record: *const SehRecord,
     frame: u64,
-    context: *mut c_void,
+    _context: *mut c_void,
     disp: *const SehDispatcherContext,
 ) -> i32 {
     let d = &*disp;
     let count = *(d.handler_data as *const u32) as usize;
     let entries = (d.handler_data + 4) as *const ScopeEntry;
+    // During an unwind (longjmp / C++ EH), handlers run their `__finally`
+    // paths only — `__except` filters are a fault-dispatch concept.
+    let unwinding = (*_record).flags & 0x2 != 0; // EXCEPTION_UNWINDING
     // Innermost range first, outward: `__finally` blocks run as the unwind
     // passes them, and a `__except` filter is only evaluated after every
     // nested scope inside it had its say. (That's what "enclosing level"
@@ -2045,6 +2093,9 @@ pub unsafe extern "C" fn __C_specific_handler(
             fin(ep.as_ptr(), frame);
             continue;
         }
+        if unwinding {
+            continue; // filters don't run on the unwind path
+        }
         // `__except`: evaluate the filter in the frame's context.
         let filter: FilterFn = core::mem::transmute(d.image_base + e.filter as u64);
         let verdict = filter(ep.as_ptr(), frame);
@@ -2061,4 +2112,20 @@ pub unsafe extern "C" fn __C_specific_handler(
         // CONTINUE_SEARCH: fall through to the enclosing try.
     }
     DISPO_CONTINUE_SEARCH
+}
+
+// --- Global unwind import -------------------------------------------------
+
+unsafe extern "C" {
+    /// kernel32's global-unwind engine (a cross-DLL import, exactly like
+    /// real msvcrt calling ntdll's RtlUnwindEx). On success it never
+    /// returns; false means the walk couldn't reach the target.
+    fn RtlUnwindEx(
+        target_frame: u64,
+        target_ip: u64,
+        record: *mut c_void,
+        retval: u64,
+        ctx: *mut c_void,
+        history: *mut c_void,
+    ) -> bool;
 }

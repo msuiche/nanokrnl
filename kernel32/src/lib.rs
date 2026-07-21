@@ -5249,7 +5249,9 @@ unsafe fn virtual_unwind(
                     }
                 }
                 UWOP_SET_FPREG => {
-                    rsp = *ctx_reg(ctx, info) - (ui.frame_off as u64) * 16;
+                    // The frame register lives in the UNWIND_INFO *header*;
+                    // the code's opinfo field is unused (info != register!).
+                    rsp = *ctx_reg(ctx, ui.frame_reg) - (ui.frame_off as u64) * 16;
                     *establisher_frame = rsp;
                 }
                 UWOP_SAVE_NONVOL => {
@@ -5298,6 +5300,7 @@ unsafe fn leaf_step(ctx: &mut Context, establisher_frame: &mut u64) -> bool {
         ctx.rip != 0
     }
 }
+
 
 /// `RtlDispatchException`'s frame walk: from the faulting context outward,
 /// invoking each frame's handler until one resumes the thread (or the walk
@@ -5361,6 +5364,117 @@ unsafe fn seh_dispatch(record: *const ExceptionRecord, context: *mut Context) ->
                 return false;
             }
         }
+        false
+    }
+}
+
+// --- Global unwind: RtlUnwindEx ---------------------------------------------
+//
+// A controlled unwind from the caller's context to a target frame, invoking
+// each frame's handler with the unwind flag set (that's how `__finally`
+// blocks run on a longjmp or a C++ exception's unwind pass) and resuming at
+// the target IP with the return value in rax. The walk reuses the dispatch
+// machinery: same `.pdata` lookup, same virtual unwind, same leaf rule.
+
+/// `EXCEPTION_UNWINDING` (exception flags word): this dispatch is an unwind,
+/// not a fault — handlers run their `__finally`/terminate paths only.
+pub const EXCEPTION_UNWINDING: u32 = 0x2;
+/// `STATUS_UNWIND` — the synthesized record's code when the caller passes
+/// none (real RtlUnwindEx synthesizes the same).
+pub const STATUS_UNWIND: u32 = 0xC000_0027;
+
+/// `RtlUnwindEx(TargetFrame, TargetIp, ExceptionRecord, ReturnValue,
+/// ContextRecord, HistoryTable)` — unwind to `target_frame`, then resume at
+/// `target_ip` with `retval` in rax. On success it never returns (the thread
+/// resumes through `NtContinue`); it returns false when the walk cannot
+/// reach the target frame, so a caller (msvcrt's `longjmp`) can fall back
+/// to a plain register-restore — NT would bugcheck; a degraded control
+/// transfer is more useful here.
+#[no_mangle]
+pub unsafe extern "C" fn RtlUnwindEx(
+    target_frame: u64,
+    target_ip: u64,
+    record: *const ExceptionRecord,
+    retval: u64,
+    context: *mut Context,
+    _history: *mut c_void,
+) -> bool {
+    unsafe {
+        let mut ctx = core::ptr::read(context);
+        // The unwind record: the caller's, or a synthesized STATUS_UNWIND.
+        let mut rec = if record.is_null() {
+            ExceptionRecord {
+                code: STATUS_UNWIND,
+                flags: 0,
+                record: 0,
+                address: ctx.rip,
+                number_parameters: 0,
+                _pad: 0,
+                information: [0; 15],
+            }
+        } else {
+            core::ptr::read(record)
+        };
+        rec.flags |= EXCEPTION_UNWINDING;
+        let record = &rec as *const ExceptionRecord;
+
+        let Some((image_base, size)) = app_module() else { return false };
+        let Some((pdata, count)) = module_pdata(image_base) else { return false };
+
+        for _ in 0..64 {
+            let rva = ctx.rip.wrapping_sub(image_base);
+            if rva >= size {
+                // Outside the covered module: leaf-rule step, with the same
+                // target check (a leaf frame can be the target).
+                if ctx.rsp == target_frame {
+                    break;
+                }
+                if !leaf_step(&mut ctx, &mut 0) {
+                    return false;
+                }
+                continue;
+            }
+            let Some(rf) = lookup_function_entry(pdata, count, rva) else {
+                if ctx.rsp == target_frame {
+                    break;
+                }
+                if !leaf_step(&mut ctx, &mut 0) {
+                    return false;
+                }
+                continue;
+            };
+            let ui = read_unwind_info(image_base, rf);
+            let frame = establisher_of(&ctx, &ui);
+            if frame == target_frame {
+                break;
+            }
+            if ui.flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER) != 0 && ui.handler_va != 0 {
+                let mut disp = DispatcherContext {
+                    control_pc: ctx.rip,
+                    image_base,
+                    function_entry: rf,
+                    establisher_frame: frame,
+                    target_ip,
+                    context_record: &mut ctx as *mut Context as u64,
+                    language_handler: ui.handler_va,
+                    handler_data: ui.handler_data,
+                    history_table: 0,
+                    scope_index: 0,
+                    fill0: 0,
+                };
+                let handler: FrameHandler = core::mem::transmute(ui.handler_va);
+                // During an unwind the handler's job is the finally/terminate
+                // path; any other answer is a contract violation we treat as
+                // continue-search (real NT bugchecks on COLLIDED_UNWIND here).
+                let _ = handler(record, frame, &mut ctx, &mut disp);
+            }
+            if !virtual_unwind(image_base, rva, rf, &ui, &mut ctx, &mut 0) {
+                return false;
+            }
+        }
+        ctx.rip = target_ip;
+        ctx.rax = retval;
+        syscall3(NT_CONTINUE, &mut ctx as *mut Context as u64, 0, 0);
         false
     }
 }

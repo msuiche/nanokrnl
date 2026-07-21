@@ -23,6 +23,10 @@ typedef int i32;
 // msvcrt shim import: the frame handler named in our .xdata.
 __declspec(dllimport) int __C_specific_handler(void*, u64, void*, void*);
 
+// msvcrt shim imports: setjmp/longjmp over the unwind machinery.
+__declspec(dllimport) int __intrinsic_setjmp(u64*);
+__declspec(dllimport) void __stdcall longjmp(u64*, int);
+
 // kernel32 shim imports
 __declspec(dllimport) u64 __stdcall GetStdHandle(u32);
 __declspec(dllimport) i32 __stdcall WriteConsoleA(u64, const void*, u32, u32*, u64);
@@ -58,6 +62,19 @@ static void print(const char* s) {
 static __declspec(noinline) void fault_in_callee(void) {
     *(volatile int*)0x1234 = 42;
 }
+
+// Case 5's helpers: a function whose __finally must run when the longjmp
+// unwinds through it, and the longjmp target buffer.
+static volatile int g_finally_lj;
+static __declspec(noinline) void fault_with_finally(void) {
+    __try {
+        *(volatile int*)0x1234 = 42;
+    } __finally {
+        g_finally_lj = 1;
+    }
+}
+static u64 g_jb[10];
+static volatile int g_lj_state;
 
 void mainCRTStartup(void) {
     // Case 1: fault in __try, except block runs.
@@ -117,6 +134,25 @@ void mainCRTStartup(void) {
     else
         print("SEH: FAIL case4\n");
 
+    // Case 5: a fault's except block longjmps back to setjmp — the unwind
+    // must run the intervening __finally and land at setjmp with the value.
+    g_finally_lj = 0;
+    g_lj_state = 0;
+    if (__intrinsic_setjmp(g_jb) == 0) {
+        g_lj_state = 1;
+        __try {
+            fault_with_finally(); // faults; its handler passes us onward
+        } __except (filt_exec(_exception_code())) {
+            longjmp(g_jb, 42); // unwind to the setjmp
+            g_lj_state = -1;   // unreached
+        }
+    }
+    // Control resumes here: setjmp "returned" 42 via longjmp.
+    if (g_lj_state == 1 && g_finally_lj)
+        print("SEH: longjmp ran the intervening __finally and returned 42\n");
+    else
+        print("SEH: FAIL case5\n");
+
     print("SEH: reached the end (survived all faults)\n");
     // Exit-code bitmask for the boot self-test: bit i = case i+1 behaved.
     u32 mask = 0;
@@ -124,5 +160,6 @@ void mainCRTStartup(void) {
     if (g_rec[2] == 1 && g_finally_ran) mask |= 2;
     if (g_rec[3] == 1) mask |= 4;
     if (g_rec[4] == 1 && !g_inner_ran) mask |= 8;
+    if (g_lj_state == 1 && g_finally_lj) mask |= 16;
     ExitProcess(mask);
 }
