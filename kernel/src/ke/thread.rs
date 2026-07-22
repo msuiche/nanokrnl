@@ -189,6 +189,29 @@ pub struct Kthread {
     /// objects delivered at `APC_LEVEL` in this thread's context by
     /// `ke::apc::ki_deliver_apcs` (`ApcState.KernelApcPending` in NT).
     pub kapc_queue: ListEntry,
+    /// Armed fault-recovery landing pad (`mm::probe::guard`): a kernel-mode
+    /// page fault while `recovery_armed` rewinds the trap frame to this
+    /// saved state instead of bugchecking — NT's `__try/__except` around
+    /// user-memory probes. Per-thread so preemption can't cross wires.
+    pub fault_recovery: FaultRecovery,
+    /// True while a `mm::probe` guard is in flight on this thread.
+    pub recovery_armed: bool,
+}
+
+/// The saved nonvolatile state at a recovery guard's entry — the landing
+/// pad the page-fault path restores into the trap frame on recovery
+/// (`rip`/`rsp` resume the guarded function as if its capture returned 1).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct FaultRecovery {
+    pub rip: u64,
+    pub rsp: u64,
+    pub rbp: u64,
+    pub rbx: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
 }
 
 /// Maximum user APCs queued per thread (NT has no fixed small limit; 8 is
@@ -238,6 +261,8 @@ impl Kthread {
             user_apcs: [(0, 0); USER_APC_MAX],
             user_apc_count: 0,
             kapc_queue: ListEntry::new(),
+            fault_recovery: FaultRecovery::default(),
+            recovery_armed: false,
         }
     }
 

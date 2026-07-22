@@ -71,7 +71,12 @@ static ONLINE_COUNT: AtomicUsize = AtomicUsize::new(1);
 
 /// The BSP's CR4, captured before AP startup so each AP can adopt the same
 /// feature set (SMEP/SMAP/PGE/…).
+/// The boot processor's CR4, captured before the first SIPI so each AP can
+/// adopt the same feature set (SMEP/SMAP/…).
 static BSP_CR4: AtomicU64 = AtomicU64::new(0);
+/// The boot processor's CR0, captured likewise — the WP bit in particular
+/// must hold on every CPU or read-only pages are writable on APs.
+static BSP_CR0: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // TLB shootdown
@@ -386,6 +391,9 @@ pub fn init() {
     let cr4: u64;
     unsafe { asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack)) };
     BSP_CR4.store(cr4, Ordering::Release);
+    let cr0: u64;
+    unsafe { asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack)) };
+    BSP_CR0.store(cr0, Ordering::Release);
     let trans_cr3 = build_transition_tables();
     let blob = unsafe {
         core::slice::from_raw_parts(
@@ -462,6 +470,11 @@ pub extern "C" fn ap_rust_entry() -> ! {
         );
         // Adopt the BSP's CR4 feature set.
         asm!("mov cr4, {}", in(reg) BSP_CR4.load(Ordering::Acquire), options(nostack));
+        // …and its CR0 (WP included: read-only pages are read-only to the
+        // supervisor on every CPU, or the probe/recovery contract is
+        // CPU-dependent). Paging is already on here, so the PG/PE bits the
+        // snapshot carries are the ones we are already running with.
+        asm!("mov cr0, {}", in(reg) BSP_CR0.load(Ordering::Acquire), options(nostack));
     }
     // Who am I? Match the LAPIC ID against the BSP-published slots.
     let id = apic::lapic_id() as u64;

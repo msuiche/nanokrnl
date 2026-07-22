@@ -261,6 +261,24 @@ extern "C" fn ki_dispatch_trap(frame: &mut KtrapFrame) {
                     crate::ke::scheduler::ki_terminate_current_thread()
                 };
             }
+            // Kernel-mode fault (a user-mode one is delivered or terminates
+            // above and never reaches here). One sanctioned escape first: a
+            // guarded user-memory touch (mm::probe — NT's __try/__except
+            // around the probe-and-copy) rewinds to its landing pad with a
+            // failure status instead of taking the machine down for one bad
+            // user pointer. Anything else is a genuine kernel bug.
+            if let Some(rec) = crate::mm::probe::take_recovery() {
+                frame.rip = rec.rip;
+                frame.rsp = rec.rsp;
+                frame.rbp = rec.rbp;
+                frame.rbx = rec.rbx;
+                frame.r12 = rec.r12;
+                frame.r13 = rec.r13;
+                frame.r14 = rec.r14;
+                frame.r15 = rec.r15;
+                frame.rax = 1; // recovery_capture's fault return value
+                return;
+            }
             kd_println!(
                 "!! page fault: va={:#018X} err={:#X} rip={:#018X}",
                 cr2,

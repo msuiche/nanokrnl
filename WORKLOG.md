@@ -2016,3 +2016,58 @@ fine until a destructor lived in one.
 Boot suite: same three cpptest checks (created / ran to exit / 0x1F)
 plus the five C-SEH case checks. Verified: QEMU suite three
 consecutive PASSes; host 18+2+7; emu 36/36; nanox pipe session clean.
+
+### 2026-07-21 - kernel-mode fault recovery: a bad user pointer no longer stops the machine
+
+The last SMP-era roadmap item was "kernel-mode SEH for driver crash
+paths". The honest 90% of it ships today; the metadata 10% is
+documented as impossible-by-toolchain below. The gap that actually
+mattered: `probe_for_read`/`probe_for_write` validate presence and
+alignment, not the W bit — so a read-only user page passed a write
+probe, the kernel's write faulted in ring 0, and the machine
+bugchecked. One bad user pointer stopped the world.
+
+- **CR0.WP is now set** (BSP at startup; each AP adopts the BSP's CR0
+  alongside the CR4 it already took). Without WP, supervisor writes
+  bypass page-level write protection entirely and the probe contract
+  is unenforceable — NT runs WP=1 always. nanox already enforced
+  read-only for supervisor writes unconditionally; hardware now
+  matches. (First proof that the bit matters: the recovery test
+  *passed silently* before WP — the "read-only" write just worked.)
+- **`mm::probe`** — the recovery machinery. `guard()` arms a
+  per-thread landing pad with a setjmp-style capture
+  (`recovery_capture`, naked: return address, post-return RSP, and the
+  callee-saved set); the page-fault path in `ke::traps`, seeing a
+  ring-0 fault on a thread with an armed guard, rewrites the trap
+  frame to the pad instead of bugchecking — the guarded copy reports
+  `ACCESS_VIOLATION` and the machine keeps running. The slot lives in
+  the KTHREAD (per-thread, so a preempted guard can't be crossed with
+  another thread's), the guard contract is NT's probe contract:
+  bounded, non-blocking, borrow-only — the landing abandons the
+  region's frames. `copy_to_user`/`copy_from_user` package the whole
+  pattern: probe, SMAP bracket, guarded copy.
+- **Exception delivery takes the guard first**: `dispatch_exception`'s
+  record+context write to the user stack was the most exposed kernel
+  write of all — a read-only page under RSP, or a stack that vanishes
+  between probe and touch, bugchecked the box while *trying to report
+  an exception*. Now delivery fails, the caller terminates the thread,
+  and the machine survives.
+- **The self-test**: map a user page read-only, `copy_to_user` into it
+  — the write faults in ring 0 and must come back `ACCESS_VIOLATION`;
+  then the same copy into the now-writable page must succeed (guard
+  disarmed, values intact). Both check; the suite continues. (Suite
+  grows to 126 checks.)
+- Deliberately out of scope: metadata-driven kernel SEH for drivers.
+  Our drivers are Rust-built for a bare-metal target — there is no
+  `.pdata`/`.xdata` to walk, so there is nothing honest to dispatch
+  on. If a driver path ever carries SEH tables, the recovery guard is
+  already the mechanism their probes would use. Also follow-up:
+  sweeping `syscalls.rs`'s probe-then-deref sites onto
+  `copy_to_user`/`copy_from_user` (the guard's whole point); the
+  machinery and the delivery path are the template.
+
+Verified: QEMU suite PASS five consecutive times after one timing
+flake in the pre-existing SMP migration check (6 threads must land on
+≥2 CPUs — probabilistic by construction, green 6 of 7 runs sampled);
+host 18+2+7; emu 36/36; nanox pipe session clean (51 OK — the two new
+checks run there too).

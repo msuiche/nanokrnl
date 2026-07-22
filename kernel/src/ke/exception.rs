@@ -163,7 +163,11 @@ pub fn dispatch_exception(frame: &mut KtrapFrame, code: u32, info: [u64; 2], npa
         return false;
     }
     crate::mm::virt::user_access_begin();
-    unsafe {
+    // The probe above checked presence, not writability, and the stack can
+    // always change under us: run the writes inside the fault-recovery
+    // guard. A fault here used to bugcheck the machine for one bad user
+    // stack; now delivery simply fails and the caller terminates the thread.
+    let wrote = crate::mm::probe::guard(|| unsafe {
         // Zero the whole CONTEXT first (FltSave, debug registers, padding).
         core::ptr::write_bytes(ctx_va as *mut u8, 0, CTX_SIZE);
         let w16 = |off: usize, v: u16| ((ctx_va + off as u64) as *mut u16).write(v);
@@ -207,8 +211,11 @@ pub fn dispatch_exception(frame: &mut KtrapFrame, code: u32, info: [u64; 2], npa
 
         // Fake return address so the dispatcher entry is call-shaped.
         (new_rsp as *mut u64).write(0);
-    }
+    });
     crate::mm::virt::user_access_end();
+    if wrote.is_err() {
+        return false; // the stack fought back mid-write — terminate the thread
+    }
 
     // Redirect the trap return into the dispatcher with the ABI arguments.
     frame.rcx = rec_va;

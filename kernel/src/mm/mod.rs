@@ -12,6 +12,10 @@
 //! * [`vad`] — per-address-space VADs and the demand-commit fault path:
 //!   `NtAllocateVirtualMemory` records a descriptor, the #PF handler backs
 //!   the page on first touch (`MmAccessFault` in miniature).
+//! * [`probe`] — guarded user-memory access: the fault-recovery landing
+//!   pad that turns a kernel-mode page fault on a user touch into an
+//!   `ACCESS_VIOLATION` instead of a bugcheck (NT's `__try/__except`
+//!   around the probe-and-copy), plus the `copy_to/from_user` primitives.
 //! * [`pageout`] — the pagefile: a raw sector region on the scratch disk,
 //!   a working-set FIFO of committed pages, and the evict/page-in cycle
 //!   that lets physical memory pressure push user pages to disk.
@@ -37,6 +41,8 @@ pub mod pageout;
 pub mod phys;
 #[cfg(target_arch = "x86_64")]
 pub mod pool;
+#[cfg(target_arch = "x86_64")]
+pub mod probe;
 #[cfg(target_arch = "x86_64")]
 pub mod vad;
 #[cfg(target_arch = "x86_64")]

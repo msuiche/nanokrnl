@@ -31,6 +31,20 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 static TESTS_DONE: AtomicBool = AtomicBool::new(false);
 static TESTS_FAILED: AtomicBool = AtomicBool::new(false);
 
+/// Set `CR0.WP` (write protect): read-only pages are read-only to the
+/// supervisor too. NT always runs with WP=1; without it the kernel writes
+/// straight through read-only user pages, which is exactly what probes and
+/// the `mm::probe` recovery guard exist to turn into `ACCESS_VIOLATION`.
+/// (nanox already enforces this unconditionally; this aligns hardware.)
+fn enable_write_protect() {
+    unsafe {
+        let mut cr0: u64;
+        core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack));
+        cr0 |= 1 << 16; // WP = 1
+        core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nomem, nostack));
+    }
+}
+
 /// Enable SSE/SSE2 on the boot processor (`KiInitializeProcessor` does the
 /// equivalent on real Windows). Clears `CR0.EM` and sets `CR0.MP`, then sets
 /// `CR4.OSFXSR`/`CR4.OSXMMEXCPT` so SSE instructions and #XF exceptions are
@@ -115,6 +129,10 @@ pub fn ki_system_startup(boot_info: &'static mut BootInfo) -> ! {
     // (e.g. `movaps` to zero a stack buffer). Without OSFXSR/OSXMMEXCPT set
     // those instructions #UD. Real Windows enables this just as early.
     enable_sse();
+
+    // CR0.WP: read-only means read-only, to the supervisor as well — the
+    // hardware half of the probe/recovery contract (mm::probe).
+    enable_write_protect();
 
     // Enable SMEP if the CPU supports it: the kernel must never execute a
     // user-accessible page, so trap any attempt. Safe here — driver images
@@ -971,6 +989,44 @@ extern "C" fn smoke_test_thread(_ctx: *mut core::ffi::c_void) -> ! {
             );
             check!("Mm: per-process address space shares the kernel high half", kernel_shared);
             check!("Mm: probe accepts a mapped user page", probe_ok);
+        }
+    }
+
+    // --- Mm: fault recovery — a guarded write to a read-only user page ----
+    // probe_for_write validates presence, not the W bit: a read-only user
+    // page passes the probe and the write faults in kernel mode. Without
+    // recovery that fault is a bugcheck; the mm::probe guard must rewind it
+    // into an ACCESS_VIOLATION and keep the machine running — NT's
+    // __try/__except around the probe-and-copy.
+    {
+        const ROVA: u64 = 0x4000_1000;
+        unsafe {
+            let kernel_as = mm::virt::mm_kernel_address_space();
+            let proc_as = mm::virt::mm_create_address_space();
+            let pa = mm::phys::mm_allocate_page().expect("test page");
+            *(mm::phys_to_virt(pa) as *mut u64) = 0;
+            // Read-only user mapping (writable=false, exec=false).
+            mm::virt::mm_map_user_range(proc_as, ROVA, pa, 1, false, false);
+            mm::virt::mm_switch_address_space(proc_as);
+            let src = [0xAAu8; 16];
+            // The guarded write must fail cleanly instead of bugchecking.
+            let ro_write = mm::probe::copy_to_user(ROVA, src.as_ptr(), 16);
+            // The same copy into the now-writable page must succeed, proving
+            // the guard disarmed after the recovery (PTE rewritten in place).
+            mm::virt::mm_map_user_range(proc_as, ROVA, pa, 1, true, false);
+            let rw_write = mm::probe::copy_to_user(ROVA, src.as_ptr(), 16);
+            mm::virt::user_access_begin();
+            let read_back = core::ptr::read_volatile(ROVA as *const u64);
+            mm::virt::user_access_end();
+            mm::virt::mm_switch_address_space(kernel_as);
+            check!(
+                "Mm: guarded write to a read-only user page recovers (no bugcheck)",
+                ro_write == Err(crate::rtl::NtStatus::ACCESS_VIOLATION)
+            );
+            check!(
+                "Mm: guarded copy still works after a recovery",
+                rw_write.is_ok() && read_back == 0xAAAA_AAAA_AAAA_AAAA
+            );
         }
     }
 
