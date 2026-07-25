@@ -127,12 +127,11 @@ unsafe fn write_dr6(v: u64) {
 }
 
 /// Read a `u64` from a user-mode address (the return address on the user
-/// stack). Brackets the access for SMAP. The caller must have validated the
-/// address is mapped (we probe first).
+/// stack). The guarded copy probes and recovers; a bad address reads as 0
+/// (annotation only). The caller must have validated the address is mapped.
 unsafe fn read_user_u64(addr: u64) -> u64 {
-    crate::mm::virt::user_access_begin();
-    let v = core::ptr::read_unaligned(addr as *const u64);
-    crate::mm::virt::user_access_end();
+    let mut v = 0u64;
+    let _ = crate::mm::probe::copy_from_user(&mut v as *mut u64 as *mut u8, addr, 8);
     v
 }
 
@@ -141,20 +140,23 @@ unsafe fn read_user_u64(addr: u64) -> u64 {
 /// isn't a readable user pointer or the first unit isn't printable ASCII (so we
 /// only log things that look like strings). Used to annotate call args.
 unsafe fn read_user_wstr(addr: u64, buf: &mut [u8; 32]) -> usize {
-    if addr < 0x1000 || crate::mm::virt::probe_for_read(addr, 2, 2).is_err() {
+    if addr < 0x1000 {
         return 0;
     }
-    crate::mm::virt::user_access_begin();
+    // Pull the whole span through the guarded copy (probes + recovers),
+    // then scan it locally for the NUL.
+    let mut units = [0u16; 31];
+    if crate::mm::probe::copy_from_user(units.as_mut_ptr() as *mut u8, addr, 62).is_err() {
+        return 0;
+    }
     let mut n = 0;
-    for i in 0..31 {
-        let c = core::ptr::read_unaligned((addr + i * 2) as *const u16);
+    for &c in &units {
         if c == 0 {
             break;
         }
         buf[n] = if (0x20..0x7f).contains(&c) { c as u8 } else { b'.' };
         n += 1;
     }
-    crate::mm::virt::user_access_end();
     // Require a printable first char so we don't log binary noise.
     if n == 0 || buf[0] == b'.' {
         return 0;

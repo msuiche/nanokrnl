@@ -2071,3 +2071,37 @@ flake in the pre-existing SMP migration check (6 threads must land on
 ≥2 CPUs — probabilistic by construction, green 6 of 7 runs sampled);
 host 18+2+7; emu 36/36; nanox pipe session clean (51 OK — the two new
 checks run there too).
+
+### 2026-07-21 - the sweep: every syscall user touch goes through the guard
+
+The follow-up from fault recovery, now closed: `syscalls.rs` had ~28
+sites that probed a user range and then dereferenced it raw — each one
+a bugcheck waiting for a read-only page or an unlucky unmap. All of
+them now cross the boundary through `mm::probe`'s guarded copies.
+
+- **Contiguous copies became `copy_to_user`/`copy_from_user`** — the
+  three central readers (`read_user_u16`, `read_user_req`,
+  `read_user_name`) fix a dozen call sites at once; struct writes
+  (find-data, pipe handles, APC pairs, IO_STATUS_BLOCK) marshal in a
+  kernel buffer and cross with one guarded copy.
+- **The io paths bounce**: `NtReadFile`/`NtWriteFile` copy the user
+  buffer into a kernel `Vec` once and hand *kernel* memory to the pipe
+  / ramfs / FAT / device consumers — the io layers no longer
+  dereference user pointers at all. Reads keep the up-front probe so a
+  bad buffer fails before it consumes data; the bounce is flushed to
+  the user with one guarded copy per successful read.
+- **`NtContinue` and the debugger's annotation reads** got the same
+  treatment — the context fields come from a guarded stack copy, and
+  the call-arg string peek pulls its span through the guard before
+  scanning for the NUL.
+- What did NOT change: the loader's writes to freshly-mapped process
+  memory (kernel-created, cannot be read-only or absent), the
+  module-image resource reads (kernel-owned mappings), and the
+  exception-delivery guard from last round. sort.exe still reads its
+  29 bytes through five bounced read calls; cmd, choice, where,
+  cpptest, sehtest all behave.
+
+Verified: QEMU suite three consecutive PASSes (126 checks); host
+18+2+7; emu 36/36; nanox pipe session clean (51 OK). With this, no
+user-mode pointer can fault the kernel on any in-tree path: probes
+reject the garbage, the guard recovers what probes cannot see.

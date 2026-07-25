@@ -9,11 +9,12 @@
 //! The service-number assignments are our own (a real system shares
 //! `ntdll`'s numbers); the user side and this table just have to agree.
 //!
-//! User buffers are validated before use: SMAP is enabled (kernel accesses
-//! to user pages are bracketed with `stac`/`clac`) and every service that
-//! takes a user pointer runs it through `mm::virt::probe_for_read`/`write`
-//! first, so a bogus or kernel pointer yields `STATUS_ACCESS_VIOLATION`
-//! instead of faulting the kernel.
+//! User buffers cross the boundary through `mm::probe`'s guarded copies
+//! (`copy_to_user`/`copy_from_user`): the range is probed, the copy runs
+//! SMAP-bracketed inside the fault-recovery guard, and io paths bounce
+//! through kernel buffers — so a bogus, fought-back, or read-only user
+//! page yields `STATUS_ACCESS_VIOLATION` (or 0 bytes) instead of faulting
+//! the kernel.
 
 use crate::io::{self, DeviceObject, IRP_MJ_WRITE};
 use crate::ke::scheduler;
@@ -207,7 +208,7 @@ extern "C" fn nt_duplicate_object(src_handle: u64, _a2: u64, _a3: u64, _a4: u64)
 /// `CreatePipe` - create an anonymous pipe and write its two handles (read then
 /// write, each u64) to the user buffer at `out_ptr`. Returns 1 on success.
 extern "C" fn nt_create_pipe(out_ptr: u64, _a2: u64, _a3: u64, _a4: u64) -> u64 {
-    if out_ptr == 0 || crate::mm::virt::probe_for_write(out_ptr, 16, 8).is_err() {
+    if out_ptr == 0 {
         return 0;
     }
     let Some((r, w)) = io::pipe::create() else {
@@ -223,12 +224,10 @@ extern "C" fn nt_create_pipe(out_ptr: u64, _a2: u64, _a3: u64, _a4: u64) -> u64 
         crate::ob::ob_dereference_object(r as *mut u8);
         crate::ob::ob_dereference_object(w as *mut u8);
     }
-    crate::mm::virt::user_access_begin();
-    unsafe {
-        *(out_ptr as *mut u64) = rh;
-        *((out_ptr + 8) as *mut u64) = wh;
+    let pair = [rh, wh];
+    if crate::mm::probe::copy_to_user(out_ptr, pair.as_ptr() as *const u8, 16).is_err() {
+        return 0;
     }
-    crate::mm::virt::user_access_end();
     1
 }
 
@@ -361,24 +360,26 @@ extern "C" fn nt_query_directory(pat_ptr: u64, pat_len: u64, index: u64, out_ptr
 /// cFileName[260]@44 (UTF-16), cAlternateFileName[14]@564.
 fn write_find_data(out_ptr: u64, name: &str, attributes: u32, size: u64) -> u64 {
     const FIND_DATA_SIZE: usize = 592;
-    if out_ptr == 0 || crate::mm::virt::probe_for_write(out_ptr, FIND_DATA_SIZE, 2).is_err() {
+    if out_ptr == 0 {
         return 0;
     }
-    crate::mm::virt::user_access_begin();
+    // Marshal in a kernel buffer, one guarded copy across the boundary.
+    let mut buf = [0u8; FIND_DATA_SIZE];
     unsafe {
-        core::ptr::write_bytes(out_ptr as *mut u8, 0, FIND_DATA_SIZE);
-        *(out_ptr as *mut u32) = attributes;
-        *((out_ptr + 28) as *mut u32) = (size >> 32) as u32;
-        *((out_ptr + 32) as *mut u32) = size as u32;
-        let name_ptr = out_ptr + 44; // cFileName
+        *(buf.as_mut_ptr() as *mut u32) = attributes;
+        *((buf.as_mut_ptr().add(28)) as *mut u32) = (size >> 32) as u32;
+        *((buf.as_mut_ptr().add(32)) as *mut u32) = size as u32;
+        let name_ptr = buf.as_mut_ptr().add(44); // cFileName
         let nb = name.as_bytes();
         let cch = nb.len().min(259);
         for i in 0..cch {
-            *((name_ptr + (i as u64) * 2) as *mut u16) = nb[i] as u16;
+            *(name_ptr.add(i * 2) as *mut u16) = nb[i] as u16;
         }
-        *((name_ptr + (cch as u64) * 2) as *mut u16) = 0;
+        *(name_ptr.add(cch * 2) as *mut u16) = 0;
     }
-    crate::mm::virt::user_access_end();
+    if crate::mm::probe::copy_to_user(out_ptr, buf.as_ptr(), FIND_DATA_SIZE).is_err() {
+        return 0;
+    }
     1
 }
 
@@ -491,18 +492,10 @@ extern "C" fn nt_load_message(base: u64, id: u64, buf: u64, cch: u64) -> u64 {
     if n == 0 {
         return 0;
     }
-    if crate::mm::virt::probe_for_write(buf, (n + 1) * 2, 2).is_err() {
+    // The string + NUL, one guarded copy into the user buffer.
+    if crate::mm::probe::copy_to_user(buf, tmp.as_ptr() as *const u8, (n + 1) * 2).is_err() {
         return 0;
     }
-    crate::mm::virt::user_access_begin();
-    let dst = buf as *mut u16;
-    unsafe {
-        for i in 0..n {
-            *dst.add(i) = tmp[i];
-        }
-        *dst.add(n) = 0;
-    }
-    crate::mm::virt::user_access_end();
     n as u64
 }
 
@@ -592,25 +585,19 @@ fn read_user_u16<'a>(ptr: u64, count: usize, dst: &'a mut [u16]) -> Option<&'a [
     if ptr == 0 || count == 0 || count > dst.len() {
         return None;
     }
-    if crate::mm::virt::probe_for_read(ptr, count * 2, 2).is_err() {
-        return None;
-    }
-    crate::mm::virt::user_access_begin();
-    unsafe { core::ptr::copy_nonoverlapping(ptr as *const u16, dst.as_mut_ptr(), count) };
-    crate::mm::virt::user_access_end();
+    // The guarded copy probes and recovers: a bad/fought-back buffer is a
+    // plain None, never a kernel fault.
+    crate::mm::probe::copy_from_user(dst.as_mut_ptr() as *mut u8, ptr, count * 2).ok()?;
     Some(&dst[..count])
 }
 
 /// Read `n` u64 fields of a request struct from a user pointer.
 fn read_user_req(ptr: u64, out: &mut [u64]) -> bool {
     let bytes = out.len() * 8;
-    if ptr == 0 || crate::mm::virt::probe_for_read(ptr, bytes, 8).is_err() {
+    if ptr == 0 {
         return false;
     }
-    crate::mm::virt::user_access_begin();
-    unsafe { core::ptr::copy_nonoverlapping(ptr as *const u64, out.as_mut_ptr(), out.len()) };
-    crate::mm::virt::user_access_end();
-    true
+    crate::mm::probe::copy_from_user(out.as_mut_ptr() as *mut u8, ptr, bytes).is_ok()
 }
 
 /// `NtOpenKey` backend (a2 = path UTF-16 ptr, a3 = char count). Returns the key
@@ -652,16 +639,12 @@ extern "C" fn nt_reg_query_value(hkey: u64, req_ptr: u64, _a3: u64, _a4: u64) ->
     if n < 0 {
         return u64::MAX;
     }
-    if out_type_ptr != 0 && crate::mm::virt::probe_for_write(out_type_ptr, 4, 4).is_ok() {
-        crate::mm::virt::user_access_begin();
-        unsafe { *(out_type_ptr as *mut u32) = vtype };
-        crate::mm::virt::user_access_end();
+    if out_type_ptr != 0 {
+        let _ = crate::mm::probe::copy_to_user(out_type_ptr, &vtype as *const u32 as *const u8, 4);
     }
     let copy = (n as usize).min(out_cap).min(data.len());
-    if out_buf != 0 && copy > 0 && crate::mm::virt::probe_for_write(out_buf, copy, 1).is_ok() {
-        crate::mm::virt::user_access_begin();
-        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), out_buf as *mut u8, copy) };
-        crate::mm::virt::user_access_end();
+    if out_buf != 0 && copy > 0 {
+        let _ = crate::mm::probe::copy_to_user(out_buf, data.as_ptr(), copy);
     }
     n as u64
 }
@@ -683,12 +666,9 @@ extern "C" fn nt_reg_set_value(hkey: u64, req_ptr: u64, _a3: u64, _a4: u64) -> u
     let mut dbuf = [0u8; 256];
     let dl = data_len.min(dbuf.len());
     if dl > 0 {
-        if crate::mm::virt::probe_for_read(data_ptr, dl, 1).is_err() {
+        if crate::mm::probe::copy_from_user(dbuf.as_mut_ptr(), data_ptr, dl).is_err() {
             return u64::MAX;
         }
-        crate::mm::virt::user_access_begin();
-        unsafe { core::ptr::copy_nonoverlapping(data_ptr as *const u8, dbuf.as_mut_ptr(), dl) };
-        crate::mm::virt::user_access_end();
     }
     if crate::cm::set_value(hkey, name, vtype, &dbuf[..dl]) {
         0
@@ -707,10 +687,8 @@ extern "C" fn nt_reg_enum_key(hkey: u64, index: u64, out_buf: u64, out_cap: u64)
         return u64::MAX;
     }
     let copy = (n as usize).min(cap);
-    if out_buf != 0 && copy > 0 && crate::mm::virt::probe_for_write(out_buf, copy * 2, 2).is_ok() {
-        crate::mm::virt::user_access_begin();
-        unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), out_buf as *mut u16, copy) };
-        crate::mm::virt::user_access_end();
+    if out_buf != 0 && copy > 0 {
+        let _ = crate::mm::probe::copy_to_user(out_buf, buf.as_ptr() as *const u8, copy * 2);
     }
     n as u64
 }
@@ -790,7 +768,7 @@ extern "C" fn nt_queue_user_apc(routine: u64, thread: u64, arg: u64, _a4: u64) -
 /// the queue is empty. The caller's CRT shim invokes the routine in user
 /// mode — the delivery half of alertable waits.
 extern "C" fn nt_next_user_apc(buf: u64, _a2: u64, _a3: u64, _a4: u64) -> u64 {
-    if buf == 0 || crate::mm::virt::probe_for_write(buf, 16, 8).is_err() {
+    if buf == 0 {
         return 0;
     }
     let cur = crate::ke::pcr::ke_get_current_thread();
@@ -805,12 +783,10 @@ extern "C" fn nt_next_user_apc(buf: u64, _a2: u64, _a3: u64, _a4: u64) -> u64 {
         (*cur).user_apc_count -= 1;
         first
     };
-    crate::mm::virt::user_access_begin();
-    unsafe {
-        *(buf as *mut u64) = routine;
-        *((buf + 8) as *mut u64) = arg;
+    let pair = [routine, arg];
+    if crate::mm::probe::copy_to_user(buf, pair.as_ptr() as *const u8, 16).is_err() {
+        return 0;
     }
-    crate::mm::virt::user_access_end();
     1
 }
 
@@ -916,19 +892,20 @@ extern "C" fn nt_continue(a1: u64, _a2: u64, _a3: u64, _a4: u64) -> u64 {
 /// `DbgPrint`-from-user: `a1` = buffer VA, `a2` = length. Echoes to the debug
 /// port. (A convenience service for bring-up; not an NT export.)
 extern "C" fn dbg_write_string(a1: u64, a2: u64, _a3: u64, _a4: u64) -> u64 {
-
-    let (ptr, len) = (a1 as *const u8, a2 as usize);
-    // Reject a bogus/kernel pointer up front (confused-deputy guard).
-    if crate::mm::virt::probe_for_read(a1, len.min(4096), 1).is_err() {
-        return NtStatus::ACCESS_VIOLATION.0 as u64;
-    }
-    if !ptr.is_null() && len < 4096 {
-        crate::mm::virt::user_access_begin(); // SMAP: reading a user buffer
-        let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
-        if let Ok(s) = core::str::from_utf8(bytes) {
+    let len = a2 as usize;
+    if a1 != 0 && len > 0 && len < 4096 {
+        // The guarded copy probes and recovers — a bogus or fought-back
+        // buffer is ACCESS_VIOLATION, never a kernel fault.
+        let mut bytes = alloc::vec![0u8; len];
+        if crate::mm::probe::copy_from_user(bytes.as_mut_ptr(), a1, len).is_err() {
+            return NtStatus::ACCESS_VIOLATION.0 as u64;
+        }
+        if let Ok(s) = core::str::from_utf8(&bytes) {
             crate::kd_print!("{}", s);
         }
-        crate::mm::virt::user_access_end();
+    } else if crate::mm::virt::probe_for_read(a1, len.min(4096), 1).is_err() {
+        // A null/over-long argument that also fails the probe is bogus.
+        return NtStatus::ACCESS_VIOLATION.0 as u64;
     }
     NtStatus::SUCCESS.0 as u64
 }
@@ -940,8 +917,10 @@ extern "C" fn nt_write_file(handle: u64, buffer: u64, length: u64, _a4: u64) -> 
     if buffer == 0 || length as usize > MAX_IO_LEN {
         return NtStatus::INVALID_PARAMETER.0 as u64;
     }
-    // The device will read this buffer; ensure it is a valid user range.
-    if crate::mm::virt::probe_for_read(buffer, length as usize, 1).is_err() {
+    // Bounce the user buffer through a kernel one: the guarded copy probes
+    // and recovers, and every consumer below touches kernel memory only.
+    let mut kbuf = alloc::vec![0u8; length as usize];
+    if crate::mm::probe::copy_from_user(kbuf.as_mut_ptr(), buffer, length as usize).is_err() {
         return NtStatus::ACCESS_VIOLATION.0 as u64;
     }
     match handle::ob_reference_object_by_handle(handle) {
@@ -949,31 +928,25 @@ extern "C" fn nt_write_file(handle: u64, buffer: u64, length: u64, _a4: u64) -> 
             // A pipe write end: append to the pipe buffer (unbounded, never blocks).
             if unsafe { io::pipe::is_write_end(obj) } {
                 let end = obj as *mut io::pipe::PipeEnd;
-                crate::mm::virt::user_access_begin();
-                let _ = unsafe { io::pipe::write(end, buffer as *const u8, length as usize) };
-                crate::mm::virt::user_access_end();
+                let _ = unsafe { io::pipe::write(end, kbuf.as_ptr(), length as usize) };
                 return NtStatus::SUCCESS.0 as u64;
             }
             // A writable RAM file (`> file`, cmd pipe temp file): append.
             if unsafe { io::ramfs::is_writable_file(obj) } {
                 let file = obj as *mut io::ramfs::WritableFile;
-                crate::mm::virt::user_access_begin();
-                let _ = unsafe { io::ramfs::write(file, buffer as *const u8, length as usize) };
-                crate::mm::virt::user_access_end();
+                let _ = unsafe { io::ramfs::write(file, kbuf.as_ptr(), length as usize) };
                 return NtStatus::SUCCESS.0 as u64;
             }
             // A writable FAT file (D:\): append to the buffer; it flushes to
             // the FAT on last close.
             if unsafe { io::fat::is_fat_writable(obj) } {
                 let file = obj as *mut io::fat::FatWritable;
-                crate::mm::virt::user_access_begin();
-                let _ = unsafe { io::fat::write(file, buffer as *const u8, length as usize) };
-                crate::mm::virt::user_access_end();
+                let _ = unsafe { io::fat::write(file, kbuf.as_ptr(), length as usize) };
                 return NtStatus::SUCCESS.0 as u64;
             }
             let device = obj as *mut DeviceObject;
             match unsafe {
-                io::io_synchronous_request(device, IRP_MJ_WRITE, buffer as *mut u8, length as usize)
+                io::io_synchronous_request(device, IRP_MJ_WRITE, kbuf.as_mut_ptr(), length as usize)
             } {
                 Ok(_) => NtStatus::SUCCESS.0 as u64,
                 Err(e) => e.0 as u64,
@@ -993,15 +966,12 @@ extern "C" fn nt_create_file(name_ptr: u64, name_len: u64, _access: u64, disposi
     if ptr.is_null() || len == 0 || len > 128 {
         return 0;
     }
-    // The name comes from user space — validate the range before reading it.
-    if crate::mm::virt::probe_for_read(name_ptr, len, 1).is_err() {
+    // The name comes from user space — the guarded copy validates the range
+    // and recovers if the page fights back mid-copy.
+    let mut ascii = [0u8; 128];
+    if crate::mm::probe::copy_from_user(ascii.as_mut_ptr(), name_ptr, len).is_err() {
         return 0;
     }
-    // Copy the ASCII name into a kernel buffer (SMAP-bracketed).
-    let mut ascii = [0u8; 128];
-    crate::mm::virt::user_access_begin();
-    unsafe { core::ptr::copy_nonoverlapping(ptr, ascii.as_mut_ptr(), len) };
-    crate::mm::virt::user_access_end();
     let ascii = &ascii[..len];
 
     // First try the device namespace (e.g. \Device\Console), widening to
@@ -1130,25 +1100,24 @@ extern "C" fn nt_open_file(
         return STATUS_INVALID_PARAMETER;
     }
     // OBJECT_ATTRIBUTES.ObjectName (PUNICODE_STRING) sits at +0x10.
-    if crate::mm::virt::probe_for_read(object_attributes, 0x18, 8).is_err() {
+    let mut oa = [0u8; 0x18];
+    if crate::mm::probe::copy_from_user(oa.as_mut_ptr(), object_attributes, 0x18).is_err() {
         return STATUS_INVALID_PARAMETER;
     }
-    let name_ptr = unsafe {
-        crate::mm::virt::user_access_begin();
-        let p = *((object_attributes + 0x10) as *const u64);
-        crate::mm::virt::user_access_end();
-        p
-    };
-    if name_ptr == 0 || crate::mm::virt::probe_for_read(name_ptr, 16, 8).is_err() {
+    let name_ptr = unsafe { *(oa.as_ptr().add(0x10) as *const u64) };
+    if name_ptr == 0 {
         return STATUS_INVALID_PARAMETER;
     }
     // UNICODE_STRING { u16 Length; u16 MaximumLength; u32 _pad; u64 Buffer; }
+    let mut us = [0u8; 16];
+    if crate::mm::probe::copy_from_user(us.as_mut_ptr(), name_ptr, 16).is_err() {
+        return STATUS_INVALID_PARAMETER;
+    }
     let (len_bytes, buf_va) = unsafe {
-        crate::mm::virt::user_access_begin();
-        let l = *(name_ptr as *const u16) as usize;
-        let b = *((name_ptr + 8) as *const u64);
-        crate::mm::virt::user_access_end();
-        (l, b)
+        (
+            *(us.as_ptr() as *const u16) as usize,
+            *(us.as_ptr().add(8) as *const u64),
+        )
     };
     let mut wbuf = [0u16; 260];
     let Some(w) = read_user_u16(buf_va, (len_bytes / 2).min(260), &mut wbuf) else {
@@ -1192,18 +1161,15 @@ extern "C" fn nt_open_file(
         return STATUS_OBJECT_NAME_NOT_FOUND;
     };
     let h = handle::ob_create_handle(file as *mut u8, 0);
-    if crate::mm::virt::probe_for_write(file_handle_out, 8, 8).is_ok() {
-        crate::mm::virt::user_access_begin();
-        unsafe { *(file_handle_out as *mut u64) = h };
-        crate::mm::virt::user_access_end();
-    }
-    if io_status_block != 0 && crate::mm::virt::probe_for_write(io_status_block, 16, 8).is_ok() {
-        crate::mm::virt::user_access_begin();
-        unsafe {
-            *(io_status_block as *mut u32) = 0; // Status = STATUS_SUCCESS
-            *((io_status_block + 8) as *mut u64) = FILE_OPENED; // Information
-        }
-        crate::mm::virt::user_access_end();
+    let _ = crate::mm::probe::copy_to_user(file_handle_out, &h as *const u64 as *const u8, 8);
+    if io_status_block != 0 {
+        // Status = STATUS_SUCCESS, Information = FILE_OPENED.
+        let iosb = [0u32, 0, FILE_OPENED as u32, 0, 0, 0];
+        let _ = crate::mm::probe::copy_to_user(
+            io_status_block,
+            iosb.as_ptr() as *const u8,
+            16,
+        );
     }
     0 // STATUS_SUCCESS
 }
@@ -1216,35 +1182,42 @@ extern "C" fn nt_read_file(handle: u64, buffer: u64, length: u64, _a4: u64) -> u
     if buffer == 0 || length as usize > MAX_IO_LEN {
         return 0; // bytes read
     }
-    // The device will write into this buffer; ensure it is a valid user range.
+    // Probe up front so a bad buffer fails before it consumes data; the
+    // readers below fill a kernel bounce buffer, and one guarded copy at
+    // the end crosses to the user (recovering if the page fights back).
     if crate::mm::virt::probe_for_write(buffer, length as usize, 1).is_err() {
         return 0; // bytes read
     }
+    let mut kbuf = alloc::vec![0u8; length as usize];
+    // One guarded copy to the user per successful read.
+    let flush = |kbuf: &[u8], n: usize| -> u64 {
+        if n == 0 {
+            return 0;
+        }
+        if crate::mm::probe::copy_to_user(buffer, kbuf.as_ptr(), n).is_err() {
+            return 0;
+        }
+        n as u64
+    };
     match handle::ob_reference_object_by_handle(handle) {
         Ok(obj) => {
             // A RAM-filesystem file reads from memory, not a device IRP.
             if unsafe { io::ramfs::is_file_object(obj) } {
                 let file = obj as *mut io::ramfs::FileObject;
-                crate::mm::virt::user_access_begin(); // SMAP: writing the user buffer
-                let n = unsafe { io::ramfs::read(file, buffer as *mut u8, length as usize) };
-                crate::mm::virt::user_access_end();
-                return n as u64;
+                let n = unsafe { io::ramfs::read(file, kbuf.as_mut_ptr(), length as usize) };
+                return flush(&kbuf, n);
             }
             // A writable RAM file (a temp file cmd wrote, `< file`): read it back.
             if unsafe { io::ramfs::is_writable_file(obj) } {
                 let file = obj as *mut io::ramfs::WritableFile;
-                crate::mm::virt::user_access_begin();
-                let n = unsafe { io::ramfs::read_writable(file, buffer as *mut u8, length as usize) };
-                crate::mm::virt::user_access_end();
-                return n as u64;
+                let n = unsafe { io::ramfs::read_writable(file, kbuf.as_mut_ptr(), length as usize) };
+                return flush(&kbuf, n);
             }
             // A writable FAT file (D:\): read the buffered content back.
             if unsafe { io::fat::is_fat_writable(obj) } {
                 let file = obj as *mut io::fat::FatWritable;
-                crate::mm::virt::user_access_begin();
-                let n = unsafe { io::fat::read_writable(file, buffer as *mut u8, length as usize) };
-                crate::mm::virt::user_access_end();
-                return n as u64;
+                let n = unsafe { io::fat::read_writable(file, kbuf.as_mut_ptr(), length as usize) };
+                return flush(&kbuf, n);
             }
             // A pipe read end: drain the buffer, blocking (preemptibly) until data
             // arrives or the last writer closes (EOF). Between checks interrupts
@@ -1253,11 +1226,9 @@ extern "C" fn nt_read_file(handle: u64, buffer: u64, length: u64, _a4: u64) -> u
                 let end = obj as *mut io::pipe::PipeEnd;
                 let mut spins: u64 = 0;
                 loop {
-                    crate::mm::virt::user_access_begin();
-                    let (n, eof) = unsafe { io::pipe::try_read(end, buffer as *mut u8, length as usize) };
-                    crate::mm::virt::user_access_end();
+                    let (n, eof) = unsafe { io::pipe::try_read(end, kbuf.as_mut_ptr(), length as usize) };
                     if n > 0 {
-                        return n as u64;
+                        return flush(&kbuf, n);
                     }
                     if eof {
                         return 0; // no data, no writers: end of file
@@ -1274,11 +1245,11 @@ extern "C" fn nt_read_file(handle: u64, buffer: u64, length: u64, _a4: u64) -> u
                 io::io_synchronous_request(
                     device,
                     crate::io::IRP_MJ_READ,
-                    buffer as *mut u8,
+                    kbuf.as_mut_ptr(),
                     length as usize,
                 )
             } {
-                Ok(iosb) => iosb.information, // bytes read
+                Ok(iosb) => flush(&kbuf, (iosb.information as usize).min(length as usize)), // bytes read
                 Err(_) => 0,
             }
         }
@@ -1334,19 +1305,10 @@ extern "C" fn nt_load_mui_string(base: u64, id: u64, buf: u64, cch: u64) -> u64 
     if n == 0 {
         return 0;
     }
-    // Copy the string + NUL into the user buffer (validated, SMAP-bracketed).
-    if crate::mm::virt::probe_for_write(buf, (n + 1) * 2, 2).is_err() {
+    // The string + NUL, one guarded copy into the user buffer.
+    if crate::mm::probe::copy_to_user(buf, tmp.as_ptr() as *const u8, (n + 1) * 2).is_err() {
         return 0;
     }
-    crate::mm::virt::user_access_begin();
-    let dst = buf as *mut u16;
-    unsafe {
-        for i in 0..n {
-            *dst.add(i) = tmp[i];
-        }
-        *dst.add(n) = 0;
-    }
-    crate::mm::virt::user_access_end();
     n as u64
 }
 
@@ -1367,12 +1329,9 @@ extern "C" fn nt_get_command_line(buf: u64, max: u64, _a3: u64, _a4: u64) -> u64
         (ptr as *const u8, len)
     };
     let n = src_len.min(max);
-    if crate::mm::virt::probe_for_write(buf, n, 1).is_err() {
+    if crate::mm::probe::copy_to_user(buf, src, n).is_err() {
         return 0;
     }
-    crate::mm::virt::user_access_begin();
-    unsafe { core::ptr::copy_nonoverlapping(src, buf as *mut u8, n) };
-    crate::mm::virt::user_access_end();
     n as u64
 }
 
@@ -1395,18 +1354,13 @@ extern "C" fn nt_query_file_size(handle: u64, _a2: u64, _a3: u64, _a4: u64) -> u
 
 /// Copy a counted ASCII string from a user pointer into `dst`, returning the
 /// borrowed `&str` (or `None` on a bad pointer / over-long / non-UTF-8 name).
-/// Probes the range and brackets the read for SMAP — the safe way to pull a
-/// short name argument across the user/kernel boundary.
+/// The guarded copy probes and recovers — the safe way to pull a short name
+/// argument across the user/kernel boundary.
 fn read_user_name<'a>(ptr: u64, len: usize, dst: &'a mut [u8]) -> Option<&'a str> {
     if ptr == 0 || len == 0 || len > dst.len() {
         return None;
     }
-    if crate::mm::virt::probe_for_read(ptr, len, 1).is_err() {
-        return None;
-    }
-    crate::mm::virt::user_access_begin();
-    unsafe { core::ptr::copy_nonoverlapping(ptr as *const u8, dst.as_mut_ptr(), len) };
-    crate::mm::virt::user_access_end();
+    crate::mm::probe::copy_from_user(dst.as_mut_ptr(), ptr, len).ok()?;
     core::str::from_utf8(&dst[..len]).ok()
 }
 

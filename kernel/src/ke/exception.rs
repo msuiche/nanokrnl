@@ -232,8 +232,13 @@ pub fn nt_continue(ctx_va: u64) -> u64 {
     if crate::mm::virt::probe_for_read(ctx_va, CTX_SIZE, 16).is_err() {
         return crate::rtl::NtStatus::ACCESS_VIOLATION.0 as u64;
     }
-    crate::mm::virt::user_access_begin();
-    let r = |off: usize| unsafe { ((ctx_va + off as u64) as *const u64).read() };
+    // Pull the fields we consume through the guarded copy — a context that
+    // fights back mid-read is ACCESS_VIOLATION, never a kernel fault.
+    let mut raw = [0u8; 0x100];
+    if crate::mm::probe::copy_from_user(raw.as_mut_ptr(), ctx_va, 0x100).is_err() {
+        return crate::rtl::NtStatus::ACCESS_VIOLATION.0 as u64;
+    }
+    let r = |off: usize| unsafe { (raw.as_ptr().add(off) as *const u64).read() };
     let mut resume = UserResume {
         rax: r(CTX_RAX),
         rbx: r(CTX_RBX),
@@ -252,11 +257,10 @@ pub fn nt_continue(ctx_va: u64) -> u64 {
         r15: r(CTX_R15),
         rip: r(CTX_RIP),
         cs: 0, // forced below
-        rflags: unsafe { ((ctx_va + CTX_EFLAGS as u64) as *const u32).read() as u64 },
+        rflags: unsafe { (raw.as_ptr().add(CTX_EFLAGS) as *const u32).read() as u64 },
         rsp: r(CTX_RSP),
         ss: 0, // forced below
     };
-    crate::mm::virt::user_access_end();
 
     // The context may only describe a return to ring 3: RIP must be
     // user-executable, RSP user-writable (the probe checks the U/S bit, so
