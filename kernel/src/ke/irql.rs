@@ -43,7 +43,9 @@ pub const HIGH_LEVEL: Kirql = 15;
 // x86_64: IRQL == CR8 == APIC TPR
 // ---------------------------------------------------------------------------
 
-#[cfg(target_arch = "x86_64")]
+// NB: target_os = "none" — bare x86_64 *hosts* (Linux CI runners) must take
+// the emulated path below; `mov cr8` is privileged and SIGSEGVs in ring 3.
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
 mod arch {
     use super::Kirql;
     use core::arch::asm;
@@ -89,7 +91,7 @@ mod arch {
 // Host (test) emulation: one global IRQL, no real masking
 // ---------------------------------------------------------------------------
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(all(target_arch = "x86_64", target_os = "none")))]
 mod arch {
     use super::Kirql;
 
