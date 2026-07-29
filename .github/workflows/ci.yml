@@ -52,6 +52,15 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
           components: rust-src, llvm-tools
+      # Pinned nightly for the boot-image builder only: bootloader 0.11.15's
+      # UEFI/stage builds (uefi 0.20 `Step` impl, x86-softfloat rustc-abi in
+      # its target JSONs) no longer compile on latest nightly. Matches the
+      # known-good local toolchain (rustc 1.98.0-nightly, 2026-06-09);
+      # scripts/qemu-test.sh picks it up via NANOKRNL_NIGHTLY.
+      - name: Install pinned nightly for the boot-image builder
+        run: |
+          rustup toolchain install nightly-2026-06-09 \
+            --component rust-src,llvm-tools
       - uses: Swatinem/rust-cache@v2
       - name: Install QEMU + LLD
         run: |
@@ -79,4 +88,6 @@ jobs:
       # Boots the kernel with every in-tree PE embedded; the self-test suite
       # exits 33 on success (winbin/-dependent tests SKIP gracefully).
       - name: Boot self-tests under QEMU (exit 33 = all passed)
+        env:
+          NANOKRNL_NIGHTLY: nightly-2026-06-09
         run: sh scripts/qemu-test.sh

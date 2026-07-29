@@ -26,14 +26,16 @@ if command -v timeout >/dev/null 2>&1; then
 fi
 
 # The boot crate (not the kernel) needs nightly: the `bootloader` build
-# script compiles its 16/32-bit boot stages with -Zbuild-std.
+# script compiles its 16/32-bit boot stages with -Zbuild-std. CI pins the
+# toolchain via NANOKRNL_NIGHTLY (newer nightlies break bootloader
+# 0.11.15's UEFI build); locally the plain `nightly` default is fine.
 #
 # stdin is redirected from /dev/null: QEMU's `-serial stdio` puts a real
 # terminal into raw mode, and when a watchdog runs it in a background
 # process group that tcsetattr stops the whole pipeline with SIGTTOU
 # (the kernel needs no serial *input* anyway).
 set +e
-$WATCHDOG cargo +nightly run -q -p boot -- \
+$WATCHDOG cargo +"${NANOKRNL_NIGHTLY:-nightly}" run -q -p boot -- \
     target/x86_64-unknown-none/debug/kernel --run < /dev/null
 code=$?
 set -e
