@@ -2075,19 +2075,6 @@ impl Cpu {
                     0x07 => {
                         if self.trace_sys {
                             self.sys_log.push((0xFFFF_FFFF, [self.regs[RAX], 0, 0, 0]));
-                            // CreatePipe (svc 36) wrote the two pipe handles to
-                            // the user buffer at a1 — dump them at sysret, when
-                            // the kernel side has populated them.
-                            if self.last_svc == 36 {
-                                let p = self.last_svc_args[0];
-                                let rd = |o: u64| {
-                                    mmu::translate(mem, &self.paging, p + o, mmu::Access::Read, false)
-                                        .ok()
-                                        .and_then(|pa| mem.get(pa as usize..pa as usize + 8))
-                                        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
-                                };
-                                eprintln!("[svc36 CreatePipe read={:#x} write={:#x}]", rd(0).unwrap_or(0), rd(8).unwrap_or(0));
-                            }
                         }
                         self.rip = self.regs[RCX];
                         self.rflags = self.regs[11];

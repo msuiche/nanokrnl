@@ -62,7 +62,9 @@ jobs:
           command -v llvm-dlltool >/dev/null || \
             sudo ln -s "$(ls /usr/lib/llvm-*/bin/llvm-dlltool | head -1)" /usr/local/bin/llvm-dlltool
       - name: Host tests (ABI conformance + allocator proptests)
-        run: cargo test -p kernel
+        # --lib only: the bootable bin defines its own _start via
+        # bootloader_api's entry_point! and cannot link for the host.
+        run: cargo test -p kernel --lib
       - name: Build in-tree PEs (driver, shim DLLs, ring-3 apps)
         env:
           DLLTOOL: llvm-dlltool
