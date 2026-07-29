@@ -90,4 +90,6 @@ jobs:
       - name: Boot self-tests under QEMU (exit 33 = all passed)
         env:
           NANOKRNL_NIGHTLY: nightly-2026-06-09
+          # No KVM on the hosted runner: the TCG boot needs headroom.
+          NANOKRNL_WATCHDOG: 180
         run: sh scripts/qemu-test.sh
